@@ -14,6 +14,9 @@ export interface FavFolder {
   id: number;
   title: string;
   mediaCount: number;
+  cover?: string;
+  intro?: string;
+  attr?: number;
   favState?: boolean;
   stateKnown?: boolean;
 }
@@ -23,15 +26,25 @@ export interface FavPage {
   hasMore: boolean;
 }
 
+export interface FavFolderPage {
+  items: FavFolder[];
+  total: number;
+  hasMore: boolean;
+}
+
 interface FavFolderRaw {
   id: number;
   title: string;
   media_count: number;
   fav_state?: number;
+  cover?: string;
+  intro?: string;
+  attr?: number;
 }
 
 interface FavFolderListData {
   count?: number;
+  has_more?: boolean;
   list?: FavFolderRaw[];
 }
 
@@ -100,6 +113,21 @@ async function csrf(): Promise<string> {
 }
 
 export class FavService {
+  /** Nara收藏封面分页；list-all不含封面，不能逐个请求夹内视频补图。 */
+  static async folderPage(mid: number, page: number = 1): Promise<FavFolderPage> {
+    const raw: string = await getJson(API_BASE + '/x/v3/fav/folder/created/list?up_mid=' + mid.toString() +
+      '&pn=' + page.toString() + '&ps=20');
+    const resp = parseEnvelope<FavFolderListData>(raw);
+    ensureOk(resp);
+    const data: FavFolderListData | undefined = resp.data;
+    const items: FavFolder[] = (data?.list || []).map((f: FavFolderRaw): FavFolder => ({
+      id: f.id, title: f.title, mediaCount: f.media_count, cover: fixUrl(f.cover || ''),
+      intro: f.intro || '', attr: f.attr
+    }));
+    const total: number = data?.count ?? items.length;
+    return { items: items, total: total, hasMore: data?.has_more ?? page * 20 < total };
+  }
+
   /** 收藏夹列表（需登录） */
   static async folders(mid: number, rid: number = 0): Promise<FavFolder[]> {
     const raw: string = await getJson(API_BASE + '/x/v3/fav/folder/created/list-all?up_mid=' + mid.toString() +

@@ -1,21 +1,21 @@
 /**
  * 我的 Tab（spec-02 V2，对齐 Nara 实拍 40）
  *  顶右设置｜头像 + 昵称 + LV/硬币/经验条｜关注·粉丝｜4 入口（离线缓存/观看记录/我的收藏/稍后再看）
- *  观看记录横滑卡片（带进度）｜我的收藏文件夹网格｜退出登录
+ *  观看记录横滑卡片（带进度）｜我的收藏横向预览｜退出登录
  * 规格：docs/specs/spec-02-UI基座与我的页.md §7、docs/ui/我的页.html
  */
 import { promptAction, router } from '@kit.ArkUI';
 import { AsyncImage } from '../../components/AsyncImage';
 import { AuthService, UserInfo, RelStat } from '../../service/auth_service';
 import { HistoryService, HistoryItem } from '../../service/history_service';
-import { FavService, FavFolder } from '../../service/fav_service';
+import { FavService, FavFolder, FavFolderPage } from '../../service/fav_service';
+import { FavFolderCard } from '../../components/FavFolderCard';
 import { onAuthLogout, onHistoryChanged } from '../../infra/event/app_events';
 import { formatPlayCount, formatDuration } from '../../components/VideoCard';
 import { thumbUrl } from '../../infra/image/bili_image';
-import { prefsGet, prefsPut } from '../../infra/storage/prefs';
-
-/** 收藏夹封面本地缓存（folderId → 封面 URL），避免每次进页面都重拉文件夹内容 */
-const COVER_CACHE_KEY: string = 'fav_covers_cache';
+import { prefsGet, prefsDelete } from '../../infra/storage/prefs';
+import { CookieStore } from '../../infra/cookie/cookie_store';
+import { BasicDataSource } from '../../common/list_data_source';
 
 interface MineEntry {
   title: string;
@@ -30,7 +30,8 @@ export struct MineTab {
   @State rel: RelStat = { following: 0, follower: 0 };
   @State history: HistoryItem[] = [];
   @State folders: FavFolder[] = [];
-  @State folderCovers: string[] = [];
+  @State folderTotal: number = 0;
+  @State folderError: string = '';
   @Prop @Watch('onShown') refreshTick: number = 0;
   @Prop @Watch('onActive') active: boolean = false;
   @StorageProp('statusBarHeight') statusBarH: number = 0;
@@ -41,6 +42,10 @@ export struct MineTab {
   private destroyed: boolean = false;
   /** 已加载数据的账号 mid（相同则返回页面时不重拉收藏/观看记录） */
   private loadedMid: number = 0;
+  private accountRequest: number = 0;
+  private folderRequest: number = 0;
+  private historyDs: BasicDataSource<HistoryItem> = new BasicDataSource<HistoryItem>();
+  private folderDs: BasicDataSource<FavFolder> = new BasicDataSource<FavFolder>();
 
   private entries: MineEntry[] = [
     { title: '离线缓存', icon: $r('app.media.icon_download'), url: 'pages/download/DownloadPage' },
@@ -51,6 +56,10 @@ export struct MineTab {
 
   aboutToAppear(): void {
     this.refresh();
+    // 旧版逐夹补封面的URL缓存已不再需要，仅在确实存在时清除。
+    prefsGet('fav_covers_cache', '').then((raw: string): void => {
+      if (raw.length > 0) { prefsDelete('fav_covers_cache').catch(() => {}); }
+    }).catch(() => {});
     this.offAuth = onAuthLogout(() => {
       this.refresh();
     });
@@ -62,6 +71,7 @@ export struct MineTab {
 
   aboutToDisappear(): void {
     this.destroyed = true;
+    this.accountRequest++; this.historyRequest++; this.folderRequest++;
     if (this.offAuth !== undefined) {
       this.offAuth();
       this.offAuth = undefined;
@@ -71,6 +81,16 @@ export struct MineTab {
 
   /** 主壳从其它页面返回（登录态可能变化） */
   onShown(): void {
+    this.refreshIfAccountChanged();
+  }
+
+  private async refreshIfAccountChanged(): Promise<void> {
+    const mid: string = await CookieStore.get('DedeUserID');
+    if (this.destroyed) { return; }
+    if (this.user !== null && mid === this.loadedMid.toString()) {
+      if (this.historyDirty) { this.loadHistory(); }
+      return;
+    }
     this.refresh();
   }
 
@@ -79,21 +99,33 @@ export struct MineTab {
   }
 
   private async refresh(): Promise<void> {
+    const request: number = ++this.accountRequest;
     const u: UserInfo | null = await AuthService.fetchNav();
-    if (this.destroyed) {
+    if (this.destroyed || request !== this.accountRequest) {
       return;
     }
     this.user = u;
     this.checked = true;
     if (u === null) {
       this.historyRequest++;
+      this.folderRequest++;
       this.loadedMid = 0;
       this.rel = { following: 0, follower: 0 };
       this.history = [];
       this.folders = [];
-      this.folderCovers = [];
+      this.historyDs.reload([]); this.folderDs.reload([]);
+      this.folderTotal = 0;
+      this.folderError = '';
       return;
     }
+    // 同账号普通路由返回不重拉/重建卡片；真实观看事件已单独标脏。
+    if (this.loadedMid === u.mid) {
+      if (this.historyDirty) { this.loadHistory(); }
+      return;
+    }
+    this.historyRequest++; this.folderRequest++;
+    this.history = []; this.folders = []; this.folderTotal = 0;
+    this.historyDs.reload([]); this.folderDs.reload([]);
     this.loadedMid = u.mid;
     this.loadStat(u.mid);
     this.loadHistory();
@@ -102,7 +134,7 @@ export struct MineTab {
 
   private async loadStat(mid: number): Promise<void> {
     const s: RelStat = await AuthService.relationStat(mid);
-    if (!this.destroyed) {
+    if (!this.destroyed && mid === this.loadedMid) {
       this.rel = s;
     }
   }
@@ -114,93 +146,25 @@ export struct MineTab {
     this.historyDirty = false;
     const list: HistoryItem[] = await HistoryService.recent(20);
     if (!this.destroyed && request === this.historyRequest && mid === this.loadedMid) {
-      this.history = list;
+      if (JSON.stringify(this.history) !== JSON.stringify(list)) {
+        this.history = list; this.historyDs.reload(list);
+      }
     }
   }
 
   private async loadFolders(mid: number): Promise<void> {
+    const request: number = ++this.folderRequest;
     try {
-      const fs: FavFolder[] = await FavService.folders(mid);
-      if (this.destroyed) {
-        return;
-      }
-      // 先用本地缓存（folderId → 封面 URL）填一遍，避免"先空后填"
-      const cached: Map<number, string> = await this.loadCoverCache();
-      if (this.destroyed) {
-        return;
-      }
-      const covers: string[] = [];
-      for (let i = 0; i < fs.length; i++) {
-        const hit: string | undefined = cached.get(fs[i].id);
-        covers.push(hit !== undefined ? hit : '');
-      }
-      this.folders = fs;
-      this.folderCovers = covers;
-      this.loadFolderCovers();
-    } catch (e) {
-      console.warn('[PiliMini-mine] folders fail=' + JSON.stringify(e));
-    }
-  }
-
-  /** 本地封面缓存（prefs，JSON：folderId → 封面 URL） */
-  private async loadCoverCache(): Promise<Map<number, string>> {
-    const out: Map<number, string> = new Map<number, string>();
-    try {
-      const raw: string = await prefsGet(COVER_CACHE_KEY, '');
-      if (raw.length === 0) {
-        return out;
-      }
-      const obj = JSON.parse(raw) as Record<string, string>;
-      const keys: string[] = Object.keys(obj);
-      for (let i = 0; i < keys.length; i++) {
-        const id: number = parseInt(keys[i], 10);
-        if (!isNaN(id) && id > 0 && obj[keys[i]].length > 0) {
-          out.set(id, obj[keys[i]]);
-        }
+      const page: FavFolderPage = await FavService.folderPage(mid);
+      if (this.destroyed || request !== this.folderRequest || mid !== this.loadedMid) { return; }
+      this.folderError = '';
+      this.folderTotal = page.total;
+      if (JSON.stringify(this.folders) !== JSON.stringify(page.items)) {
+        this.folders = page.items; this.folderDs.reload(page.items);
       }
     } catch (e) {
-      // 忽略损坏缓存
-    }
-    return out;
-  }
-
-  private async saveCoverCache(id: number, cover: string): Promise<void> {
-    try {
-      const raw: string = await prefsGet(COVER_CACHE_KEY, '');
-      const obj: Record<string, string> = raw.length > 0
-        ? JSON.parse(raw) as Record<string, string>
-        : {};
-      obj[id.toString()] = cover;
-      await prefsPut(COVER_CACHE_KEY, JSON.stringify(obj));
-    } catch (e) {
-      // 忽略
-    }
-  }
-
-  /** 文件夹封面 = 第一条视频封面（全部取，串行避免密集请求；已有封面不重取） */
-  private async loadFolderCovers(): Promise<void> {
-    const max: number = this.folders.length;
-    for (let i = 0; i < max; i++) {
-      if (this.destroyed) {
-        return;
-      }
-      if (i < this.folderCovers.length && this.folderCovers[i] !== undefined && this.folderCovers[i].length > 0) {
-        continue;
-      }
-      try {
-        const page = await FavService.folderItems(this.folders[i].id, 1);
-        if (this.destroyed) {
-          return;
-        }
-        if (page.items.length > 0) {
-          const url: string = page.items[0].cover;
-          const next: string[] = this.folderCovers.slice();
-          next[i] = url;
-          this.folderCovers = next;
-          this.saveCoverCache(this.folders[i].id, url);
-        }
-      } catch (e) {
-        console.warn('[PiliMini-mine] cover fail=' + JSON.stringify(e));
+      if (!this.destroyed && request === this.folderRequest && mid === this.loadedMid) {
+        this.folderError = '收藏夹加载失败，点击刷新重试';
       }
     }
   }
@@ -392,10 +356,10 @@ export struct MineTab {
     Column() {
       Stack({ alignContent: Alignment.BottomStart }) {
         Column() {
-          AsyncImage({ src: item.cover, w: 440, h: 248 })
+          AsyncImage({ src: item.cover, w: 360, h: 220 })
         }
         .width('100%')
-        .aspectRatio(1.78)
+        .height(110)
         .borderRadius(6)
         .clip(true)
         .backgroundColor($r('app.color.btn_soft_bg'))
@@ -411,13 +375,13 @@ export struct MineTab {
       .width('100%')
 
       Text(item.title)
-        .fontSize(13)
+        .fontSize(12)
         .lineHeight(18)
         .fontColor($r('app.color.text_primary'))
-        .maxLines(2)
+        .maxLines(1)
         .textOverflow({ overflow: TextOverflow.Ellipsis })
         .width('100%')
-        .margin({ top: 6 })
+        .margin({ top: 8 })
 
       Text(item.upName)
         .fontSize(11)
@@ -425,9 +389,9 @@ export struct MineTab {
         .maxLines(1)
         .textOverflow({ overflow: TextOverflow.Ellipsis })
         .width('100%')
-        .margin({ top: 4 })
+        .margin({ top: 0 })
     }
-    .width(200)
+    .width(180)
     .alignItems(HorizontalAlign.Start)
     .onClick(() => {
       this.openVideo(item);
@@ -435,99 +399,42 @@ export struct MineTab {
   }
 
   @Builder
-  FolderCard(item: FavFolder, index: number) {
-    Column() {
-      Stack({ alignContent: Alignment.BottomEnd }) {
-        if (index < this.folderCovers.length && this.folderCovers[index].length > 0) {
-          AsyncImage({ src: this.folderCovers[index], w: 440, h: 248 })
-            .width('100%')
-            .aspectRatio(1.78)
-        } else {
-          Column() {
-            Image($r('app.media.icon_star'))
-              .width(28)
-              .height(28)
-              .fillColor($r('app.color.text_secondary'))
-              .opacity(0.6)
-          }
-          .width('100%')
-          .aspectRatio(1.78)
-          .justifyContent(FlexAlign.Center)
-        }
-
-        Text(item.mediaCount.toString() + '个内容')
-          .fontSize(10)
-          .fontColor('#FFFFFF')
-          .backgroundColor('#80000000')
-          .borderRadius(4)
-          .padding({ left: 4, right: 4, top: 1, bottom: 1 })
-          .margin({ right: 6, bottom: 6 })
-      }
-      .width('100%')
-      .aspectRatio(1.78)
-      .borderRadius(6)
-      .clip(true)
-      .backgroundColor($r('app.color.card_bg'))
-
-      Text(item.title)
-        .fontSize(13)
-        .lineHeight(18)
-        .fontColor($r('app.color.text_primary'))
-        .maxLines(2)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-        .width('100%')
-        .margin({ top: 6 })
-
-      Text('共' + item.mediaCount.toString() + '条视频 · 公开')
-        .fontSize(11)
-        .fontColor($r('app.color.text_secondary'))
-        .width('100%')
-        .margin({ top: 4 })
-    }
-    .layoutWeight(1)
-    .alignItems(HorizontalAlign.Start)
-    .onClick(() => {
-      // 直接打开该收藏夹的内容（FavListPage 读 mediaId/title 参数）
-      const params: Record<string, string> = {
-        'mediaId': item.id.toString(),
-        'title': item.title
-      };
-      router.pushUrl({ url: 'pages/fav/FavListPage', params: params });
-    })
-  }
-
-  @Builder
-  SectionTitle(title: string, right: string, section: string) {
+  SectionTitle(title: string, section: string) {
     Row() {
+      Row({ space: 6 }) {
       Text(title)
         .fontSize(16)
         .fontWeight(FontWeight.Medium)
         .fontColor($r('app.color.text_primary'))
-      if (right.length > 0) {
-        Text(right)
+      if (section === 'fav' && this.folderTotal > 0) {
+        Text(this.folderTotal.toString())
           .fontSize(12)
           .fontColor($r('app.color.text_secondary'))
       }
-      Blank()
       Image($r('app.media.icon_arrow_right'))
-            .width(22).height(22)
+            .width(18).height(18)
         .fillColor($r('app.color.text_secondary'))
+      }.layoutWeight(1).onClick(() => {
+        router.pushUrl({ url: section === 'history' ? 'pages/history/HistoryPage' : 'pages/fav/FavListPage' });
+      })
+      if (this.user !== null) {
+        Image($r('app.media.icon_refresh')).width(20).height(20).margin({ left: 12 })
+          .fillColor($r('app.color.text_secondary'))
+          .id('mine_refresh_' + section)
+          .onClick(() => {
+            if (section === 'history') { this.loadHistory(); }
+            else { this.loadFolders(this.loadedMid); }
+          })
+      }
     }
     .width('100%')
     .padding({ left: 16, right: 16, top: 10, bottom: 10 })
-    .onClick(() => {
-      if (section === 'history') {
-        router.pushUrl({ url: 'pages/history/HistoryPage' });
-      } else {
-        router.pushUrl({ url: 'pages/fav/FavListPage' });
-      }
-    })
   }
 
   @Builder
   HistorySection() {
     Column() {
-      this.SectionTitle('观看记录', '', 'history')
+      this.SectionTitle('观看记录', 'history')
       if (this.history.length === 0) {
         Text(this.checked && this.user !== null ? '暂无观看记录' : '登录后查看观看记录')
           .fontSize(13)
@@ -535,18 +442,18 @@ export struct MineTab {
           .width('100%')
           .padding({ left: 16, right: 16, top: 4, bottom: 16 })
       } else {
-        Scroll() {
-          Row({ space: 12 }) {
-            ForEach(this.history, (item: HistoryItem) => {
-              this.HistoryCard(item)
-            }, (item: HistoryItem) => item.key)
+        List({ space: 14 }) {
+          LazyForEach(this.historyDs, (item: HistoryItem) => {
+            ListItem() { this.HistoryCard(item) }
+          }, (item: HistoryItem) => item.key)
+          ListItem() {
+            Image($r('app.media.icon_arrow_right')).width(18).height(18).padding(12)
+              .backgroundColor($r('app.color.btn_soft_bg')).borderRadius(24)
+              .onClick(() => { router.pushUrl({ url: 'pages/history/HistoryPage' }); })
           }
-          .padding({ left: 16, right: 16 })
-        }
-        .scrollable(ScrollDirection.Horizontal)
-        .scrollBar(BarState.Off)
-        .width('100%')
-        .padding({ bottom: 6 })
+        }.listDirection(Axis.Horizontal).alignListItem(ListItemAlign.Start).cachedCount(1)
+          .scrollBar(BarState.Off).width('100%').height(173)
+          .padding({ left: 20, right: 20, top: 10 }).id('mine_history_preview')
       }
     }
     .width('100%')
@@ -555,49 +462,36 @@ export struct MineTab {
   @Builder
   FavSection() {
     Column() {
-      this.SectionTitle('我的收藏', this.folders.length > 0 ? this.folders.length.toString() : '', 'fav')
+      this.SectionTitle('我的收藏', 'fav')
       if (this.folders.length === 0) {
-        Text(this.checked && this.user !== null ? '暂无收藏夹' : '登录后查看收藏')
+        Text(this.folderError || (this.checked && this.user !== null ? '暂无收藏夹' : '登录后查看收藏'))
           .fontSize(13)
           .fontColor($r('app.color.text_secondary'))
           .width('100%')
           .padding({ left: 16, right: 16, top: 4, bottom: 16 })
       } else {
-        Column({ space: 14 }) {
-          ForEach(this.chunkRows(), (row: number[]) => {
-            Row({ space: 12 }) {
-              ForEach(row, (i: number) => {
-                if (i < this.folders.length) {
-                  this.FolderCard(this.folders[i], i)
-                } else {
-                  Column().layoutWeight(1)
-                }
-              }, (i: number) => 'fc_' + i.toString())
+        List({ space: 14 }) {
+            LazyForEach(this.folderDs, (folder: FavFolder) => {
+              ListItem() {
+              FavFolderCard({ folder: folder, preview: true, onOpen: () => {
+                router.pushUrl({ url: 'pages/fav/FavListPage',
+                  params: { mediaId: folder.id.toString(), title: folder.title } });
+              } })
+              }
+            }, (folder: FavFolder) => folder.id.toString())
+            if (this.folderTotal > this.folders.length) {
+              ListItem() {
+              Image($r('app.media.icon_arrow_right')).width(18).height(18).padding(12)
+                .backgroundColor($r('app.color.btn_soft_bg')).borderRadius(24)
+                .onClick(() => { router.pushUrl({ url: 'pages/fav/FavListPage' }); })
+              }
             }
-            .width('100%')
-            .alignItems(VerticalAlign.Top)
-          }, (row: number[]) => 'fr_' + row[0].toString())
-        }
-        .width('100%')
-        .padding({ left: 16, right: 16, bottom: 8 })
+        }.listDirection(Axis.Horizontal).alignListItem(ListItemAlign.Start).cachedCount(1)
+          .padding({ left: 20, right: 20, top: 10 }).scrollBar(BarState.Off).height(173).width('100%')
+          .id('mine_fav_preview')
       }
     }
     .width('100%')
-  }
-
-  /** 文件夹按两列分行（[0,1] / [2,3] / ...） */
-  private chunkRows(): number[][] {
-    const rows: number[][] = [];
-    let i: number = 0;
-    while (i < this.folders.length) {
-      const r: number[] = [i];
-      if (i + 1 < this.folders.length) {
-        r.push(i + 1);
-      }
-      rows.push(r);
-      i += 2;
-    }
-    return rows;
   }
 
   build() {
@@ -613,7 +507,7 @@ export struct MineTab {
           Button('退出登录')
             .fontSize(14)
             .width('92%')
-            .backgroundColor('#F5F5F5')
+            .backgroundColor($r('app.color.btn_soft_bg'))
             .fontColor('#E54D42')
             .margin({ top: 16 })
             .onClick(() => {

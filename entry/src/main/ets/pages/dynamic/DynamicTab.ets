@@ -14,11 +14,18 @@ import { LoadingFooter, ErrorRetry } from '../../components/StateViews';
 import { DynamicService, DynItem, DynPageResult } from '../../service/dynamic_service';
 import { CookieStore } from '../../infra/cookie/cookie_store';
 import { AppError } from '../../infra/error/app_error';
+import { FeedNavigation, FeedNavRequest } from '../../common/feed_navigation';
 
 @Component
 struct DynFeedList {
   @Prop dynType: string = 'all';
   @Prop filterKind: string = ''; // 客户端过滤：如 'draw'（图文 chip 用）
+  @Prop selected: boolean = false;
+  @Prop @Watch('onNavRequest') navRequest: FeedNavRequest = new FeedNavRequest();
+  private navigation: FeedNavigation = new FeedNavigation();
+  private destroyed: boolean = false;
+  private reloading: boolean = false;
+  private refreshRunning: boolean = false;
   private ds: BasicDataSource<DynItem> = new BasicDataSource<DynItem>();
   @State pager: Pager<DynItem> = new Pager<DynItem>();
   @State needLogin: boolean = false;
@@ -29,7 +36,12 @@ struct DynFeedList {
     this.reload();
   }
 
-  aboutToDisappear(): void { this.pager.cancel(); }
+  aboutToDisappear(): void { this.destroyed = true; this.pager.cancel(); }
+
+  private onNavRequest(): void {
+    if (!this.selected || this.destroyed || this.reloading || this.refreshRunning) { return; }
+    if (this.navigation.shouldRefresh(this.navRequest, this.pager.firstLoaded && !this.needLogin)) { this.refresh(); }
+  }
 
   private async fetchFeed(cursor: string): Promise<PageData<DynItem>> {
     try {
@@ -47,7 +59,7 @@ struct DynFeedList {
     } catch (e) {
       const err: Error = e as Error;
       const ae: AppError = e as AppError;
-      if (ae !== undefined && ae !== null && ae.type === 'auth') {
+      if (!this.destroyed && ae !== undefined && ae !== null && ae.type === 'auth') {
         this.needLogin = true;
       }
       throw err;
@@ -55,30 +67,46 @@ struct DynFeedList {
   }
 
   private async reload(): Promise<void> {
-    this.needLogin = false;
-    // 本地登录态判断（无网络开销）：未登录直接给引导，不浪费一次请求
-    const logged: boolean = await CookieStore.isLogin();
-    if (!logged) {
-      this.needLogin = true;
-      return;
-    }
-    await this.pager.reload(this.ds, (cursor: string): Promise<PageData<DynItem>> => this.fetchFeed(cursor));
-    // 客户端过滤后首页可能为空：自动续拉（带上限防死循环）
-    let guard: number = 0;
-    while (this.ds.size() === 0 && this.pager.hasMore && this.pager.firstLoaded && guard < 10) {
-      guard++;
-      await this.pager.loadMore(this.ds, (cursor: string): Promise<PageData<DynItem>> => this.fetchFeed(cursor));
-    }
+    if (this.destroyed || this.reloading) { return; }
+    this.reloading = true;
+    try {
+      this.needLogin = false;
+      // 本地登录态判断（无网络开销）：未登录直接给引导，不浪费一次请求
+      const logged: boolean = await CookieStore.isLogin();
+      if (this.destroyed) { return; }
+      if (!logged) {
+        this.needLogin = true;
+        return;
+      }
+      const loaded: boolean = await this.pager.reload(this.ds,
+        (cursor: string): Promise<PageData<DynItem>> => this.fetchFeed(cursor));
+      if (!loaded) { return; }
+      // 客户端过滤后首页可能为空：仅成功的空页续拉，失败立即停止。
+      let guard: number = 0;
+      while (!this.destroyed && this.ds.size() === 0 && this.pager.hasMore && guard < 10) {
+        guard++;
+        const more: boolean = await this.pager.loadMore(this.ds,
+          (cursor: string): Promise<PageData<DynItem>> => this.fetchFeed(cursor));
+        if (!more) { break; }
+      }
+    } finally { this.reloading = false; }
   }
 
   private async loadMore(): Promise<void> {
+    if (this.destroyed) { return; }
     await this.pager.loadMore(this.ds, (cursor: string): Promise<PageData<DynItem>> => this.fetchFeed(cursor));
   }
 
   private async refresh(): Promise<void> {
+    if (this.destroyed || this.reloading || this.refreshRunning) { return; }
+    this.refreshRunning = true;
+    console.info('[PiliMini-feed] refresh source=dynamic_' + this.dynType + '_' + this.filterKind);
     this.refreshing = true;
-    await this.reload();
-    this.refreshing = false;
+    try { await this.reload(); }
+    finally {
+      this.refreshRunning = false;
+      if (!this.destroyed) { this.refreshing = false; }
+    }
   }
 
   // ===== 未登录引导（spec-08 验收 6） =====
@@ -141,7 +169,7 @@ struct DynFeedList {
           .justifyContent(FlexAlign.Center)
         } else {
           Refresh({ refreshing: $$this.refreshing }) {
-            List() {
+            List({ scroller: this.navigation.scroller }) {
               LazyForEach(this.ds, (item: DynItem) => {
                 ListItem() {
                   DynamicCard({
@@ -167,6 +195,9 @@ struct DynFeedList {
             .cachedCount(3)
             .width('100%')
             .height('100%')
+            .id('dynamic_feed_' + this.dynType + '_' + this.filterKind)
+            .onAreaChange((_old: Area, area: Area): void => { this.navigation.viewportHeight = Number(area.height); })
+            .onScrollStop((): void => { this.navigation.onScrollStop(); })
             // 卡片间 0.5px 分隔线（左右缩进 12，10% alpha）
             .divider({ strokeWidth: 0.5, color: '#1A000000', startMargin: 12, endMargin: 12 })
             .onReachEnd(() => {
@@ -194,13 +225,23 @@ export struct DynamicTab {
   @State mode: number = 0; // 0=全部 1=视频 2=图文
   @State categoryProgress: number = 0;
   private feedTabs: TabsController = new TabsController();
+  @Prop @Watch('onNavRequest') navRequest: FeedNavRequest = new FeedNavRequest();
+  @State feedNavRequests: FeedNavRequest[] = [new FeedNavRequest(), new FeedNavRequest(), new FeedNavRequest()];
   /** 是否当前可见（主壳传入）：首次激活前不挂载列表，避免启动即请求 */
   @Prop @Watch('onActive') active: boolean = false;
   @State visited: boolean = false;
   @StorageProp('statusBarHeight') statusBarH: number = 0;
 
+  aboutToAppear(): void { this.onActive(); }
+
+  private onNavRequest(): void {
+    const requests: FeedNavRequest[] = this.feedNavRequests.slice();
+    requests[this.mode] = this.navRequest;
+    this.feedNavRequests = requests;
+  }
+
   onActive(): void {
-    if (this.active) {
+    if (this.active && !this.visited) {
       this.visited = true;
     }
   }
@@ -215,11 +256,11 @@ export struct DynamicTab {
       }
       .width('100%').height(44).padding({ top: 6, bottom: 6 })
 
-      if (this.active || this.visited) {
+      if (this.visited) {
         Tabs({ index: this.mode, controller: this.feedTabs }) {
-          TabContent() { DynFeedList({ dynType: 'all', filterKind: '' }) }
-          TabContent() { DynFeedList({ dynType: 'video', filterKind: '' }) }
-          TabContent() { DynFeedList({ dynType: 'all', filterKind: 'draw' }) }
+          TabContent() { DynFeedList({ dynType: 'all', filterKind: '', selected: this.mode === 0, navRequest: this.feedNavRequests[0] }) }
+          TabContent() { DynFeedList({ dynType: 'video', filterKind: '', selected: this.mode === 1, navRequest: this.feedNavRequests[1] }) }
+          TabContent() { DynFeedList({ dynType: 'all', filterKind: 'draw', selected: this.mode === 2, navRequest: this.feedNavRequests[2] }) }
         }
         .barHeight(0).layoutWeight(1).width('100%').animationDuration(300)
         .onContentDidScroll((_selected: number, index: number, position: number): void => {

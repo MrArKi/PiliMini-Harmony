@@ -15,10 +15,12 @@ import { FeedCategoryBar } from '../../components/FeedCategoryBar';
 import { VideoService, PageResult } from '../../service/video_service';
 import { AuthService, UserInfo } from '../../service/auth_service';
 import { VideoItem } from '../../model/video_item';
+import { FeedNavigation, FeedNavRequest } from '../../common/feed_navigation';
 
 @Component
 struct FeedList {
   @Prop source: string = 'rcmd'; // 'rcmd' | 'hot'
+  @Prop selected: boolean = false;
   /** 顶部玻璃栏高度：作为首个网格占位，让内容从栏下穿过（沉浸光感） */
   @Prop topInset: number = 0;
   /** 上滑收起顶栏（首行进入视口即收起，与 Nara 一致） */
@@ -26,19 +28,27 @@ struct FeedList {
   };
   /** 自增即滚回顶部（系统返回键回首页时用） */
   @Prop @Watch('onTopTick') topTick: number = 0;
-  private scroller: Scroller = new Scroller();
+  @Prop @Watch('onNavRequest') navRequest: FeedNavRequest = new FeedNavRequest();
+  private navigation: FeedNavigation = new FeedNavigation();
   private ds: BasicDataSource<VideoItem> = new BasicDataSource<VideoItem>();
   @State pager: Pager<VideoItem> = new Pager<VideoItem>();
   @State refreshing: boolean = false;
   /** 本地去重：仅在收起状态变化时回调宿主 */
   private collapsedLocal: boolean = false;
+  private destroyed: boolean = false;
+  private refreshRunning: boolean = false;
+
+  private onNavRequest(): void {
+    if (!this.selected || this.destroyed || this.pager.loading || this.refreshRunning) { return; }
+    if (this.navigation.shouldRefresh(this.navRequest, this.pager.firstLoaded)) { this.refresh(); }
+  }
 
   private onTopTick(): void {
     if (this.topTick <= 0) {
       return;
     }
     try {
-      this.scroller.scrollToIndex(0, true, ScrollAlign.START);
+      if (this.pager.firstLoaded) { this.navigation.toTop(); }
     } catch (e) {
       // 忽略
     }
@@ -52,7 +62,7 @@ struct FeedList {
     this.reload();
   }
 
-  aboutToDisappear(): void { this.pager.cancel(); }
+  aboutToDisappear(): void { this.destroyed = true; this.pager.cancel(); }
 
   private async fetchPage(cursor: string): Promise<PageData<VideoItem>> {
     const pn: number = parseInt(cursor, 10);
@@ -72,12 +82,19 @@ struct FeedList {
   }
 
   private async refresh(): Promise<void> {
+    if (this.destroyed || this.refreshRunning || this.pager.loading) { return; }
+    this.refreshRunning = true;
+    console.info('[PiliMini-feed] refresh source=' + this.source);
     this.refreshing = true;
-    await this.reload();
-    this.refreshing = false;
+    try { await this.reload(); }
+    finally {
+      this.refreshRunning = false;
+      if (!this.destroyed) { this.refreshing = false; }
+    }
   }
 
   private async loadMore(): Promise<void> {
+    if (this.destroyed) { return; }
     await this.pager.loadMore(this.ds, (cursor: string): Promise<PageData<VideoItem>> => this.fetchPage(cursor));
   }
 
@@ -102,7 +119,7 @@ struct FeedList {
         .justifyContent(FlexAlign.Center)
       } else {
         Refresh({ refreshing: $$this.refreshing }) {
-          Grid(this.scroller) {
+          Grid(this.navigation.scroller) {
             GridItem() {
               Column()
                 .width('100%')
@@ -142,6 +159,9 @@ struct FeedList {
           .cachedCount(6)
           .width('100%')
           .height('100%')
+          .id('home_feed_' + this.source)
+          .onAreaChange((_old: Area, area: Area): void => { this.navigation.viewportHeight = Number(area.height); })
+          .onScrollStop((): void => { this.navigation.onScrollStop(); })
           .onScrollIndex((first: number, last: number) => {
             // 首行（占位后的第一排卡片）进入视口 → 收起顶栏（Nara：上滑收起搜索行）
             const collapsed: boolean = first >= 1;
@@ -177,6 +197,8 @@ export struct HomeTab {
   @Prop @Watch('onShown') refreshTick: number = 0;
   /** 自增即回顶部（系统返回键回首页） */
   @Prop topTick: number = 0;
+  @Prop @Watch('onNavRequest') navRequest: FeedNavRequest = new FeedNavRequest();
+  @State feedNavRequests: FeedNavRequest[] = [new FeedNavRequest(), new FeedNavRequest()];
   @StorageProp('statusBarHeight') statusBarH: number = 0;
   /** 顶栏是否已上滑收起（搜索行淡出、只留分类行） */
   @State collapsed: boolean = false;
@@ -185,6 +207,12 @@ export struct HomeTab {
   onGoMine: () => void = () => {
   };
   private destroyed: boolean = false;
+
+  private onNavRequest(): void {
+    const requests: FeedNavRequest[] = this.feedNavRequests.slice();
+    requests[this.mode] = this.navRequest;
+    this.feedNavRequests = requests;
+  }
 
   aboutToAppear(): void {
     this.loadUser();
@@ -360,6 +388,8 @@ export struct HomeTab {
         TabContent() {
           FeedList({
             source: 'rcmd',
+            selected: this.mode === 0,
+            navRequest: this.feedNavRequests[0],
             topInset: this.expandedH(),
             topTick: this.topTick,
             onCollapse: (c: boolean) => {
@@ -371,6 +401,8 @@ export struct HomeTab {
         TabContent() {
           FeedList({
             source: 'hot',
+            selected: this.mode === 1,
+            navRequest: this.feedNavRequests[1],
             topInset: this.expandedH(),
             topTick: this.topTick,
             onCollapse: (c: boolean) => {

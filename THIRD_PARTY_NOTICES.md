@@ -6,6 +6,7 @@ PiliMini自身采用GPL-3.0-only。以下组件、图形数据及其修改仍保
 
 - **PiliNara**：https://github.com/dev4harmony/PiliNara/tree/ohos ，上游项目还包括 https://github.com/Starfallan/PiliNara 及 https://github.com/bggRGjQaUbCoE/PiliPlus 。Nara的LICENSE为GNU GPL v3（https://github.com/dev4harmony/PiliNara/blob/ohos/LICENSE）。PiliMini以ArkTS/ArkUI重新组织界面和业务，参考其布局、动效、交互、播放器参数、后台行为及WBI签名；`member_level_*.svg`改编自Nara的`LevelCanvas`几何。保留上游项目及贡献者的版权，不将改编部分标为完全原创。
 - **bilibili-API-collect**：https://github.com/SocialSisterYi/bilibili-API-collect ，仅用作接口资料参考；不将其整份文档复制入本仓库。
+- `common/feed_navigation.ets`及主壳导航处理参考Nara的`pages/main/controller.dart`、`pages/common/common_controller.dart`和`utils/extension/scroll_controller_ext.dart`的单击回顶、双击刷新及500ms回顶规则；`components/FavFolderCard.ets`参考Nara的`FavVideoItem`/`FavFolderItem`的封面行与横向叠层预览。
 
 ## 源码中保留的第三方内容
 

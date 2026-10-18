@@ -13,6 +13,7 @@ import { MineTab } from '../mine/MineTab';
 import { AuthService } from '../../service/auth_service';
 import { onAuthLogout } from '../../infra/event/app_events';
 import { prefsGet } from '../../infra/storage/prefs';
+import { FeedNavRequest } from '../../common/feed_navigation';
 
 /** 材质等级存储键：0=精美 1=轻柔 2=流畅 10=自适应（默认） */
 export const MATERIAL_LEVEL_KEY: string = 'setting_material_level';
@@ -25,6 +26,8 @@ struct MainShell {
   @State pageVisible: boolean = true;
   /** 回首页时让首页滚到顶（系统返回键 / 手势返回触发） */
   @State homeTopTick: number = 0;
+  @State homeNavRequest: FeedNavRequest = new FeedNavRequest();
+  @State dynamicNavRequest: FeedNavRequest = new FeedNavRequest();
   @State materialLevel: number = 10;
   @StorageProp('navBarHeight') navBarH: number = 0;
   private tabsCtrl: HdsTabsController = new HdsTabsController();
@@ -34,6 +37,26 @@ struct MainShell {
   private touchX: number = 0;
   private touchY: number = 0;
   private barsHidden: boolean = false;
+  private lastReselectIndex: number = -1;
+  private lastReselectAt: number = 0;
+
+  private onNavClick(index: number): void {
+    if (index === this.currentIndex && (index === 0 || index === 1)) {
+      const now: number = Date.now();
+      const doubleTap: boolean = this.lastReselectIndex === index && now - this.lastReselectAt < 500;
+      this.lastReselectIndex = index;
+      this.lastReselectAt = now;
+      if (index === 0) {
+        this.homeNavRequest = new FeedNavRequest(this.homeNavRequest.serial + 1, doubleTap);
+      } else {
+        this.dynamicNavRequest = new FeedNavRequest(this.dynamicNavRequest.serial + 1, doubleTap);
+      }
+    } else {
+      this.lastReselectIndex = -1;
+      this.currentIndex = index;
+    }
+    this.onScrollHidden(false);
+  }
 
   /** 主壳统一观察手指方向；短列表/空态也能呼回底栏，不抢子组件滚动手势。 */
   private onShellTouch(event: TouchEvent): void {
@@ -154,6 +177,7 @@ struct MainShell {
     .justifyContent(FlexAlign.Center)
     .backgroundColor(this.currentIndex === index ? '#1FFB7299' : Color.Transparent)
     .borderRadius(28)
+    .id('main_nav_' + index.toString())
   }
 
   /** 与Nara默认Cupertino一致：300ms，底页1/3视差。 */
@@ -175,6 +199,7 @@ struct MainShell {
           HomeTab({
             refreshTick: this.shownTick,
             topTick: this.homeTopTick,
+            navRequest: this.homeNavRequest,
             onGoMine: () => {
               this.currentIndex = 2;
               this.onScrollHidden(false);
@@ -188,7 +213,7 @@ struct MainShell {
 
       TabContent() {
         Stack() {
-          DynamicTab({ active: this.currentIndex === 1 })
+          DynamicTab({ active: this.currentIndex === 1, navRequest: this.dynamicNavRequest })
         }
         .width('100%')
         .height('100%')
@@ -219,6 +244,7 @@ struct MainShell {
     .height('100%')
     .backgroundColor($r('app.color.bg_page'))
     .onTouch((event: TouchEvent) => { this.onShellTouch(event); })
+    .onTabBarClick((index: number): void => { this.onNavClick(index); })
     .onChange((index: number) => {
       this.currentIndex = index;
       this.onScrollHidden(false);
