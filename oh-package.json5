@@ -1,0 +1,12 @@
+{
+  "modelVersion": "5.0.0",
+  "name": "pilimini",
+  "version": "0.1.0",
+  "description": "PiliMini - 鸿蒙极简 B 站客户端（个人自用）",
+  "main": "",
+  "author": "",
+  "license": "GPL-3.0-only",
+  "dependencies": {},
+  "devDependencies": {},
+  "dynamicDependencies": {}
+}

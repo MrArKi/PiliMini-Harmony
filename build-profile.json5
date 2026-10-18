@@ -1,0 +1,58 @@
+{
+  "app": {
+    "signingConfigs": [],
+    "products": [
+      {
+        "name": "default",
+        "compatibleSdkVersion": "6.0.2(22)",
+        "runtimeOS": "HarmonyOS",
+        "targetSdkVersion": "26.0.0"
+      }
+    ],
+    "buildModeSet": [
+      {
+        "name": "debug",
+        "buildOption": {
+          "nativeLib": {
+            "filter": {
+              "excludes": [
+                "**/armeabi/*.so",
+                "**/armeabi-v7a/*.so",
+                "**/x86/*.so"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "name": "release",
+        "buildOption": {
+          "nativeLib": {
+            "filter": {
+              "excludes": [
+                "**/armeabi/*.so",
+                "**/armeabi-v7a/*.so",
+                "**/x86/*.so",
+                "**/x86_64/*.so"
+              ]
+            }
+          }
+        }
+      }
+    ]
+  },
+  "modules": [
+    {
+      "name": "entry",
+      "srcPath": "./entry",
+      "targets": [
+        {
+          "name": "default",
+          "applyToProducts": [
+            "default"
+          ]
+        }
+      ]
+    }
+  ]
+}

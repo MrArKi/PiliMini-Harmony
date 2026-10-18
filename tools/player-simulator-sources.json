@@ -1,0 +1,90 @@
+{
+  "sources": [
+    {
+      "file": "mpv-complete.tgz",
+      "sha256": "f9e2164008be04eb75b59098eb94dd068cdea9f9e301ee33306750c5d4d19eab",
+      "url": "https://codeload.github.com/p1nbored/mpv/tar.gz/578c5bf8b3f615218162700438e89509005cd751",
+      "directory": "mpv-578c5bf8b3f615218162700438e89509005cd751"
+    },
+    {
+      "file": "ffmpeg-complete.tgz",
+      "sha256": "2ba7514c55ef5eae070ab8790bcb15622fbca12fbf95bc72e7775b38d1b1e5aa",
+      "url": "https://codeload.github.com/p1nbored/FFmpeg/tar.gz/7258ab2",
+      "directory": "FFmpeg-7258ab2"
+    },
+    {
+      "file": "harfbuzz-source.tgz",
+      "sha256": "5bc7a571b476eeda0c1996a04006da7c25f8edbc01cdf394ef729a6ecd1296d6",
+      "url": "https://codeload.github.com/harfbuzz/harfbuzz/tar.gz/11.4.5",
+      "directory": "harfbuzz-11.4.5"
+    },
+    {
+      "file": "freetype-source.tgz",
+      "sha256": "bc5c898e4756d373e0d991bab053036c5eb2aa7c0d5c67e8662ddc6da40c4103",
+      "url": "https://codeload.github.com/freetype/freetype/tar.gz/VER-2-13-3",
+      "directory": "freetype-VER-2-13-3"
+    },
+    {
+      "file": "fribidi-source.tgz",
+      "sha256": "5a1d187a33daa58fcee2ad77f0eb9d136dd6fa4096239199ba31e850d397e8a8",
+      "url": "https://codeload.github.com/fribidi/fribidi/tar.gz/v1.0.16",
+      "directory": "fribidi-1.0.16"
+    },
+    {
+      "file": "libass-source.tgz",
+      "sha256": "c287d180d93dc9c9021872574b618ac49027e84cc90e1289318b1ee68bb42251",
+      "url": "https://codeload.github.com/libass/libass/tar.gz/0.17.4",
+      "directory": "libass-0.17.4"
+    },
+    {
+      "file": "mbedtls-source.tgz",
+      "sha256": "a1e01f6094bb744ead8caaa92d7c7102b7137a813f509b49afaebc0b8e51899c",
+      "url": "https://codeload.github.com/Mbed-TLS/mbedtls/tar.gz/mbedtls-3.6.4",
+      "directory": "mbedtls-3.6.4"
+    },
+    {
+      "file": "mbed-framework.tgz",
+      "sha256": "f5934ffcad4c32a95f9281f0f95908eb471ee34df721fb9d6ad4adb9567f6b61",
+      "url": "https://codeload.github.com/Mbed-TLS/mbedtls-framework/tar.gz/2a3e2c5ea053c14b745dbdf41f609b1edc6a72fa",
+      "directory": "mbedtls-framework-2a3e2c5ea053c14b745dbdf41f609b1edc6a72fa"
+    },
+    {
+      "file": "placebo-source.tgz",
+      "sha256": "d05fdf90bea2f629eaa2d115e909fd356388ac639e54f77b87a018a6d76224bd",
+      "url": "https://codeload.github.com/haasn/libplacebo/tar.gz/v7.360.1",
+      "directory": "libplacebo-7.360.1"
+    }
+  ],
+  "patch": {
+    "file": "placebo-ohos.patch",
+    "sha256": "6aab3a5cd3253f992876eb11c20b05125e28e0b80e81603d2401ba8bc6e6ad30",
+    "url": "https://raw.githubusercontent.com/p1nbored/libmpv-ohos-build/feat-ohos-hdr/patches/libplacebo/support-external-yuv-zero-copy.patch"
+  },
+  "tools": [
+    {
+      "file": "make.zip",
+      "sha256": "fb66a02b530f7466f6222ce53c0b602c5288e601547a034e4156a512dd895ee7",
+      "url": "https://downloads.sourceforge.net/project/ezwinports/make-4.4.1-without-guile-w32-bin.zip"
+    },
+    {
+      "file": "tcc.zip",
+      "sha256": "34a721949a2583fdff725312da092fa0f5f1f284b702e6f811c6954714faabb2",
+      "url": "https://download.savannah.gnu.org/releases/tinycc/tcc-0.9.27-win64-bin.zip"
+    },
+    {
+      "file": "pkg-0.zip",
+      "url": "https://ftp.gnome.org/pub/gnome/binaries/win32/dependencies/pkg-config_0.26-1_win32.zip",
+      "sha256": "e919821da1a61af45ac9d924914bb72d92ba9ead956c82b9d89128b1b90d37c3"
+    },
+    {
+      "file": "pkg-1.zip",
+      "url": "https://ftp.gnome.org/pub/gnome/binaries/win32/glib/2.28/glib_2.28.8-1_win32.zip",
+      "sha256": "0d485a8dd57494944128ac19b5b8dd52d6140eb16f102a43c835f060aaa49a19"
+    },
+    {
+      "file": "pkg-2.zip",
+      "url": "https://ftp.gnome.org/pub/gnome/binaries/win32/dependencies/gettext-runtime_0.18.1.1-2_win32.zip",
+      "sha256": "4c313b74dd63b81604168f1a8e714e1292e778f1ec0cb5bb85a2bcd9e8842cba"
+    }
+  ]
+}

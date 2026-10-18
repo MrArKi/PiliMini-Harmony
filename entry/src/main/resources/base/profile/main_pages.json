@@ -1,0 +1,26 @@
+{
+  "src": [
+    "pages/Index",
+    "pages/login/LoginPage",
+    "pages/main/MainShell",
+    "pages/search/SearchPage",
+    "pages/video/VideoDetailPage",
+    "pages/video/SubReplyPage",
+    "pages/dynamic/DynDetailPage",
+    "pages/member/MemberPage",
+    "pages/member/MemberListPage",
+    "pages/member/MemberSearchPage",
+    "pages/fav/FavListPage",
+    "pages/later/LaterPage",
+    "pages/download/DownloadPage",
+    "pages/history/HistoryPage",
+    "pages/setting/SettingPage",
+    "pages/setting/VideoSettingPage",
+    "pages/DebugHome",
+    "pages/debug/SpikeNet",
+    "pages/debug/SpikePlayer",
+    "pages/debug/SpikeWbi",
+    "pages/debug/SpikeAudio",
+    "pages/debug/Spec01"
+  ]
+}

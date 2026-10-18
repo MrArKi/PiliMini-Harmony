@@ -1,0 +1,9 @@
+{
+  "allowToBackupRestore": true,
+  "excludes": [
+    "/data/storage/el2/base/haps/entry/preferences/",
+    "/data/storage/el2/base/preferences/",
+    "/data/storage/el2/base/haps/entry/files/download/",
+    "/data/storage/el2/base/haps/entry/cache/"
+  ]
+}

@@ -1,0 +1,62 @@
+{
+  "color": [
+    { "name": "member_secondary_container", "value": "#5B3F45" },
+    { "name": "member_on_secondary_container", "value": "#FFD9E0" },
+    {
+      "name": "start_window_background",
+      "value": "#000000"
+    },
+    {
+      "name": "bg_page",
+      "value": "#121212"
+    },
+    {
+      "name": "card_bg",
+      "value": "#1E1E1E"
+    },
+    {
+      "name": "text_primary",
+      "value": "#E8E8E8"
+    },
+    {
+      "name": "text_secondary",
+      "value": "#9BA0A5"
+    },
+    {
+      "name": "divider",
+      "value": "#2A2A2A"
+    },
+    {
+      "name": "brand_pink",
+      "value": "#FB7299"
+    },
+    {
+      "name": "comment_top_bg",
+      "value": "#2A2024"
+    },
+    {
+      "name": "comment_sub_bg",
+      "value": "#262626"
+    },
+    {
+      "name": "btn_soft_bg",
+      "value": "#2A2A2A"
+    },
+    {
+      "name": "glass_bg",
+      "value": "#B31E1E1E"
+    },
+    {
+      "name": "top_bar_mask_start",
+      "value": "#C0000000"
+    },
+    {
+      "name": "top_bar_mask_mid",
+      "value": "#33000000"
+    },
+    {
+      "name": "top_bar_mask_end",
+      "value": "#00000000"
+    }
+  ]
+}
