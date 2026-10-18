@@ -74,6 +74,7 @@ Apache-2.0文本：https://www.apache.org/licenses/LICENSE-2.0 。这些许可�
 
 - **arm64 libmpv**：来自 https://github.com/p1nbored/libmpv-ohos-build/releases/tag/20260831-hdr ，由`tools/prepare-player-deps.cjs`下载并核验SHA256，二进制不入库。
 - **模拟器源码**：mpv、FFmpeg、libplacebo、libass、FreeType、HarfBuzz、FriBidi、Mbed TLS等的具体版本、源码地址和摘要见`tools/player-simulator-sources.json`；源码包、构建工具和输出均在忽略目录。
+- **模拟器本地修改**：`tools/build-player-simulator.cjs`为mpv的OHOS OpenGL尺寸切换添加一次缓冲交换后的补绘，修复暂停末帧停留在旧缓冲尺寸的问题；修改随构建配方公开，仅用于x86_64调试库，生产arm64仍使用上方原始发布库。
 - mpv上游默认GPL-2.0-or-later，排除GPL专属代码的构建可采用LGPL-2.1-or-later；FFmpeg也随启用组件和配置决定许可。`gpl=false`配置本身不能代替实际组件核对。必须保留各自的`Copyright`、`LICENSE*`、补丁与构建信息。
 
 当前Git仓库交付开发源码，不附播放器二进制。未来发布HAP或自行修改内核时，应按该包的实际组成提供许可声明、对应版本源码及必要构建/修改材料，不能只附本仓库的GPL文本或只链接一个上游首页就视为完成。

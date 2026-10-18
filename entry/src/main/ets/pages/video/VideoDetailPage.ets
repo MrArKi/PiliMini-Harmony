@@ -107,10 +107,12 @@ struct VideoDetailPage {
   /** 离线播放：本地文件路径（非空 = 播放已下载文件，播放器同在线一套 UI） */
   private localPath: string = '';
   @State localTitle: string = '';
-  /** 全屏退出：等窗口转回竖屏后再恢复布局（避免横屏闪现详情页） */
+  /** 全屏请求与已提交布局分开；实际窗口到位后与布局一起提交。 */
   private mainWin: window.Window | undefined = undefined;
-  private pendingExitFs: boolean = false;
+  private fullscreenTarget: boolean | undefined = undefined;
   private fsFallbackTimer: number = -1;
+  @State viewportWidth: number = 0;
+  @State viewportHeight: number = 0;
   /** 当前窗口是否横屏（进全屏过渡期：竖屏下播放器保持 16:9 不拉伸） */
   @State isLandscape: boolean = false;
   /** 楼中楼面板 */
@@ -166,6 +168,8 @@ struct VideoDetailPage {
       }
       this.mainWin = win;
       win.on('windowSizeChange', this.windowSizeHandler);
+      const rect: window.Rect = win.getWindowProperties().windowRect;
+      this.onWindowSize({ width: rect.width, height: rect.height });
     }).catch(() => {
       // 忽略
     });
@@ -208,7 +212,8 @@ struct VideoDetailPage {
     }
     // 全屏态直接返回（系统返回键）时恢复竖屏，否则主壳留在横屏；
     // 竖屏视频全屏（未旋转窗口）无需恢复
-    if (this.isFullscreen || this.pendingExitFs || this.isLandscape) {
+    if (this.isFullscreen || this.fullscreenTarget !== undefined || this.isLandscape) {
+      this.fullscreenTarget = undefined;
       this.isFullscreen = false;
       const ctx = getContext(this);
       window.getLastWindow(ctx).then((win: window.Window) => {
@@ -239,13 +244,12 @@ struct VideoDetailPage {
         if (!this.destroyed) { this.followed = followed; }
       });
     }
-    AppStorage.setOrCreate<boolean>('playerFullscreen', this.isFullscreen);
-    refreshSystemBars(getContext(this) as common.UIAbilityContext);
+    this.syncFullscreenBars();
   }
 
   /** 当前分P 的 cid */
   private syncFullscreenBars(): void {
-    AppStorage.setOrCreate<boolean>('playerFullscreen', this.isFullscreen && !this.destroyed);
+    AppStorage.setOrCreate<boolean>('playerFullscreen', (this.fullscreenTarget ?? this.isFullscreen) && !this.destroyed);
     refreshSystemBars(getContext(this) as common.UIAbilityContext);
   }
 
@@ -509,47 +513,61 @@ struct VideoDetailPage {
 
   /** spec-06a：全屏 = 横屏 + 隐藏其它内容（Nara 同构）；竖屏视频全屏不旋转（Nara FullScreenMode.vertical 同构） */
   private async toggleFullscreen(): Promise<void> {
-    if (this.destroyed) { return; }
+    if (this.destroyed || this.fullscreenTarget !== undefined) { return; }
     const generation: number = ++this.orientationGeneration;
+    const target: boolean = !this.isFullscreen;
     if (this.isVerticalVideo()) {
       // 竖屏视频：全屏 = 竖向铺满整屏，不请求横屏旋转
-      this.isFullscreen = !this.isFullscreen;
+      this.isFullscreen = target;
       return;
     }
-    if (this.isFullscreen) {
-      // 退出全屏：先请求竖屏，等窗口真正转回竖屏后再恢复页面布局
-      // （否则横屏瞬间会先闪现详情页，再旋转，观感跳变）
-      this.pendingExitFs = true;
-      if (this.fsFallbackTimer !== -1) {
-        clearTimeout(this.fsFallbackTimer);
+    this.fullscreenTarget = target;
+    this.syncFullscreenBars();
+    // 仅作请求看门狗，正常路径由窗口尺寸事件完成，无动画等待定时器。
+    this.fsFallbackTimer = setTimeout((): void => {
+      this.fsFallbackTimer = -1;
+      if (!this.destroyed && generation === this.orientationGeneration && this.fullscreenTarget !== undefined) {
+        this.finishFullscreen(this.viewportWidth, this.viewportHeight);
+        if (this.fullscreenTarget !== undefined) { this.cancelFullscreen(generation); }
       }
-      this.fsFallbackTimer = setTimeout(() => {
-        this.fsFallbackTimer = -1;
-        if (this.pendingExitFs) {
-          // 兜底：未收到 windowSizeChange（模拟器/异常）时直接恢复
-          this.pendingExitFs = false;
-          this.isFullscreen = false;
-        }
-      }, 1500);
-      try {
-        const win = await this.getWin();
-        if (this.destroyed || generation !== this.orientationGeneration) { return; }
-        await win.setPreferredOrientation(window.Orientation.PORTRAIT);
-      } catch (e) {
-        this.pendingExitFs = false;
-        this.isFullscreen = false;
+    }, 1500);
+    try {
+      const win: window.Window = await this.getWin();
+      if (this.destroyed || generation !== this.orientationGeneration) { return; }
+      await win.setPreferredOrientation(target ? window.Orientation.LANDSCAPE : window.Orientation.PORTRAIT);
+      if (this.destroyed) { await win.setPreferredOrientation(window.Orientation.PORTRAIT); return; }
+      if (generation === this.orientationGeneration) {
+        this.finishFullscreen(this.viewportWidth, this.viewportHeight);
+      } else {
+        // 超时后的迟到请求不能把新请求/已提交的页面留在旧方向。
+        const landscape: boolean = this.fullscreenTarget ?? this.isFullscreen;
+        await win.setPreferredOrientation(landscape ? window.Orientation.LANDSCAPE : window.Orientation.PORTRAIT);
       }
-    } else {
-      this.isFullscreen = true;
-      try {
-        const win = await this.getWin();
-        if (this.destroyed || generation !== this.orientationGeneration) { return; }
-        await win.setPreferredOrientation(window.Orientation.LANDSCAPE);
-        if (this.destroyed) { await win.setPreferredOrientation(window.Orientation.PORTRAIT); }
-      } catch (e) {
-        // 模拟器可能不支持，忽略
-      }
+    } catch (e) {
+      this.cancelFullscreen(generation);
     }
+  }
+
+  private finishFullscreen(width: number, height: number): void {
+    const target: boolean | undefined = this.fullscreenTarget;
+    if (this.destroyed || target === undefined || width <= 0 || height <= 0 || (width > height) !== target) { return; }
+    if (this.fsFallbackTimer !== -1) { clearTimeout(this.fsFallbackTimer); this.fsFallbackTimer = -1; }
+    this.fullscreenTarget = undefined;
+    this.isFullscreen = target;
+  }
+
+  private cancelFullscreen(generation: number): void {
+    if (this.destroyed || generation !== this.orientationGeneration || this.fullscreenTarget === undefined) { return; }
+    if (this.fsFallbackTimer !== -1) { clearTimeout(this.fsFallbackTimer); this.fsFallbackTimer = -1; }
+    this.fullscreenTarget = undefined;
+    this.orientationGeneration++;
+    this.syncFullscreenBars();
+    if (this.mainWin !== undefined) {
+      this.mainWin.setPreferredOrientation(this.isFullscreen ? window.Orientation.LANDSCAPE : window.Orientation.PORTRAIT)
+        .catch((): void => { console.warn('[VideoDetail] 恢复屏幕方向失败'); });
+    }
+    console.warn('[VideoDetail] 全屏方向切换未完成');
+    promptAction.showToast({ message: '屏幕方向切换未完成，请重试' });
   }
 
   private async getWin(): Promise<window.Window> {
@@ -563,23 +581,17 @@ struct VideoDetailPage {
     return nw;
   }
 
-  /** 窗口尺寸变化：退出全屏流程等待转回竖屏后收尾 */
+  /** 方向已真实改变，在ArkUI下一轮布局前提交，避免先布局中间尺寸Surface。 */
   private onWindowSize(size: window.Size): void {
+    this.viewportWidth = size.width; this.viewportHeight = size.height;
     this.isLandscape = size.width > size.height;
-    if (this.pendingExitFs && size.height > size.width) {
-      this.pendingExitFs = false;
-      if (this.fsFallbackTimer !== -1) {
-        clearTimeout(this.fsFallbackTimer);
-        this.fsFallbackTimer = -1;
-      }
-      this.isFullscreen = false;
-    }
+    this.finishFullscreen(size.width, size.height);
   }
 
   /** 系统返回（侧滑/按键）：全屏时先退全屏，不退出页面 */
   onBackPress(): boolean {
     if (this.subShown || this.subClosing) { this.closeSub(); return true; }
-    if (this.pendingExitFs) {
+    if (this.fullscreenTarget !== undefined) {
       return true;
     }
     if (this.isFullscreen) {
@@ -1415,7 +1427,9 @@ struct VideoDetailPage {
                 this.goHome();
               },
               viewHeight: '100%',
-              canvasHeight: this.playerHeight(),
+              canvasWidth: this.viewportWidth > 0 ? px2vp(this.viewportWidth) : Math.min(this.screenW, this.screenH),
+              canvasHeight: this.isFullscreen && this.viewportHeight > 0 ? px2vp(this.viewportHeight) :
+                (this.isFullscreen ? Math.max(this.screenW, this.screenH) : this.playerHeight()),
               viewportHeight: this.playerBoxHeight() - this.statusBarH,
               onStateChange: (st: string) => {
                 if (st === 'playing' && this.scrollAcc > 0) {

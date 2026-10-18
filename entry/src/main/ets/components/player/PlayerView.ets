@@ -86,6 +86,8 @@ export struct PlayerView {
   @Prop viewHeight: string = '100%';
   /** Surface保留原尺寸，合成层按可见容器做contain缩放，复刻Nara动态头部约束。 */
   @Prop canvasHeight: number = 0;
+  /** 宿主与全屏状态一起提交尺寸，视频不能比控制层晚一个onAreaChange。 */
+  @Prop canvasWidth: number = 0;
   @Prop viewportHeight: number = 0;
 
   @State state: string = 'idle'; // idle | loading | playing | paused | error
@@ -147,10 +149,11 @@ export struct PlayerView {
     return this.actualRatio > 0 ? this.actualRatio :
       (this.sourceWidth > 0 && this.sourceHeight > 0 ? this.sourceWidth / this.sourceHeight : 16 / 9);
   }
-  private canvasH(): number { return !this.isFullscreen && this.canvasHeight > 0 ? this.canvasHeight : this.playerH; }
-  private surfaceWidth(): number { return Math.min(this.playerW, this.canvasH() * this.videoRatio()); }
-  private surfaceHeight(): number { return Math.min(this.canvasH(), this.playerW / this.videoRatio()); }
-  private viewportH(): number { return !this.isFullscreen && this.viewportHeight > 0 ? this.viewportHeight : this.playerH; }
+  private canvasW(): number { return this.canvasWidth > 0 ? this.canvasWidth : this.playerW; }
+  private canvasH(): number { return this.canvasHeight > 0 ? this.canvasHeight : this.playerH; }
+  private surfaceWidth(): number { return Math.min(this.canvasW(), this.canvasH() * this.videoRatio()); }
+  private surfaceHeight(): number { return Math.min(this.canvasH(), this.canvasW() / this.videoRatio()); }
+  private viewportH(): number { return this.isFullscreen ? this.canvasH() : (this.viewportHeight > 0 ? this.viewportHeight : this.playerH); }
   private canvasScale(): number { return Math.min(1, this.viewportH() / Math.max(1, this.surfaceHeight())); }
 
   aboutToAppear(): void {

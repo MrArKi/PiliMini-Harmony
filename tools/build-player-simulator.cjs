@@ -23,6 +23,7 @@ const posix = p => normalized(path.resolve(p)).replace(/^([a-z]):/i, (_, drive) 
 const quoted = s => "'" + s.replaceAll("'", "'\\''") + "'";
 const sha = file => fs.existsSync(file) ? crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex') : '';
 const lockHash = sha(path.join(__dirname, 'player-simulator-sources.json'));
+const recipeHash = sha(__filename);
 function run(exe, argv, cwd = root, capture = false) {
   const result = spawnSync(exe, argv, { cwd, env: process.env, windowsHide: true,
     stdio: capture ? 'pipe' : 'inherit', maxBuffer: 32 * 1024 * 1024 });
@@ -41,11 +42,32 @@ function download(item) {
 function write(file, content) { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, content); }
 function copy(from, to) { fs.mkdirSync(path.dirname(to), { recursive: true }); fs.cpSync(from, to, { recursive: true }); }
 function meson(...argv) { run(python, ['-m', 'mesonbuild.mesonmain', ...argv]); }
+function patchSimulatorResize(source) {
+  const file = path.join(source, 'video', 'out', 'opengl', 'context_ohos.c');
+  let text = fs.readFileSync(file, 'utf8').replaceAll('\r\n', '\n');
+  const marker = 'PiliMini simulator: redraw once after EGL acquires the resized buffer.';
+  if (text.includes(marker)) return;
+  const replace = (before, after) => {
+    if (text.split(before).length !== 2) throw new Error('模拟器EGL补绘补丁与锁定源码不匹配');
+    text = text.replace(before, after);
+  };
+  replace('    EGLSurface egl_surface;\n', '    EGLSurface egl_surface;\n    bool resized;\n');
+  replace('    eglSwapBuffers(p->egl_display, p->egl_surface);\n',
+    '    eglSwapBuffers(p->egl_display, p->egl_surface);\n' +
+    '    // ' + marker + '\n' +
+    '    if (p->resized) {\n        p->resized = false;\n' +
+    '        ctx->vo->want_redraw = true;\n        vo_wakeup(ctx->vo);\n    }\n');
+  replace('static bool ohos_reconfig(struct ra_ctx *ctx)\n{\n',
+    'static bool ohos_reconfig(struct ra_ctx *ctx)\n{\n    struct priv *p = ctx->priv;\n');
+  replace('    ctx->vo->dwidth = w;\n',
+    '    p->resized |= ctx->vo->dwidth != w || ctx->vo->dheight != h;\n    ctx->vo->dwidth = w;\n');
+  write(file, text);
+}
 function main() {
   fs.mkdirSync(cache, { recursive: true });
   if (fs.existsSync(stamp) && !args.includes('--rebuild')) {
     const previous = JSON.parse(fs.readFileSync(stamp));
-    if (previous.lockHash === lockHash && sha(target) === previous.libraryHash) {
+    if (previous.lockHash === lockHash && previous.recipeHash === recipeHash && sha(target) === previous.libraryHash) {
       console.log('libmpv x86_64 debug SHA256 verified'); return;
     }
   }
@@ -69,6 +91,8 @@ function main() {
   for (const item of manifest.tools) run('tar', ['-xf', download(item), '-C', cache]);
   const patch = download(manifest.patch);
   const source = name => path.join(cache, manifest.sources.find(s => s.file.startsWith(name)).directory);
+  // 只影响模拟器O0库；暂停尺寸切换也需正确末帧，不能通过短暂播放强制刷新。
+  patchSimulatorResize(source('mpv'));
   // 上游external-YUV补丁是Nara鸿蒙移植的一部分，不能省略。
   const patchArgs = ['apply', '--check', patch];
   const check = spawnSync('git', patchArgs, { cwd: source('placebo'), windowsHide: true, stdio: 'ignore' });
@@ -178,7 +202,7 @@ function main() {
     '-Dpulse=disabled','-Dalsa=disabled','-Dopenal=disabled','-Dsdl2-gamepad=disabled','-Dopensles=disabled',
     '-Db_ndebug=false','-Dc_args=-fPIC'], true);
   copy(path.join(cache,'build-mpv','libmpv.so'),target);
-  write(stamp, JSON.stringify({lockHash,libraryHash:sha(target),buildtype:'debug',architecture:'x86_64',
+  write(stamp, JSON.stringify({lockHash,recipeHash,libraryHash:sha(target),buildtype:'debug',architecture:'x86_64',
     note:'模拟器OpenGL优化构建崩溃尚未定位，使用O0；生产arm64保持Nara原始发布库。'},null,2) + '\n');
   console.log('libmpv x86_64 built: ' + sha(target));
 }
