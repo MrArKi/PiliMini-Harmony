@@ -65,8 +65,11 @@ interface FoldersData { list?: MemberFolder[]; count?: number; has_more?: boolea
 export interface MemberFolderResult { items: MemberFolder[]; hasMore: boolean; }
 
 export function memberUrl(url: string): string {
-  if (!url) { return ''; }
-  return url.startsWith('//') ? 'https:' + url : url.replace(/^http:/, 'https:');
+  const value: string = (url || '').trim();
+  // WBI top_photo也会返回bfs/space/...；不能把相对路径当域名请求。
+  if (/^\/?bfs\//.test(value)) { return 'https://i0.hdslb.com/' + value.replace(/^\//, ''); }
+  const absolute: string = value.startsWith('//') ? 'https:' + value : value;
+  return /^https?:\/\/[^/\s]+(?:\/|$)/i.test(absolute) ? absolute.replace(/^http:/i, 'https:') : '';
 }
 function duration(v: ArchiveRaw): number {
   if (v.duration !== undefined) { return v.duration; }
@@ -112,7 +115,7 @@ export class MemberService {
       const info: ProfileRaw = await read<ProfileRaw>('/x/space/wbi/acc/info', {
         'mid': mid.toString(), 'platform': 'web', 'web_location': '1550101'
       }, true, mid);
-      result.banner = memberUrl(info.top_photo || result.banner); result.sign = info.sign || result.sign;
+      result.banner = memberUrl(info.top_photo || '') || result.banner; result.sign = info.sign || result.sign;
       result.level = info.level || result.level; result.official = info.official?.title || result.official;
     } catch (_) { /* API可能限制WBI资料；基础card不受影响。 */ }
     return result;
