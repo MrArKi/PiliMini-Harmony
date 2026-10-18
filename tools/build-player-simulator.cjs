@@ -23,7 +23,9 @@ const posix = p => normalized(path.resolve(p)).replace(/^([a-z]):/i, (_, drive) 
 const quoted = s => "'" + s.replaceAll("'", "'\\''") + "'";
 const sha = file => fs.existsSync(file) ? crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex') : '';
 const lockHash = sha(path.join(__dirname, 'player-simulator-sources.json'));
-const recipeHash = sha(__filename);
+const workerPatch = path.join(__dirname, 'player-simulator-vo-worker.c');
+const recipeHash = crypto.createHash('sha256').update(fs.readFileSync(__filename))
+  .update(fs.readFileSync(workerPatch)).digest('hex');
 function run(exe, argv, cwd = root, capture = false) {
   const result = spawnSync(exe, argv, { cwd, env: process.env, windowsHide: true,
     stdio: capture ? 'pipe' : 'inherit', maxBuffer: 32 * 1024 * 1024 });
@@ -63,6 +65,33 @@ function patchSimulatorResize(source) {
     '    p->resized |= ctx->vo->dwidth != w || ctx->vo->dheight != h;\n    ctx->vo->dwidth = w;\n');
   write(file, text);
 }
+function patchSimulatorVoWorker(source) {
+  const file = path.join(source, 'video', 'out', 'vo.c');
+  let text = fs.readFileSync(file, 'utf8').replaceAll('\r\n', '\n');
+  const marker = '// PiliMini simulator: reuse one VO executor for the EGL thread connection.';
+  // Replace our previous insertion too, so changes to the helper take effect.
+  const end = '// PiliMini simulator: end VO executor.';
+  if (text.includes(marker)) {
+    const from = text.indexOf(marker), to = text.indexOf(end, from);
+    if (to < 0) throw new Error('模拟器VO补丁边界缺失');
+    text = text.slice(0, from) + text.slice(to + end.length + 1);
+    text = text.replace('    bool pm_sim_reused, pm_sim_done;\n', '')
+      .replace('if (pm_sim_start_vo(vo))', 'if (mp_thread_create(&vo->in->thread, vo_thread, vo))')
+      .replaceAll('pm_sim_join_vo(vo);', 'mp_thread_join(vo->in->thread);');
+  }
+  const replace = (before, after, count = 1) => {
+    if (text.split(before).length !== count + 1) throw new Error('模拟器VO补丁与锁定源码不匹配');
+    text = text.replaceAll(before, after);
+  };
+  replace('    mp_thread thread;\n', '    mp_thread thread;\n    bool pm_sim_reused, pm_sim_done;\n');
+  const declaration = 'static MP_THREAD_VOID vo_thread(void *ptr);\n';
+  replace(declaration, declaration + marker + '\n' + fs.readFileSync(workerPatch, 'utf8') + '\n' + end + '\n');
+  replace('if (mp_thread_create(&vo->in->thread, vo_thread, vo))', 'if (pm_sim_start_vo(vo))');
+  // The inserted fallback also calls join: limit the replacement to original call sites.
+  replace('        mp_thread_join(vo->in->thread);\n        goto error;', '        pm_sim_join_vo(vo);\n        goto error;');
+  replace('    mp_thread_join(vo->in->thread);\n    dealloc_vo(vo);', '    pm_sim_join_vo(vo);\n    dealloc_vo(vo);');
+  write(file, text);
+}
 function main() {
   fs.mkdirSync(cache, { recursive: true });
   if (fs.existsSync(stamp) && !args.includes('--rebuild')) {
@@ -93,6 +122,7 @@ function main() {
   const source = name => path.join(cache, manifest.sources.find(s => s.file.startsWith(name)).directory);
   // 只影响模拟器O0库；暂停尺寸切换也需正确末帧，不能通过短暂播放强制刷新。
   patchSimulatorResize(source('mpv'));
+  patchSimulatorVoWorker(source('mpv'));
   // 上游external-YUV补丁是Nara鸿蒙移植的一部分，不能省略。
   const patchArgs = ['apply', '--check', patch];
   const check = spawnSync('git', patchArgs, { cwd: source('placebo'), windowsHide: true, stdio: 'ignore' });

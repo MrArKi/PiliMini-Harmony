@@ -35,6 +35,7 @@
 
 # 仅保留可复现构建所需的辅助工具。
 /tools/*
+!/tools/player-simulator-vo-worker.c
 !/tools/dev.sh
 !/tools/prepare-player-deps.cjs
 !/tools/build-player-simulator.cjs

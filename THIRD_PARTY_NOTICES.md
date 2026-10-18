@@ -7,6 +7,7 @@ PiliMini自身采用GPL-3.0-only。以下组件、图形数据及其修改仍保
 - **PiliNara**：https://github.com/dev4harmony/PiliNara/tree/ohos ，上游项目还包括 https://github.com/Starfallan/PiliNara 及 https://github.com/bggRGjQaUbCoE/PiliPlus 。Nara的LICENSE为GNU GPL v3（https://github.com/dev4harmony/PiliNara/blob/ohos/LICENSE）。PiliMini以ArkTS/ArkUI重新组织界面和业务，参考其布局、动效、交互、播放器参数、后台行为及WBI签名；`member_level_*.svg`改编自Nara的`LevelCanvas`几何。保留上游项目及贡献者的版权，不将改编部分标为完全原创。
 - **bilibili-API-collect**：https://github.com/SocialSisterYi/bilibili-API-collect ，仅用作接口资料参考；不将其整份文档复制入本仓库。
 - `common/feed_navigation.ets`及主壳导航处理参考Nara的`pages/main/controller.dart`、`pages/common/common_controller.dart`和`utils/extension/scroll_controller_ext.dart`的单击回顶、双击刷新及500ms回顶规则；`components/FavFolderCard.ets`参考Nara的`FavVideoItem`/`FavFolderItem`的封面行与横向叠层预览。
+- 下载资料库、版本化有序文件夹、离线播放范围与续播入口参考Nara [2.1.6.1-ohos](https://github.com/dev4harmony/PiliNara/tree/2.1.6.1-ohos/lib/pages/download)及上游[2.6.1.1](https://github.com/Starfallan/PiliNara/tree/2.6.1.1/lib/services/download)；卡片布局与选中动画参考`PageInfoItem`、`DetailItem`和`select_mask.dart`。以ArkTS服务、系统原生下载和现有播放器重新组织，不包含上游Dart流下载实现。
 
 ## 源码中保留的第三方内容
 
@@ -76,6 +77,7 @@ Apache-2.0文本：https://www.apache.org/licenses/LICENSE-2.0 。这些许可�
 - **arm64 libmpv**：来自 https://github.com/p1nbored/libmpv-ohos-build/releases/tag/20260831-hdr ，由`tools/prepare-player-deps.cjs`下载并核验SHA256，二进制不入库。
 - **模拟器源码**：mpv、FFmpeg、libplacebo、libass、FreeType、HarfBuzz、FriBidi、Mbed TLS等的具体版本、源码地址和摘要见`tools/player-simulator-sources.json`；源码包、构建工具和输出均在忽略目录。
 - **模拟器本地修改**：`tools/build-player-simulator.cjs`为mpv的OHOS OpenGL尺寸切换添加一次缓冲交换后的补绘，修复暂停末帧停留在旧缓冲尺寸的问题；修改随构建配方公开，仅用于x86_64调试库，生产arm64仍使用上方原始发布库。
+- `tools/player-simulator-vo-worker.c`（LGPL-2.1-or-later）由构建脚本插入锁定版本mpv的`video/out/vo.c`，复用一个VO执行线程，完整保留每个VO的初始化/释放与等待结束语义。用于限制模拟器EGL驱动的每线程连接残留；源码纳入构建摘要，不修改arm64发布库。此文件为构建源码，仓库不包含可执行程序。
 - mpv上游默认GPL-2.0-or-later，排除GPL专属代码的构建可采用LGPL-2.1-or-later；FFmpeg也随启用组件和配置决定许可。`gpl=false`配置本身不能代替实际组件核对。必须保留各自的`Copyright`、`LICENSE*`、补丁与构建信息。
 
 当前Git仓库交付开发源码，不附播放器二进制。未来发布HAP或自行修改内核时，应按该包的实际组成提供许可声明、对应版本源码及必要构建/修改材料，不能只附本仓库的GPL文本或只链接一个上游首页就视为完成。

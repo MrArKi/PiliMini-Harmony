@@ -9,10 +9,14 @@ import { AuthService } from '../../service/auth_service';
 import { PlaybackPos } from '../storage/playback_pos';
 import { prefsGet } from '../storage/prefs';
 import { onAppBackground, onAppForeground } from '../event/app_events';
+import { DownloadLibraryService } from '../../service/download_library_service';
 
 export interface PlaybackSource {
   bvid: string; cid: number; localPath: string;
   title: string; artist: string; cover: string;
+  localDuration?: number;
+  offlineScope?: string;
+  offlineKey?: string;
 }
 
 export class PlaybackSnapshot {
@@ -209,7 +213,9 @@ export class PlayController {
     const same: boolean = preserve && previous !== undefined && previous.bvid === source.bvid &&
       previous.cid === source.cid && previous.localPath === source.localPath;
     if (this.history !== undefined) { this.history.flush(); }
-    if (previous === undefined || previous.bvid !== source.bvid || previous.cid !== source.cid) {
+    if (source.localPath.length > 0) {
+      this.history = undefined;
+    } else if (previous === undefined || previous.localPath.length > 0 || previous.bvid !== source.bvid || previous.cid !== source.cid) {
       this.history = new PlaybackHistory(source.bvid, source.cid);
     }
     this.savePosition(true);
@@ -239,7 +245,12 @@ export class PlayController {
       let start: number = position;
       if (source.localPath.length > 0) {
         info = { videoUrl: 'file://' + source.localPath, audioUrl: '', videoBackup: [], audioBackup: [],
-          qualities: [], currentQn: 0, durationMs: 0, isDash: false };
+          qualities: [], currentQn: 0, durationMs: (source.localDuration || 0) * 1000, isDash: false };
+        if (!same) {
+          const saved: number = await PlaybackPos.get(source.bvid, source.cid);
+          if (!this.current(generation)) { return; }
+          if (saved > 5000 && (info.durationMs <= 0 || saved < info.durationMs - 400)) { start = saved; }
+        }
       } else {
         const logged: boolean = await AuthService.isLogin();
         if (!this.current(generation)) { return; }
@@ -488,16 +499,21 @@ export class PlayController {
   private savePosition(force: boolean): void {
     const source: PlaybackSource | undefined = this.source;
     const ms: number = this.state.position;
-    if (source === undefined || source.localPath.length > 0 || ms <= 0 || this.state.duration <= 0) { return; }
-    if (ms > this.state.duration - 10000) {
+    if (source === undefined || ms <= 0 || this.state.duration <= 0) { return; }
+    const offline: boolean = source.localPath.length > 0;
+    if (ms > this.state.duration - (offline ? 400 : 10000)) {
       if (this.lastSaved !== -1) {
         this.lastSaved = -1;
-        PlaybackPos.clearIfFinished(source.bvid, source.cid, ms, this.state.duration);
+        PlaybackPos.remove(source.bvid, source.cid);
       }
       return;
     }
     if (force || Date.now() - this.lastSavedAt >= (this.background ? 30000 : 15000)) {
       this.lastSaved = ms; this.lastSavedAt = Date.now();
+      if (offline && ms > 5000) {
+        DownloadLibraryService.remember(source.bvid, source.cid,
+          { scope: source.offlineScope || 'all', key: source.offlineKey || '' });
+      }
       if (force) { PlaybackPos.flush(source.bvid, source.cid, ms); }
       else { PlaybackPos.save(source.bvid, source.cid, ms); }
     }

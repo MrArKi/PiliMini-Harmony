@@ -101,6 +101,9 @@ export interface VideoDetail {
   danmakuCount: number;
   replyCount: number;
   pages: VideoPageInfo[];
+  seasonId?: string;
+  seasonTitle?: string;
+  seasonOrder?: number;
 }
 
 interface ViewDimensionRaw {
@@ -128,7 +131,12 @@ interface ViewDataRaw {
   owner: OwnerInfo;
   stat: StatInfo;
   pages?: ViewPageRaw[];
+  ugc_season?: ViewSeasonRaw;
 }
+
+interface ViewEpisodeRaw { aid?: number; bvid?: string; }
+interface ViewSectionRaw { episodes?: ViewEpisodeRaw[]; }
+interface ViewSeasonRaw { id: number; title: string; sections?: ViewSectionRaw[]; }
 
 // ===== 评论 =====
 
@@ -607,6 +615,14 @@ export class VideoService {
         pages.push({ cid: p.cid, page: p.page, part: p.part, duration: p.duration, width: vw, height: vh });
       }
     }
+    let seasonOrder: number = 0;
+    let order: number = 0;
+    for (const section of d.ugc_season?.sections || []) {
+      for (const episode of section.episodes || []) {
+        order++;
+        if (episode.bvid === d.bvid || episode.aid === d.aid) { seasonOrder = order; }
+      }
+    }
     return {
       aid: d.aid,
       bvid: d.bvid,
@@ -621,7 +637,9 @@ export class VideoService {
       viewCount: d.stat.view,
       danmakuCount: d.stat.danmaku !== undefined ? d.stat.danmaku : 0,
       replyCount: d.stat.reply !== undefined ? d.stat.reply : 0,
-      pages: pages
+      pages: pages,
+      seasonId: d.ugc_season ? d.ugc_season.id.toString() : '',
+      seasonTitle: d.ugc_season?.title || '', seasonOrder: seasonOrder
     };
   }
 
@@ -1001,6 +1019,7 @@ export class VideoService {
     if (durl === undefined || durl === null || durl.length === 0 || durl[0].url === undefined) {
       throw new AppError('parse', -1, '无 durl 下载源（可能需登录/大会员）');
     }
+    if (durl.length !== 1) { throw new AppError('parse', -1, '该下载源包含多个媒体段，暂不支持缓存'); }
     const backup: string[] = [];
     const bu: string[] | undefined = durl[0].backup_url;
     if (bu !== undefined && bu !== null) {
@@ -1016,6 +1035,7 @@ export class VideoService {
     return {
       url: main,
       backup: backup,
+      quality: resp.data.quality || qn,
       durationMs: resp.data.timelength !== undefined ? resp.data.timelength : 0,
       size: durl[0].size !== undefined ? durl[0].size : 0
     };
@@ -1026,6 +1046,7 @@ export class VideoService {
 export interface DownloadUrl {
   url: string;
   backup: string[];
+  quality: number;
   durationMs: number;
   /** 文件字节数（0 表示未知） */
   size: number;

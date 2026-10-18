@@ -24,8 +24,9 @@ function two(n: number): string {
 }
 
 export function formatDuration(sec: number): string {
-  const m: number = Math.floor(sec / 60);
-  const s: number = sec % 60;
+  const whole: number = Number.isFinite(sec) ? Math.max(0, Math.floor(sec)) : 0;
+  const m: number = Math.floor(whole / 60);
+  const s: number = whole % 60;
   return two(m) + ':' + two(s);
 }
 

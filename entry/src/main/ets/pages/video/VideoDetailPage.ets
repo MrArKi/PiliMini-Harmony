@@ -14,6 +14,7 @@ import { AsyncImage } from '../../components/AsyncImage';
 import { CommentItemView, CommentSkeleton } from '../../components/CommentItem';
 import { PlayerView } from '../../components/player/PlayerView';
 import { refreshSystemBars } from '../../infra/player/system_bars';
+import { PlaybackSource } from '../../infra/player/play_controller';
 import { LoadingFooter } from '../../components/StateViews';
 import { formatPlayCount, formatDuration } from '../../components/VideoCard';
 import { VideoItem } from '../../model/video_item';
@@ -22,6 +23,8 @@ import { SubReplyPanel } from '../../components/SubReplyPanel';
 import { AuthService } from '../../service/auth_service';
 import { FavService, FavFolder } from '../../service/fav_service';
 import { DownloadService, DownloadTask } from '../../service/download_service';
+import { DownloadLibraryService } from '../../service/download_library_service';
+import { OfflineContext } from '../../model/download';
 import { prefsGet } from '../../infra/storage/prefs';
 
 function two(n: number): string {
@@ -96,7 +99,7 @@ struct VideoDetailPage {
   private exitPending: boolean = false;
   private commentGeneration: number = 0;
   private orientationGeneration: number = 0;
-  private localCid: number = 0;
+  @State localCid: number = 0;
   private routeIndex: number = 0;
   private hideTimer: number = -1;
   @State nativeWidth: number = 0;
@@ -105,7 +108,14 @@ struct VideoDetailPage {
     if (!this.destroyed) { this.onWindowSize(size); }
   };
   /** 离线播放：本地文件路径（非空 = 播放已下载文件，播放器同在线一套 UI） */
-  private localPath: string = '';
+  @State localPath: string = '';
+  @State localCover: string = '';
+  @State localArtist: string = '';
+  @State localDuration: number = 0;
+  @State localSource: PlaybackSource | undefined = undefined;
+  private offlineContext: OfflineContext = new OfflineContext();
+  @State offlineTasks: DownloadTask[] = [];
+  private offlineDs: BasicDataSource<DownloadTask> = new BasicDataSource<DownloadTask>();
   @State localTitle: string = '';
   /** 全屏请求与已提交布局分开；实际窗口到位后与布局一起提交。 */
   private mainWin: window.Window | undefined = undefined;
@@ -153,7 +163,10 @@ struct VideoDetailPage {
   aboutToAppear(): void {
     DownloadService.init(getContext(this) as common.Context);
     DownloadService.onChange(this.downloadChange);
-    DownloadService.load().then((): void => { this.refreshCacheState(); });
+    DownloadService.load().then((): void => { this.refreshCacheState(); }).catch((): void => {
+      // 下载资料损坏只影响缓存管理，不能阻断在线播放；缓存入口会报告原错误。
+      if (!this.destroyed) { this.cachedCids = []; }
+    });
     try {
       const disp = display.getDefaultDisplaySync();
       this.screenW = px2vp(disp.width);
@@ -185,12 +198,16 @@ struct VideoDetailPage {
       if (lp !== undefined && lp.length > 0) {
         this.localPath = lp;
         this.localCid = parseInt(pm['cid'] || '0', 10);
+        this.localCover = pm['localCover'] || ''; this.localArtist = pm['localArtist'] || '';
+        this.localDuration = Number(pm['localDuration'] || '0');
+        this.offlineContext = { scope: pm['offlineScope'] || 'all', key: pm['offlineKey'] || '' };
       }
       const lt: string | undefined = pm['title'];
       if (lt !== undefined) {
         this.localTitle = lt;
       }
     }
+    if (this.localPath) { this.updateLocalSource(); }
     this.fetch();
   }
 
@@ -365,6 +382,19 @@ struct VideoDetailPage {
   }
 
   private async fetch(): Promise<void> {
+    if (this.localPath.length > 0) {
+      try {
+        await DownloadService.load();
+        if (this.destroyed) { return; }
+        this.offlineTasks = DownloadLibraryService.playlist(this.offlineContext);
+        this.offlineDs.reload(this.offlineTasks);
+        const task = this.offlineTasks.find((t: DownloadTask): boolean => t.bvid === this.bvid && t.cid === this.localCid);
+        if (!task) { this.error = '本地文件已失效，请返回缓存页检查'; }
+        else { this.localCover = task.cover; this.localArtist = task.upName; this.localDuration = task.duration; }
+      } catch (e) { if (!this.destroyed) { this.error = (e as Error).message; } }
+      if (!this.destroyed) { this.loading = false; }
+      return;
+    }
     if (this.bvid.length === 0) {
       this.error = '缺少 bvid';
       this.loading = false;
@@ -663,7 +693,8 @@ struct VideoDetailPage {
       const existing: DownloadTask | undefined = DownloadService.list().find((t: DownloadTask): boolean =>
         t.bvid === this.bvid && t.cid === p.cid);
       if (existing !== undefined && existing.status === 'failed') { await DownloadService.resume(p.cid); }
-      else { await DownloadService.add(this.bvid, p.cid, d.title, d.cover, realQn, part, p.duration, d.ownerName); }
+      else { await DownloadService.add(this.bvid, p.cid, d.title, d.cover, realQn, part, p.duration, d.ownerName,
+        { page: p.page, seasonId: d.seasonId || '', seasonTitle: d.seasonTitle || '', seasonOrder: d.seasonOrder || 0 }); }
       this.refreshCacheState();
       promptAction.showToast({ message: '已加入缓存队列' });
     } catch (e) {
@@ -1183,6 +1214,67 @@ struct VideoDetailPage {
       .translate({ x: '100%' })
   }
 
+  private offlineIndex(): number {
+    return this.offlineTasks.findIndex((t: DownloadTask): boolean => t.bvid === this.bvid && t.cid === this.localCid);
+  }
+
+  private updateLocalSource(): void {
+    this.localSource = { bvid: this.bvid, cid: this.localCid, localPath: this.localPath,
+      title: this.localTitle, artist: this.localArtist, cover: this.localCover, localDuration: this.localDuration,
+      offlineScope: this.offlineContext.scope, offlineKey: this.offlineContext.key };
+  }
+
+  private playOffline(task: DownloadTask): void {
+    if (this.exitPending || this.destroyed) { return; }
+    if (!DownloadLibraryService.available(task)) { promptAction.showToast({ message: '本地文件已失效' }); return; }
+    // 同一页面/Surface保留全屏和倍速，单个源快照避免不同P的字段交叉。
+    this.bvid = task.bvid; this.localCid = task.cid; this.localPath = task.filePath;
+    this.localCover = task.cover; this.localArtist = task.upName; this.localDuration = task.duration;
+    this.localTitle = task.part ? task.title + ' · ' + task.part : task.title;
+    this.nativeWidth = 0; this.nativeHeight = 0; this.updateLocalSource();
+  }
+
+  private nextOffline(delta: number): void {
+    const index: number = this.offlineIndex() + delta;
+    if (index >= 0 && index < this.offlineTasks.length) { this.playOffline(this.offlineTasks[index]); }
+  }
+
+  @Builder
+  OfflinePanel() {
+    Column({ space: 8 }) {
+      Text(this.localTitle).fontSize(16).fontColor($r('app.color.text_primary'))
+        .width('100%').maxLines(2).padding({ left: 12, right: 12, top: 12 })
+      Row() {
+        Text('上一集').id('offline_previous').fontSize(13).fontColor($r('app.color.brand_pink'))
+          .opacity(this.offlineIndex() > 0 ? 1 : 0.35).enabled(this.offlineIndex() > 0)
+          .padding(12).onClick(() => { this.nextOffline(-1); })
+        Blank()
+        Text('本地播放 · ' + (this.offlineIndex() + 1).toString() + '/' + this.offlineTasks.length.toString())
+          .fontSize(12).fontColor($r('app.color.text_secondary'))
+        Blank()
+        Text('下一集').id('offline_next').fontSize(13).fontColor($r('app.color.brand_pink'))
+          .opacity(this.offlineIndex() + 1 < this.offlineTasks.length ? 1 : 0.35)
+          .enabled(this.offlineIndex() + 1 < this.offlineTasks.length)
+          .padding(12).onClick(() => { this.nextOffline(1); })
+      }.width('100%')
+      List() {
+        LazyForEach(this.offlineDs, (t: DownloadTask) => {
+          ListItem() {
+            Row({ space: 10 }) {
+              Image($r('app.media.icon_play')).width(16).height(16)
+                .fillColor(t.cid === this.localCid ? $r('app.color.brand_pink') : $r('app.color.text_secondary'))
+              Text(t.part || t.title).fontSize(14).layoutWeight(1).maxLines(2)
+                .fontColor(t.cid === this.localCid ? $r('app.color.brand_pink') : $r('app.color.text_primary'))
+              Text(formatDuration(t.duration)).fontSize(12).fontColor($r('app.color.text_secondary'))
+            }.width('100%').padding({ left: 12, right: 12, top: 14, bottom: 14 })
+              .id('offline_item_' + t.cid.toString()).onClick(() => { if (t.cid !== this.localCid) { this.playOffline(t); } })
+          }
+        }, (t: DownloadTask): string => t.bvid + ':' + t.cid.toString())
+      }.width('100%').layoutWeight(1).cachedCount(1)
+        .edgeEffect(EdgeEffect.None, { alwaysEnabled: true }).nestedScroll(DETAIL_NESTED_SCROLL)
+    }.width('100%').height(this.bodyHeight())
+  }
+
   build() {
     Stack({ alignContent: Alignment.TopStart }) {
       Refresh({ refreshing: $$this.refreshing, builder: this.EmptyRefreshIndicator() }) {
@@ -1211,6 +1303,8 @@ struct VideoDetailPage {
         }
         .layoutWeight(1)
         .justifyContent(FlexAlign.Center)
+      } else if (this.localPath.length > 0 && !this.isFullscreen) {
+        this.OfflinePanel()
       } else if (this.detail !== undefined && !this.isFullscreen) {
         Stack({ alignContent: Alignment.TopStart }) {
         Column() {
@@ -1413,14 +1507,18 @@ struct VideoDetailPage {
               registerRelease: (release: () => Promise<void>): void => { this.releasePlayer = release; },
               bvid: this.bvid,
               cid: this.currentCid(),
-              cover: this.detail !== undefined ? this.detail.cover : '',
+              cover: this.detail !== undefined ? this.detail.cover : this.localCover,
               title: this.detail !== undefined ? this.detail.title : this.localTitle,
-              artist: this.detail !== undefined ? this.detail.ownerName : '',
+              artist: this.detail !== undefined ? this.detail.ownerName : this.localArtist,
               partText: this.partLabel(),
               danmakuCount: this.detail !== undefined ? this.detail.danmakuCount : 0,
               isFullscreen: this.isFullscreen,
               autoPlay: true,
               localPath: this.localPath,
+              localSource: this.localSource,
+              localDuration: this.localDuration,
+              offlineScope: this.offlineContext.scope,
+              offlineKey: this.offlineContext.key,
               resumeTick: this.resumeTick,
               collapseRatio: this.collapseRatio,
               onGoHome: () => {
@@ -1432,6 +1530,7 @@ struct VideoDetailPage {
                 (this.isFullscreen ? Math.max(this.screenW, this.screenH) : this.playerHeight()),
               viewportHeight: this.playerBoxHeight() - this.statusBarH,
               onStateChange: (st: string) => {
+                if (st === 'completed' && this.localPath.length > 0) { this.nextOffline(1); }
                 if (st === 'playing' && this.scrollAcc > 0) {
                   this.headerExpanding = true;
                   this.headerScroller.scrollTo({ xOffset: 0, yOffset: 0,

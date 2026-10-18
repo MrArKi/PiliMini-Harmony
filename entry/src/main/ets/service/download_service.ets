@@ -13,37 +13,10 @@ import { prefsGet, prefsPut } from '../infra/storage/prefs';
 import { VideoService, DownloadUrl } from './video_service';
 import { UA_PC, BILI_REFERER } from '../config/constants';
 
+import { DownloadTask, DlFolder, DownloadMetadata } from '../model/download';
+import { DownloadFolderService } from './download_folder_service';
+export { DownloadTask, DlFolder };
 const KEY_TASKS: string = 'dl_tasks';
-const KEY_FOLDERS: string = 'dl_folders';
-
-/** 下载文件夹（对齐 Nara 文件夹能力） */
-export class DlFolder {
-  id: string = '';
-  title: string = '';
-}
-
-@Observed
-export class DownloadTask {
-  bvid: string = '';
-  cid: number = 0;
-  title: string = '';
-  /** 分P 标签（如 'P1 xxx'；单P 为空） */
-  part: string = '';
-  cover: string = '';
-  quality: number = 64;
-  /** 视频总时长（秒；详情页缓存时传入，用于卡片角标） */
-  duration: number = 0;
-  /** UP 主名（详情页缓存时传入，用于列表行「大小 UP名」） */
-  upName: string = '';
-  status: string = 'queued'; // queued | downloading | paused | done | failed
-  progress: number = 0; // 0~100
-  totalSize: number = 0;
-  receivedSize: number = 0;
-  filePath: string = '';
-  errMsg: string = '';
-  /** 所属文件夹（'' = 未分组） */
-  folderId: string = '';
-}
 
 export function formatSize(n: number): string {
   if (n <= 0) {
@@ -90,11 +63,12 @@ export class DownloadService {
   private static frozen: boolean = false;
   private static versions: Map<string, number> = new Map<string, number>();
   private static inFlight: Map<string, Promise<void>> = new Map<string, Promise<void>>();
+  private static cancelling: Map<string, Promise<void>> = new Map<string, Promise<void>>();
   private static reqTasks: Map<string, request.DownloadTask> = new Map<string, request.DownloadTask>();
   private static pollTimers: Map<string, number> = new Map<string, number>();
   private static ctx: common.Context | undefined = undefined;
   private static listeners: Array<() => void> = [];
-  private static folders: DlFolder[] = [];
+  private static revision: number = 0;
   /** 停滞检测：每任务连续无字节增长的秒数 */
   private static stallCounts: Map<string, number> = new Map<string, number>();
 
@@ -115,7 +89,10 @@ export class DownloadService {
     }
   }
 
-  private static notify(): void {
+  static structureRevision(): number { return DownloadService.revision; }
+
+  private static notify(structural: boolean = true): void {
+    if (structural) { DownloadService.revision++; }
     for (let i = 0; i < DownloadService.listeners.length; i++) {
       DownloadService.listeners[i]();
     }
@@ -125,86 +102,24 @@ export class DownloadService {
     return DownloadService.tasks;
   }
 
-  // ===== 文件夹（对齐 Nara「文件夹」能力：新建/重命名/删除/移动/筛选） =====
-
-  static folderList(): DlFolder[] {
-    return DownloadService.folders;
-  }
-
+  static folderList(): DlFolder[] { return DownloadFolderService.list(); }
   static async addFolder(title: string): Promise<void> {
-    await DownloadService.load();
-    const f = new DlFolder();
-    f.id = 'f' + Date.now().toString();
-    f.title = title;
-    DownloadService.folders.push(f);
-    await DownloadService.persistFolders();
-    DownloadService.notify();
+    await DownloadService.load(); await DownloadFolderService.add(title); DownloadService.notify();
   }
-
   static async renameFolder(id: string, title: string): Promise<void> {
-    await DownloadService.load();
-    for (let i = 0; i < DownloadService.folders.length; i++) {
-      if (DownloadService.folders[i].id === id) {
-        DownloadService.folders[i].title = title;
-      }
-    }
-    await DownloadService.persistFolders();
-    DownloadService.notify();
+    await DownloadService.load(); await DownloadFolderService.rename(id, title); DownloadService.notify();
   }
-
-  /** 删除文件夹（条目回到未分组） */
   static async removeFolder(id: string): Promise<void> {
-    await DownloadService.load();
-    const next: DlFolder[] = [];
-    for (let i = 0; i < DownloadService.folders.length; i++) {
-      if (DownloadService.folders[i].id !== id) {
-        next.push(DownloadService.folders[i]);
-      }
-    }
-    DownloadService.folders = next;
-    for (let i = 0; i < DownloadService.tasks.length; i++) {
-      if (DownloadService.tasks[i].folderId === id) {
-        DownloadService.tasks[i].folderId = '';
-      }
-    }
-    await DownloadService.persistFolders();
-    await DownloadService.persist();
-    DownloadService.notify();
+    await DownloadService.load(); await DownloadFolderService.remove(id); DownloadService.notify();
   }
-
-  /** 移动一组视频（bvid）到文件夹（'' = 移出） */
-  static async setFolder(bvids: string[], folderId: string): Promise<void> {
-    await DownloadService.load();
-    for (let i = 0; i < DownloadService.tasks.length; i++) {
-      const t: DownloadTask = DownloadService.tasks[i];
-      for (let j = 0; j < bvids.length; j++) {
-        if (t.bvid === bvids[j]) {
-          t.folderId = folderId;
-        }
-      }
-    }
-    await DownloadService.persist();
-    DownloadService.notify();
+  static async addToFolder(id: string, refs: string[]): Promise<void> {
+    await DownloadService.load(); await DownloadFolderService.addMembers(id, refs); DownloadService.notify();
   }
-
-  private static async persistFolders(): Promise<void> {
-    try {
-      await prefsPut(KEY_FOLDERS, JSON.stringify(DownloadService.folders));
-    } catch (e) {
-      // 忽略
-    }
+  static async removeFromFolder(id: string, refs: string[]): Promise<void> {
+    await DownloadService.load(); await DownloadFolderService.removeMembers(id, refs); DownloadService.notify();
   }
-
-  private static async loadFolders(): Promise<void> {
-    try {
-      const raw: string = await prefsGet(KEY_FOLDERS, '');
-      if (raw.length === 0) {
-        return;
-      }
-      DownloadService.folders = JSON.parse(raw) as DlFolder[];
-    } catch (e) {
-      // 忽略损坏数据
-    }
+  static async moveMember(id: string, ref: string, delta: number): Promise<void> {
+    await DownloadService.load(); await DownloadFolderService.move(id, ref, delta); DownloadService.notify();
   }
 
   private static dir(): string {
@@ -224,17 +139,27 @@ export class DownloadService {
 
   /** 所有写入入口共享一次恢复，避免先 add 后 load 覆盖旧元数据。 */
   private static async restore(): Promise<void> {
-    await DownloadService.loadFolders();
-
     try {
       const raw: string = await prefsGet(KEY_TASKS, '');
-      if (raw.length === 0) {
-        return;
-      }
-      const arr = JSON.parse(raw) as DownloadTask[];
+      const arr = JSON.parse(raw || '[]') as DownloadTask[];
+      if (!Array.isArray(arr)) { throw new Error('下载任务数据损坏，原数据已保留'); }
       const out: DownloadTask[] = [];
       for (let i = 0; i < arr.length; i++) {
         const t = arr[i];
+        if (!t || typeof t.bvid !== 'string' || !/^BV[0-9A-Za-z]+$/.test(t.bvid) ||
+          !Number.isSafeInteger(t.cid) || t.cid <= 0 || typeof t.title !== 'string' || typeof t.cover !== 'string' ||
+          !Number.isSafeInteger(t.quality) || t.quality <= 0 ||
+          (t.duration !== undefined && (!Number.isFinite(t.duration) || t.duration < 0)) ||
+          (t.totalSize !== undefined && (!Number.isSafeInteger(t.totalSize) || t.totalSize < 0)) ||
+          (t.page !== undefined && (!Number.isSafeInteger(t.page) || t.page < 0)) ||
+          (t.seasonOrder !== undefined && (!Number.isSafeInteger(t.seasonOrder) || t.seasonOrder < 0)) ||
+          (t.part !== undefined && typeof t.part !== 'string') ||
+          (t.upName !== undefined && typeof t.upName !== 'string') ||
+          (t.seasonId !== undefined && typeof t.seasonId !== 'string') ||
+          (t.seasonTitle !== undefined && typeof t.seasonTitle !== 'string') ||
+          !['done', 'downloading', 'paused', 'queued', 'failed'].includes(t.status)) {
+          throw new Error('下载任务数据损坏，原数据已保留');
+        }
         const task = new DownloadTask();
         task.bvid = t.bvid;
         task.cid = t.cid;
@@ -244,6 +169,8 @@ export class DownloadService {
         task.quality = t.quality;
         task.duration = t.duration !== undefined ? t.duration : 0;
         task.upName = t.upName !== undefined ? t.upName : '';
+        task.page = t.page || Number(/^P(\d+)/i.exec(task.part)?.[1] || '0');
+        task.seasonId = t.seasonId || ''; task.seasonTitle = t.seasonTitle || ''; task.seasonOrder = t.seasonOrder || 0;
         task.filePath = DownloadService.dir() + task.bvid + '_' + task.cid.toString() + '.mp4';
         task.folderId = t.folderId !== undefined ? t.folderId : '';
         if (t.status === 'done') {
@@ -254,7 +181,8 @@ export class DownloadService {
           } catch (e) {
             exists = false;
           }
-          task.status = exists ? 'done' : 'failed';
+          task.status = exists && DownloadService.fileBytes(task) > 0 ? 'done' : 'failed';
+          task.errMsg = task.status === 'failed' ? '本地文件缺失，请重试下载' : '';
           task.progress = exists ? 100 : 0;
           if (exists) {
             const sz: number = DownloadService.fileBytes(task);
@@ -263,9 +191,12 @@ export class DownloadService {
               task.receivedSize = sz;
             }
           }
-        } else if (t.status === 'downloading' || t.status === 'paused') {
-          // 重启后未完成的任务回退为 queued（request 会话无法跨进程恢复）
-          task.status = 'paused';
+        } else if (t.status === 'downloading' || t.status === 'paused' || t.status === 'queued' || t.status === 'failed') {
+          task.receivedSize = DownloadService.fileBytes(task); task.totalSize = t.totalSize || 0;
+          task.progress = task.totalSize > 0 ? Math.min(99, Math.round(task.receivedSize * 100 / task.totalSize)) : 0;
+          // request 会话无法跨进程恢复；失败原因仍保留，不伪装成暂停。
+          task.status = t.status === 'failed' ? 'failed' : 'paused';
+          task.errMsg = t.errMsg || '';
         } else {
           task.status = t.status;
         }
@@ -273,8 +204,9 @@ export class DownloadService {
       }
       DownloadService.tasks = out;
     } catch (e) {
-      // 忽略损坏数据
+      throw new Error('下载资料恢复失败，原数据已保留：' + (e as Error).message);
     }
+    await DownloadFolderService.load(DownloadService.tasks);
     DownloadService.notify();
   }
 
@@ -292,7 +224,7 @@ export class DownloadService {
   }
 
   static async add(bvid: string, cid: number, title: string, cover: string, qn: number,
-    part: string = '', duration: number = 0, upName: string = ''): Promise<void> {
+    part: string = '', duration: number = 0, upName: string = '', metadata?: DownloadMetadata): Promise<void> {
     await DownloadService.load();
     const dir = DownloadService.dir();
     if (dir.length === 0) {
@@ -314,6 +246,10 @@ export class DownloadService {
     task.quality = qn;
     task.duration = duration;
     task.upName = upName;
+    if (metadata) {
+      task.page = metadata.page; task.seasonId = metadata.seasonId;
+      task.seasonTitle = metadata.seasonTitle; task.seasonOrder = metadata.seasonOrder;
+    }
     task.status = 'queued';
     task.filePath = dir + bvid + '_' + cid.toString() + '.mp4';
     DownloadService.tasks.unshift(task);
@@ -369,6 +305,8 @@ export class DownloadService {
       next.progress = 0;
       const u: DownloadUrl = await VideoService.durlForDownload(next.bvid, next.cid, next.quality);
       if (!DownloadService.valid(next, generation) || next.status !== 'downloading') { return; }
+      next.quality = u.quality;
+      if (u.durationMs > 0) { next.duration = u.durationMs / 1000; }
       await DownloadService.doDownload(next, u, generation);
     } catch (e) {
       if (!DownloadService.valid(next, generation)) { return; }
@@ -417,12 +355,13 @@ export class DownloadService {
     DownloadService.reqTasks.set(key, rtask);
     rtask.on('progress', (received: number, total: number): void => {
       if (!DownloadService.valid(task, generation) || task.status !== 'downloading') { return; }
+      if (received > task.receivedSize) { DownloadService.stallCounts.set(key, 0); }
       task.receivedSize = received;
       if (total > 0) {
         task.totalSize = total;
         task.progress = Math.round(received * 100 / total);
       }
-      DownloadService.notify();
+      DownloadService.notify(false);
     });
     rtask.on('complete', (): void => {
       if (DownloadService.valid(task, generation) && task.status === 'downloading') { DownloadService.finish(task, key); }
@@ -456,7 +395,7 @@ export class DownloadService {
           task.progress = Math.min(100, Math.round(fb * 100 / task.totalSize));
         }
         DownloadService.stallCounts.set(key, 0);
-        DownloadService.notify();
+        DownloadService.notify(false);
       } else {
         // 停滞检测：30s 无字节增长（request 引擎在模拟器/异常网络下会静默挂起）→ 判失败可重试
         const stalls: number = DownloadService.stallCounts.get(key) !== undefined
@@ -514,19 +453,33 @@ export class DownloadService {
     if (task.status === 'done') {
       return;
     }
+    const sz: number = DownloadService.fileBytes(task);
+    if (sz <= 0 || (task.totalSize > 0 && sz < task.totalSize)) {
+      DownloadService.failTask(task, key, DownloadService.versions.get(key) || 0, '下载文件不完整，请重试');
+      return;
+    }
     task.status = 'done';
     task.progress = 100;
-    const sz: number = DownloadService.fileBytes(task);
     if (task.totalSize <= 0 && sz > 0) {
       // 完成时用文件实际大小补齐（此前大小未知导致"已完成 0B"）
       task.totalSize = sz;
     }
     task.receivedSize = task.totalSize > 0 ? task.totalSize : sz;
-    DownloadService.reqTasks.delete(key);
+    DownloadService.detachRequest(key);
     DownloadService.stopPoll(key);
     DownloadService.notify();
     DownloadService.persist();
     DownloadService.startNext();
+  }
+
+  private static detachRequest(key: string): void {
+    const rt = DownloadService.reqTasks.get(key);
+    if (rt) {
+      try { rt.off('progress'); } catch (_) {}
+      try { rt.off('complete'); } catch (_) {}
+      try { rt.off('fail'); } catch (_) {}
+      DownloadService.reqTasks.delete(key);
+    }
   }
 
   private static stopPoll(key: string): void {
@@ -541,14 +494,19 @@ export class DownloadService {
   private static async failTask(t: DownloadTask, key: string, generation: number, message: string): Promise<void> {
     if (!DownloadService.valid(t, generation)) { return; }
     t.status = 'failed';
+    t.errMsg = message;
     DownloadService.versions.set(key, generation + 1);
     DownloadService.stopPoll(key);
     const rt: request.DownloadTask | undefined = DownloadService.reqTasks.get(key);
     if (rt !== undefined) {
-      try { await rt.delete(); } catch (e) { console.warn('[PiliMini-dl] 取消失败'); }
-      DownloadService.reqTasks.delete(key);
+      DownloadService.detachRequest(key);
+      const closing: Promise<void> = rt.delete().then((): void => {}, (): void => { console.warn('[PiliMini-dl] 取消失败'); });
+      DownloadService.cancelling.set(key, closing);
+      try { await closing; } finally {
+        if (DownloadService.cancelling.get(key) === closing) { DownloadService.cancelling.delete(key); }
+      }
     }
-    t.errMsg = message;
+    if (!DownloadService.valid(t, generation + 1)) { return; }
     DownloadService.notify();
     await DownloadService.persist();
     DownloadService.startNext();
@@ -570,7 +528,14 @@ export class DownloadService {
     DownloadService.notify();
     const rt: request.DownloadTask | undefined = DownloadService.reqTasks.get(key);
     if (rt !== undefined) {
-      try { await rt.pause(); } catch (e) { t.errMsg = '暂停失败，请重试'; }
+      try { await rt.pause(); } catch (e) {
+        if (t.totalSize > 0 && DownloadService.fileBytes(t) >= t.totalSize) {
+          DownloadService.finish(t, key);
+        } else {
+          await DownloadService.failTask(t, key, DownloadService.versions.get(key) || 0, '暂停失败，已取消传输，请重试');
+        }
+        return;
+      }
     }
     await DownloadService.persist();
     DownloadService.startNext();
@@ -583,6 +548,8 @@ export class DownloadService {
     if (t === undefined) { return; }
     const pending: Promise<void> | undefined = DownloadService.inFlight.get(DownloadService.key(t));
     if (pending !== undefined) { await pending; }
+    const closing: Promise<void> | undefined = DownloadService.cancelling.get(DownloadService.key(t));
+    if (closing !== undefined) { await closing; }
     if (DownloadService.tasks.indexOf(t) < 0) { return; }
     t.status = 'queued';
     t.errMsg = '';
@@ -601,11 +568,14 @@ export class DownloadService {
     DownloadService.stopPoll(key);
     const pending: Promise<void> | undefined = DownloadService.inFlight.get(key);
     if (pending !== undefined) { await pending; }
+    const closing: Promise<void> | undefined = DownloadService.cancelling.get(key);
+    if (closing !== undefined) { await closing; }
     const rt: request.DownloadTask | undefined = DownloadService.reqTasks.get(key);
-    if (rt !== undefined) { await rt.delete(); DownloadService.reqTasks.delete(key); }
+    if (rt !== undefined) { DownloadService.detachRequest(key); await rt.delete(); }
     DownloadService.deleteFile(t);
     DownloadService.tasks = DownloadService.tasks.filter((x: DownloadTask): boolean => x !== t);
     DownloadService.versions.delete(key);
+    await DownloadFolderService.prune(DownloadService.tasks);
     DownloadService.notify();
     await DownloadService.persist();
     DownloadService.startNext();

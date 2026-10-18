@@ -50,6 +50,10 @@ export struct PlayerView {
   @Prop autoPlay: boolean = false;
   /** 本地文件路径（非空 = 离线播放：跳取流，直接播该文件；与在线播放同一套 UI/手势） */
   @Prop localPath: string = '';
+  @Prop @Watch('onLocalSourceChange') localSource: PlaybackSource | undefined = undefined;
+  @Prop localDuration: number = 0;
+  @Prop offlineScope: string = 'all';
+  @Prop offlineKey: string = '';
   @StorageProp('statusBarHeight') statusBarH: number = 0;
   /** 详情页「继续播放」等外部控制：自增即触发一次播放（idle → 起播；paused → 续播） */
   @Prop @Watch('onResumeTick') resumeTick: number = 0;
@@ -253,11 +257,18 @@ export struct PlayerView {
     if (this.ready && this.settingsLoaded && this.visible) { this.start(this.qn, false); }
   }
 
+  private onLocalSourceChange(): void {
+    if (!this.localSource || this.destroyed) { return; }
+    this.actualRatio = 0; this.pausedFrame = undefined; this.showPausedFrame = false; this.controlsVisible = true;
+    if (this.ready && this.settingsLoaded && this.visible) { this.start(this.qn, false); }
+  }
+
   private start(quality: number, preserve: boolean = true): void {
     if (this.controller === undefined || !this.controller.ready() || this.destroyed || !this.visible) { return; }
     if (preserve && !this.wanted) { this.capturePausedFrame(); this.showPausedFrame = this.pausedFrame !== undefined; }
-    const source: PlaybackSource = { bvid: this.bvid, cid: this.cid, localPath: this.localPath,
-      title: this.partText || this.title, artist: this.artist, cover: this.cover };
+    const source: PlaybackSource = this.localSource || { bvid: this.bvid, cid: this.cid, localPath: this.localPath,
+      title: this.partText || this.title, artist: this.artist, cover: this.cover,
+      localDuration: this.localDuration, offlineScope: this.offlineScope, offlineKey: this.offlineKey };
     this.controller.start(source, quality, preserve);
   }
   private togglePlay(): void {
@@ -269,7 +280,11 @@ export struct PlayerView {
   private seekTo(ms: number): void { if (this.controller !== undefined) { this.controller.seek(ms); } }
   private applySpeed(value: number): void { if (this.controller !== undefined) { this.controller.speed(value); } }
   private syncSession(): void {
-    if (this.controller !== undefined) { this.controller.setMetadata(this.partText || this.title, this.artist, this.cover); }
+    if (this.controller !== undefined) {
+      const source = this.localSource;
+      this.controller.setMetadata(source ? source.title : this.partText || this.title,
+        source ? source.artist : this.artist, source ? source.cover : this.cover);
+    }
   }
   private updateScreenOn(): void {
     if (this.mainWin !== undefined) {
