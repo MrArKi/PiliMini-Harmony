@@ -83,7 +83,9 @@ export struct GalleryThumbnail {
         onDone: () => { this.close(); },
         registerDismiss: (close: () => void) => { this.dismissViewer = close; } }),
       customStyle: true, alignment: DialogAlignment.Center, autoCancel: false,
-      maskColor: Color.Transparent, openAnimation: { duration: 0 }, closeAnimation: { duration: 0 },
+      // mask仅控制遮罩；内容底板也必须透明，避免深色主题弹窗黑底抢占首尾帧。
+      backgroundColor: Color.Transparent, backgroundBlurStyle: BlurStyle.NONE, maskColor: Color.Transparent,
+      openAnimation: { duration: 0 }, closeAnimation: { duration: 0 },
       onWillDismiss: () => { if (this.dismissViewer !== undefined) { this.dismissViewer(); } }
     });
     this.dialog.open();

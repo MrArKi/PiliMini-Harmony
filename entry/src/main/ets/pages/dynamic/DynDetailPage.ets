@@ -208,9 +208,9 @@ struct DynDetailPage {
     this.loadComments(true);
   }
 
-  /** 楼中楼：点击「共N条回复」→ 进入「评论详情」页 */
-  private toggleSub(item: CommentItem): void {
-    SubReplyArgs.set(item, this.item !== undefined ? this.item.author.mid : 0, 0, this.commentOid(), this.commentType());
+  /** 楼中楼：预览可带目标子回复ID，计数入口只打开详情。 */
+  private toggleSub(item: CommentItem, targetRpid: number = 0): void {
+    SubReplyArgs.set(item, this.item !== undefined ? this.item.author.mid : 0, 0, this.commentOid(), this.commentType(), targetRpid);
     router.pushUrl({ url: 'pages/video/SubReplyPage' });
   }
 
@@ -573,8 +573,8 @@ struct DynDetailPage {
                   CommentItemView({
                     item: t,
                     upMid: this.item !== undefined ? this.item.author.mid : 0,
-                    onOpenSub: (it: CommentItem) => {
-                      this.toggleSub(it);
+                    onOpenSub: (it: CommentItem, targetRpid: number) => {
+                      this.toggleSub(it, targetRpid);
                     },
                     onSubMore: (it: CommentItem) => {
                       this.loadSubMore(it);
@@ -601,8 +601,8 @@ struct DynDetailPage {
                   CommentItemView({
                     item: c,
                     upMid: this.item !== undefined ? this.item.author.mid : 0,
-                    onOpenSub: (it: CommentItem) => {
-                      this.toggleSub(it);
+                    onOpenSub: (it: CommentItem, targetRpid: number) => {
+                      this.toggleSub(it, targetRpid);
                     },
                     onSubMore: (it: CommentItem) => {
                       this.loadSubMore(it);

@@ -1,9 +1,18 @@
 /** Nara视频内局部回复面板与外部评论详情共用内容。 */
+import { FrameCallback } from '@ohos.arkui.UIContext';
 import { router, curves } from '@kit.ArkUI';
 import { CommentItemView, CommentSkeleton } from './CommentItem';
 import { BasicDataSource } from '../common/list_data_source';
 import { formatPlayCount } from './VideoCard';
-import { CommentItem, SubReplyPage, VideoService } from '../service/video_service';
+import { CommentItem, SubReplyPage, SubReplyWindow, VideoService } from '../service/video_service';
+import { AppError } from '../infra/error/app_error';
+
+/** 单次布局后执行，回调自行检查页面是否已销毁。 */
+class ReplyLayoutCallback extends FrameCallback {
+  private action: () => void;
+  constructor(action: () => void) { super(); this.action = action; }
+  onFrame(_time: number): void { this.action(); this.action = () => {}; }
+}
 
 @Component
 export struct SubReplyPanel {
@@ -20,7 +29,18 @@ export struct SubReplyPanel {
   @StorageProp('statusBarHeight') statusBarH: number = 0;
   @StorageProp('navBarHeight') navBarH: number = 0;
   private page: number = 0;
-  private loadingMore: boolean = false;
+  @State loadingMore: boolean = false;
+  targetRpid: number = 0;
+  @State hasPrevious: boolean = false;
+  @State focusNotice: string = '';
+  @State highlightRpid: number = 0;
+  private windowMode: boolean = false;
+  private prevOffset: string = '';
+  private nextOffset: string = '';
+  private failedDirection: string = 'initial';
+  private pendingFocus: number = 0;
+  private listHeight: number = 0;
+  private firstVisible: number = 0;
   private destroyed: boolean = false;
   private ds: BasicDataSource<CommentItem> = new BasicDataSource<CommentItem>();
   // 入参快照（aboutToAppear 一次性取走，避免全局 ctx 被后续操作/返回动画干扰）
@@ -33,50 +53,138 @@ export struct SubReplyPanel {
 
   aboutToAppear(): void {
     this.total = this.root !== undefined ? this.root.rcount : 0;
-    this.load(1);
+    this.windowMode = this.targetRpid > 0;
+    this.load();
   }
 
   aboutToDisappear(): void {
     this.destroyed = true;
   }
 
-  private async load(page: number): Promise<void> {
+  private positionReply(rpid: number, y: number, highlight: boolean, attempt: number = 0): void {
+    this.getUIContext().postFrameCallback(new ReplyLayoutCallback(() => {
+      if (this.destroyed) { return; }
+      const index: number = this.items.findIndex((item: CommentItem) => item.rpid === rpid);
+      if (index < 0) { return; }
+      // 主评论/分隔/排序/向前入口共4项；LazyForEach目标可由scrollToIndex直接物化。
+      try { this.listScroller.scrollToIndex(index + 4, false, ScrollAlign.CENTER); }
+      catch (e) { this.positionFailed(rpid, y, highlight, attempt); return; }
+      this.getUIContext().postFrameCallback(new ReplyLayoutCallback(() => {
+        if (this.destroyed) { return; }
+        try {
+          const rect: RectResult = this.listScroller.getItemRect(index + 4);
+          if (rect.height <= 0) { this.positionFailed(rpid, y, highlight, attempt); return; }
+          this.listScroller.scrollBy(0, rect.y - y);
+        } catch (e) { this.positionFailed(rpid, y, highlight, attempt); return; }
+        if (highlight) {
+          this.highlightRpid = rpid;
+          animateTo({ delay: 800, duration: 200, curve: Curve.Linear }, () => { this.highlightRpid = 0; });
+        }
+      }));
+    }));
+  }
+
+  private positionFailed(rpid: number, y: number, highlight: boolean, attempt: number): void {
+    if (this.destroyed) { return; }
+    if (attempt < 2) { this.positionReply(rpid, y, highlight, attempt + 1); }
+    else if (highlight) { this.focusNotice = '暂时无法定位该回复，请重新打开详情'; }
+  }
+
+  private async load(direction: string = 'initial'): Promise<void> {
     const root: CommentItem | undefined = this.root;
     if (this.destroyed || this.loadingMore || root === undefined) {
-      this.loading = false;
-      if (root === undefined) {
-        this.err = '评论已失效，请返回重试';
-      }
+      if (root === undefined) { this.loading = false; this.err = '评论已失效，请返回重试'; }
       return;
     }
+    if (direction === 'previous' && !this.hasPrevious) { return; }
+    const anchorIndex: number = this.firstVisible - 4;
+    const anchor: CommentItem | undefined = anchorIndex >= 0 ? this.items[anchorIndex] : undefined;
+    let anchorY: number = 0;
     this.loadingMore = true;
+    this.failedDirection = direction;
     this.err = '';
     try {
-      const r: SubReplyPage = this.aid > 0
-        ? await VideoService.subReplies(this.aid, root.rpid, page)
-        : await VideoService.dynSubReplies(this.oid, this.otype, root.rpid, page);
-      if (this.destroyed) {
-        return;
+      if (direction === 'previous' && anchor !== undefined) {
+        anchorY = this.listScroller.getItemRect(anchorIndex + 4).y;
       }
-      if (page === 1) {
-        this.items = r.items;
-        this.ds.reload(r.items);
-      } else {
-        this.items = this.items.concat(r.items);
-        this.ds.append(r.items);
-      }
-      this.page = page;
-      if (r.total > 0) {
+      let incoming: CommentItem[] = [];
+      if (this.windowMode) {
+        const offset: string = direction === 'previous' ? this.prevOffset : this.nextOffset;
+        const r: SubReplyWindow = await VideoService.subReplyWindow(this.aid > 0 ? this.aid.toString() : this.oid,
+          this.aid > 0 ? 1 : this.otype, root.rpid, direction === 'initial' ? this.targetRpid : 0,
+          direction === 'initial' ? '' : offset);
+        if (this.destroyed) { return; }
+        incoming = r.items;
+        if (direction !== 'next') { this.prevOffset = r.prevOffset; this.hasPrevious = r.hasPrevious; }
+        if (direction !== 'previous') { this.nextOffset = r.nextOffset; this.isEnd = !r.hasMore; }
         this.total = r.total;
+      } else {
+        const page: number = direction === 'initial' ? 1 : this.page + 1;
+        const r: SubReplyPage = this.aid > 0
+          ? await VideoService.subReplies(this.aid, root.rpid, page)
+          : await VideoService.dynSubReplies(this.oid, this.otype, root.rpid, page);
+        if (this.destroyed) { return; }
+        incoming = r.items;
+        this.page = page;
+        this.total = r.total;
+        this.isEnd = !r.hasMore;
       }
-      this.isEnd = !r.hasMore;
+      if (direction === 'initial') {
+        this.items = incoming;
+        this.ds.reload(this.items);
+        if (this.windowMode) {
+          if (this.items.some((item: CommentItem) => item.rpid === this.targetRpid)) {
+            this.pendingFocus = this.targetRpid;
+          } else {
+            this.focusNotice = '该回复可能已删除或不可见';
+          }
+        }
+      } else {
+        const unique: CommentItem[] = incoming.filter((item: CommentItem) =>
+          !this.items.some((existing: CommentItem) => existing.rpid === item.rpid));
+        if (direction === 'previous') {
+          this.items = unique.concat(this.items);
+          this.ds.reload(this.items);
+          if (anchor !== undefined) { this.positionReply(anchor.rpid, anchorY, false); }
+        } else {
+          this.items = this.items.concat(unique);
+          this.ds.append(unique);
+        }
+      }
     } catch (e) {
       if (!this.destroyed) {
-        this.err = '加载失败，点击重试';
+        if (this.windowMode && direction === 'initial' && e instanceof AppError && e.code === 12006) {
+          this.focusNotice = '该回复可能已删除或不可见';
+          this.isEnd = true;
+        } else { this.err = '加载失败，点击重试'; }
+      }
+    } finally {
+      if (!this.destroyed) {
+        this.loadingMore = false;
+        this.loading = false;
+        if (this.pendingFocus > 0) {
+          const rpid: number = this.pendingFocus;
+          this.pendingFocus = 0;
+          // 异步加载结束显式安排下一帧，onDidBuild只覆盖组件初次构建。
+          this.getUIContext().postFrameCallback(new ReplyLayoutCallback(() => {
+            if (!this.destroyed) { this.positionReply(rpid, this.listHeight * 0.25, true); }
+          }));
+        }
       }
     }
-    this.loadingMore = false;
-    this.loading = false;
+  }
+
+  private showAll(): void {
+    if (this.loadingMore) { return; }
+    this.windowMode = false;
+    this.hasPrevious = false;
+    this.focusNotice = '';
+    this.highlightRpid = 0;
+    this.loading = true;
+    this.items = [];
+    this.ds.reload([]);
+    this.listScroller.scrollToIndex(0);
+    this.load();
   }
 
   @Builder
@@ -84,7 +192,7 @@ export struct SubReplyPanel {
     CommentItemView({
       item: item,
       upMid: this.upMid,
-      hideSubEntry: false,
+      hideSubEntry: true,
       onOpenSub: () => {
       },
       onSubMore: () => {
@@ -171,6 +279,21 @@ export struct SubReplyPanel {
         }
         .width('100%')
 
+        ListItem() {
+          Column({ space: 6 }) {
+            if (this.focusNotice.length > 0) {
+              Text(this.focusNotice).fontSize(12).fontColor($r('app.color.text_secondary'))
+              Text('查看全部回复').fontSize(12).fontColor($r('app.color.brand_pink'))
+                .id('sub_reply_show_all').onClick(() => { this.showAll(); })
+            } else if (this.hasPrevious) {
+              Text(this.loadingMore ? '加载中…' : '加载更早回复').fontSize(12)
+                .fontColor($r('app.color.brand_pink')).id('sub_reply_previous')
+                .onClick(() => { this.load('previous'); })
+            }
+          }.width('100%').padding({ top: this.hasPrevious || this.focusNotice.length > 0 ? 12 : 0,
+            bottom: this.hasPrevious || this.focusNotice.length > 0 ? 12 : 0 })
+        }.width('100%')
+
         if (this.loading) {
           ForEach([0, 1, 2, 3], (i: number) => {
             ListItem() {
@@ -184,6 +307,8 @@ export struct SubReplyPanel {
               this.ReplyRow(item)
             }
             .width('100%')
+            .id('sub_reply_' + item.rpid.toString())
+            .backgroundColor(this.highlightRpid === item.rpid ? $r('app.color.comment_focus_bg') : $r('app.color.bg_page'))
           }, (item: CommentItem) => 'sr_' + item.rpid.toString())
         }
 
@@ -195,7 +320,7 @@ export struct SubReplyPanel {
                 .fontSize(12)
                 .fontColor($r('app.color.brand_pink'))
                 .onClick(() => {
-                  this.load(this.page + 1);
+                  this.load(this.failedDirection);
                 })
             } else {
               Text(this.isEnd ? '没有更多了' : '加载中...')
@@ -211,10 +336,13 @@ export struct SubReplyPanel {
       }
       .width('100%')
       .layoutWeight(1)
+      .id('sub_reply_list')
+      .onAreaChange((_old: Area, area: Area) => { this.listHeight = Number(area.height); })
+      .onScrollIndex((start: number) => { this.firstVisible = start; })
       .divider({ strokeWidth: 0.3, color: '#14000000', startMargin: 55, endMargin: 15 })
       .onReachEnd(() => {
-        if (!this.isEnd) {
-          this.load(this.page + 1);
+        if (!this.loading && !this.isEnd && this.err.length === 0) {
+          this.load('next');
         }
       })
     }

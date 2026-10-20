@@ -12,10 +12,12 @@ struct SubReplyDetailPage {
   private aid: number = 0;
   private oid: string = '';
   private otype: number = 1;
+  private targetRpid: number = 0;
 
   aboutToAppear(): void {
     this.root = SubReplyArgs.root; this.upMid = SubReplyArgs.upMid;
     this.aid = SubReplyArgs.aid; this.oid = SubReplyArgs.oid; this.otype = SubReplyArgs.otype;
+    this.targetRpid = SubReplyArgs.targetRpid;
     SubReplyArgs.clear();
   }
 
@@ -33,7 +35,8 @@ struct SubReplyDetailPage {
 
   build() {
     Column() {
-      SubReplyPanel({ root: this.root, upMid: this.upMid, aid: this.aid, oid: this.oid, otype: this.otype })
+      SubReplyPanel({ root: this.root, upMid: this.upMid, aid: this.aid, oid: this.oid, otype: this.otype,
+        targetRpid: this.targetRpid })
     }.width('100%').height('100%')
   }
 }

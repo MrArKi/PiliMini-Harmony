@@ -33,6 +33,7 @@ struct FeedList {
   private ds: BasicDataSource<VideoItem> = new BasicDataSource<VideoItem>();
   @State pager: Pager<VideoItem> = new Pager<VideoItem>();
   @State refreshing: boolean = false;
+  @State refreshPullOffset: number = 0;
   /** 本地去重：仅在收起状态变化时回调宿主 */
   private collapsedLocal: boolean = false;
   private destroyed: boolean = false;
@@ -98,6 +99,26 @@ struct FeedList {
     await this.pager.loadMore(this.ds, (cursor: string): Promise<PageData<VideoItem>> => this.fetchPage(cursor));
   }
 
+  @Builder
+  EmptyRefreshIndicator() { Row().width('100%').height(0) }
+
+  /** 原生Refresh推进卡片；圆环在顶栏下方新增的下拉空白内居中。 */
+  @Builder
+  FeedRefreshIndicator() {
+    Row() {
+      LoadingProgress().width(28).height(28).color($r('app.color.brand_pink'))
+    }
+    .width(49).height(49).justifyContent(FlexAlign.Center)
+    .backgroundColor($r('app.color.card_bg')).borderRadius(24.5)
+    .shadow({ radius: 2, color: '#33000000', offsetY: 2 })
+    .position({ x: '50%', y: this.topInset + this.refreshPullOffset / 2 - 24.5 })
+    .translate({ x: -24.5 })
+    .scale({ x: Math.min(1, this.refreshPullOffset / 64),
+      y: Math.min(1, this.refreshPullOffset / 64) })
+    .hitTestBehavior(HitTestMode.None)
+    .accessibilityText('正在刷新')
+  }
+
   build() {
     Column() {
       if (this.pager.loading && !this.pager.firstLoaded) {
@@ -118,7 +139,8 @@ struct FeedList {
         .layoutWeight(1)
         .justifyContent(FlexAlign.Center)
       } else {
-        Refresh({ refreshing: $$this.refreshing }) {
+        Stack({ alignContent: Alignment.Top }) {
+        Refresh({ refreshing: $$this.refreshing, builder: this.EmptyRefreshIndicator() }) {
           Grid(this.navigation.scroller) {
             GridItem() {
               Column()
@@ -141,7 +163,7 @@ struct FeedList {
                   Text(this.pager.footerText)
                     .fontSize(12)
                     .fontColor($r('app.color.text_secondary'))
-                } else {
+                } else if (this.pager.loadingMore) {
                   LoadingFooter({ text: '加载中…' })
                 }
               }
@@ -174,11 +196,15 @@ struct FeedList {
             }
           })
         }
+        .refreshOffset(64)
+        .onOffsetChange((offset: number): void => { this.refreshPullOffset = Math.max(0, offset); })
         .onRefreshing(() => {
           this.refresh();
         })
-        .layoutWeight(1)
+        .height('100%')
         .width('100%')
+        if (this.refreshPullOffset > 0) { this.FeedRefreshIndicator() }
+        }.layoutWeight(1).width('100%')
       }
     }
     .width('100%')

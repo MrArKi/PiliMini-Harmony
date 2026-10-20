@@ -12,14 +12,16 @@ export class SubReplyArgs {
   /** 动态楼中楼：oid + otype（type=17 等） */
   static oid: string = '';
   static otype: number = 1;
+  static targetRpid: number = 0;
 
-  static set(root: CommentItem, upMid: number, aid: number, oid: string, otype: number): void {
+  static set(root: CommentItem, upMid: number, aid: number, oid: string, otype: number, targetRpid: number = 0): void {
     SubReplyArgs.root = root;
     SubReplyArgs.upMid = upMid;
     SubReplyArgs.total = root.rcount;
     SubReplyArgs.aid = aid;
     SubReplyArgs.oid = oid;
     SubReplyArgs.otype = otype;
+    SubReplyArgs.targetRpid = targetRpid;
   }
 
   /** 消费方在 aboutToAppear 快照后立即清空（风险5：返回动画期间读到 undefined） */
@@ -30,5 +32,6 @@ export class SubReplyArgs {
     SubReplyArgs.aid = 0;
     SubReplyArgs.oid = '';
     SubReplyArgs.otype = 1;
+    SubReplyArgs.targetRpid = 0;
   }
 }

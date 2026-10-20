@@ -169,7 +169,7 @@ struct LaterPage {
               if (this.items.length === 0) {
                 EmptyState({ text: '稍后再看空空如也' })
               } else {
-                LoadingFooter({ text: '共 ' + this.items.length.toString() + ' 条' })
+                LoadingFooter({ text: '共 ' + this.items.length.toString() + ' 条', loading: false })
               }
             }
           }

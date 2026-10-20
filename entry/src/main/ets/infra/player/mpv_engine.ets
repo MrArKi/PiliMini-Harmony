@@ -6,10 +6,15 @@ export class MpvEngine {
   private handle: number = 0;
   private closed: boolean = false;
 
-  constructor(surface: string, hardware: boolean, listener: (event: NativePlayerEvent) => void) {
-    this.handle = playerNative.create(surface, hardware, (event: NativePlayerEvent): void => {
-      if (!this.closed) { listener(event); }
+  private constructor() {}
+
+  static async create(surface: string, hardware: boolean, listener: (event: NativePlayerEvent) => void): Promise<MpvEngine> {
+    const engine: MpvEngine = new MpvEngine();
+    engine.handle = await playerNative.create(surface, hardware, (event: NativePlayerEvent): void => {
+      // 初始化阶段的原生idle事件不交给尚未取得实例所有权的页面。
+      if (!engine.closed && engine.handle > 0) { listener(event); }
     });
+    return engine;
   }
 
   load(video: string, audio: string, position: number, paused: boolean): void {
@@ -35,7 +40,7 @@ export class MpvEngine {
     this.closed = true;
     const handle: number = this.handle;
     this.handle = 0;
-    return playerNative.dispose(handle);
+    return handle > 0 ? playerNative.dispose(handle) : Promise.resolve();
   }
   static stats(): NativePlayerStats { return playerNative.stats(); }
 }

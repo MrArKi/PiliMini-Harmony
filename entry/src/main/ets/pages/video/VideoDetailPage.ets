@@ -135,7 +135,13 @@ struct VideoDetailPage {
   @State introLabelWidth: number = 26;
   @State replyLabelWidth: number = 26;
   private tabsCtrl: TabsController = new TabsController();
-  @State related: VideoItem[] = [];
+  @State relatedCount: number = 0;
+  private relatedDs: BasicDataSource<VideoItem> = new BasicDataSource<VideoItem>();
+  private routeSettled: boolean = false;
+  private tabMoving: boolean = false;
+  private tabAnimating: boolean = false;
+  private contentWaiters: (() => void)[] = [];
+  private settleTimer: number = -1;
   @State followed: boolean = false;
   @State followBusy: boolean = false;
   /** 收窄交互：播放状态 / 累计滚动 / 收窄比例(0~1) / 继续播放命令计数 */
@@ -144,6 +150,7 @@ struct VideoDetailPage {
   @State resumeTick: number = 0;
   @State subShown: boolean = false;
   @State subRoot: CommentItem | undefined = undefined;
+  @State subTargetRpid: number = 0;
   private subClosing: boolean = false;
   @State scrollAcc: number = 0;
   private introScroller: Scroller = new Scroller();
@@ -161,6 +168,11 @@ struct VideoDetailPage {
   @StorageProp('navBarHeight') navBarH: number = 0;
 
   aboutToAppear(): void {
+    this.settleTimer = setTimeout((): void => {
+      this.settleTimer = -1;
+      this.routeSettled = true;
+      this.flushContentWaiters();
+    }, NARA_ROUTE_DURATION + 32);
     DownloadService.init(getContext(this) as common.Context);
     DownloadService.onChange(this.downloadChange);
     DownloadService.load().then((): void => { this.refreshCacheState(); }).catch((): void => {
@@ -216,6 +228,8 @@ struct VideoDetailPage {
     DownloadService.offChange(this.downloadChange);
     if (this.hideTimer !== -1) { clearTimeout(this.hideTimer); this.hideTimer = -1; }
     this.destroyed = true;
+    if (this.settleTimer !== -1) { clearTimeout(this.settleTimer); this.settleTimer = -1; }
+    this.flushContentWaiters();
     refreshSystemBars(getContext(this) as common.UIAbilityContext);
     this.commentGeneration++;
     this.orientationGeneration++;
@@ -429,9 +443,11 @@ struct VideoDetailPage {
       // 收藏状态 + 收藏夹列表（spec-07，非阻塞）
       this.loadFavState();
       // 相关推荐（spec-05 V2「简介」面板底部，非阻塞）
-      VideoService.related(this.bvid).then((list: VideoItem[]) => {
+      VideoService.related(this.bvid).then(async (list: VideoItem[]): Promise<void> => {
+        await this.waitForContentIdle();
         if (!this.destroyed) {
-          this.related = list;
+          this.relatedDs.reload(list);
+          this.relatedCount = list.length;
         }
       }).catch(() => {
       });
@@ -451,6 +467,19 @@ struct VideoDetailPage {
     }
   }
 
+  /** 网络继续并发，列表提交避开路由/横滑关键帧；无轮询，退页解开所有等待。 */
+  private waitForContentIdle(): Promise<void> {
+    if (this.destroyed || (this.routeSettled && !this.tabMoving && !this.tabAnimating)) { return Promise.resolve(); }
+    return new Promise<void>((resolve: () => void): void => { this.contentWaiters.push(resolve); });
+  }
+
+  private flushContentWaiters(): void {
+    if (!this.destroyed && (!this.routeSettled || this.tabMoving || this.tabAnimating)) { return; }
+    const pending: (() => void)[] = this.contentWaiters;
+    this.contentWaiters = [];
+    pending.forEach((resolve: () => void): void => { resolve(); });
+  }
+
   private async loadComments(reset: boolean): Promise<void> {
     if (this.destroyed || (!reset && this.loadingMoreReply) || this.aid === 0) {
       return;
@@ -466,6 +495,7 @@ struct VideoDetailPage {
     }
     try {
       const r = await VideoService.reply(this.aid, reset ? '' : this.nextOffset, this.sortMode);
+      await this.waitForContentIdle();
       if (this.destroyed || generation !== this.commentGeneration) {
         return;
       }
@@ -484,6 +514,7 @@ struct VideoDetailPage {
       this.nextOffset = r.nextOffset;
       this.replyEnd = r.isEnd;
     } catch (e) {
+      await this.waitForContentIdle();
       if (this.destroyed || generation !== this.commentGeneration) { return; }
       const err = e as Error;
       this.replyErr = '评论加载失败，点击重试';
@@ -506,9 +537,10 @@ struct VideoDetailPage {
   }
 
   /** Nara replyReply：只覆盖详情区，视频继续使用同一Surface。 */
-  private toggleSub(item: CommentItem): void {
+  private toggleSub(item: CommentItem, targetRpid: number = 0): void {
     if (this.subShown || this.subClosing) { return; }
     this.subRoot = item;
+    this.subTargetRpid = targetRpid;
     animateTo({ duration: 250, curve: curves.cubicBezierCurve(0.4, 0, 0.2, 1) }, () => { this.subShown = true; });
   }
 
@@ -1035,20 +1067,17 @@ struct VideoDetailPage {
     })
   }
 
-  /** 相关推荐区块（标题 + 列表） */
+  /** 推荐标题；卡片作为List独立懒加载项，避免整组构建和测量。 */
   @Builder
   RelatedSection() {
     Column() {
-      if (this.related.length > 0) {
+      if (this.relatedCount > 0) {
         Text('相关推荐')
           .fontSize(15)
           .fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.text_primary'))
           .width('100%')
           .padding({ left: 12, right: 12, top: 12, bottom: 4 })
-        ForEach(this.related, (item: VideoItem) => {
-          this.RelatedRow(item)
-        }, (item: VideoItem) => item.key)
       }
     }
     .width('100%')
@@ -1331,6 +1360,10 @@ struct VideoDetailPage {
                 this.RelatedSection()
               }
               .width('100%')
+
+              LazyForEach(this.relatedDs, (item: VideoItem) => {
+                ListItem() { this.RelatedRow(item) }.width('100%')
+              }, (item: VideoItem) => item.key)
             }
             .cachedCount(3)
             .width('100%')
@@ -1355,8 +1388,8 @@ struct VideoDetailPage {
                       CommentItemView({
                         item: t,
                         upMid: this.upMid,
-                        onOpenSub: (it: CommentItem) => {
-                          this.toggleSub(it);
+                        onOpenSub: (it: CommentItem, targetRpid: number) => {
+                          this.toggleSub(it, targetRpid);
                         },
                         onSubMore: (it: CommentItem) => {
                           this.loadSubMore(it);
@@ -1384,8 +1417,8 @@ struct VideoDetailPage {
                       CommentItemView({
                         item: item,
                         upMid: this.upMid,
-                        onOpenSub: (it: CommentItem) => {
-                          this.toggleSub(it);
+                        onOpenSub: (it: CommentItem, targetRpid: number) => {
+                          this.toggleSub(it, targetRpid);
                         },
                         onSubMore: (it: CommentItem) => {
                           this.loadSubMore(it);
@@ -1455,8 +1488,21 @@ struct VideoDetailPage {
         .animationDuration(300)
         .onContentDidScroll((_selected: number, index: number, position: number): void => {
           this.tabProgress = Math.max(0, Math.min(1, index - position));
+          this.tabMoving = position > -0.999 && position < 0.999 && Math.abs(position) > 0.001;
+          this.flushContentWaiters();
         })
-        .onAnimationEnd((index: number): void => { this.tabProgress = index; })
+        .onAnimationStart((): void => { this.tabAnimating = true; })
+        .onAnimationEnd((index: number, extraInfo: TabsAnimationEvent): void => {
+          this.tabProgress = index;
+          this.tabMoving = Math.abs(extraInfo.currentOffset) > 0.5;
+          this.tabAnimating = false;
+          this.flushContentWaiters();
+        })
+        .onDisAppear((): void => {
+          this.tabMoving = false;
+          this.tabAnimating = false;
+          this.flushContentWaiters();
+        })
         .onChange((index: number) => {
           this.tab = index;
         })
@@ -1470,6 +1516,7 @@ struct VideoDetailPage {
         .width('100%').height(this.visibleBodyHeight())
         if (this.subShown && this.subRoot !== undefined) {
           SubReplyPanel({ embedded: true, root: this.subRoot, upMid: this.upMid, aid: this.aid,
+            targetRpid: this.subTargetRpid,
             onClose: () => { this.closeSub(); } })
             .width('100%').height(this.visibleBodyHeight())
             .transition(TransitionEffect.move(TransitionEdge.BOTTOM))
@@ -1531,12 +1578,12 @@ struct VideoDetailPage {
               viewportHeight: this.playerBoxHeight() - this.statusBarH,
               onStateChange: (st: string) => {
                 if (st === 'completed' && this.localPath.length > 0) { this.nextOffline(1); }
-                if (st === 'playing' && this.scrollAcc > 0) {
+                if ((st === 'playing' || st === 'loading') && this.scrollAcc > 0 && !this.headerExpanding) {
                   this.headerExpanding = true;
                   this.headerScroller.scrollTo({ xOffset: 0, yOffset: 0,
                     animation: { duration: Math.max(1, Math.round(200 * this.scrollAcc / this.playerHeight())), curve: Curve.Linear } });
-                  this.playerState = st;
-                } else { this.playerState = st; }
+                }
+                this.playerState = st;
               },
               onExit: () => {
                 if (this.isFullscreen) {

@@ -45,13 +45,16 @@ export struct ErrorRetry {
 @Component
 export struct LoadingFooter {
   @Prop text: string = '加载中…';
+  @Prop loading: boolean = true;
 
   build() {
     Row({ space: 8 }) {
-      LoadingProgress()
-        .width(18)
-        .height(18)
-        .color($r('app.color.text_secondary'))
+      if (this.loading) {
+        LoadingProgress()
+          .width(18)
+          .height(18)
+          .color($r('app.color.text_secondary'))
+      }
       Text(this.text)
         .fontSize(12)
         .fontColor($r('app.color.text_secondary'))

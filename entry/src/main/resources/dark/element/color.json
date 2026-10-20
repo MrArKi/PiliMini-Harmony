@@ -1,5 +1,6 @@
 {
   "color": [
+    { "name": "comment_focus_bg", "value": "#262626" },
     { "name": "member_secondary_container", "value": "#5B3F45" },
     { "name": "member_on_secondary_container", "value": "#FFD9E0" },
     {

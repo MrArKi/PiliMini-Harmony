@@ -19,8 +19,12 @@ export struct AsyncImage {
   @Prop previewSrc: string = '';
   @Prop previewW: number = 480;
   @Prop previewH: number = 320;
+  /** Hero移交直接复用页面持有的小图，缓存被淘汰时也不出现空帧。 */
+  previewMap: image.PixelMap | undefined = undefined;
+  @Prop synchronous: boolean = false;
   onImageSize: (w: number, h: number) => void = () => {};
   onReady: (pm: image.PixelMap) => void = () => {};
+  onDisplayed: (pm: image.PixelMap) => void = () => {};
   @State pixelMap: image.PixelMap | undefined = undefined;
   private destroyed: boolean = false;
 
@@ -45,7 +49,7 @@ export struct AsyncImage {
     }
     const want: string = this.src;
     this.pixelMap = peekCachedImage(this.src, this.w, this.h, this.original) ||
-      peekCachedImage(this.previewSrc, this.previewW, this.previewH);
+      this.previewMap || peekCachedImage(this.previewSrc, this.previewW, this.previewH);
     if (this.pixelMap !== undefined) { this.onReady(this.pixelMap); }
     if (this.previewSrc.length > 0) {
       loadImage(this.previewSrc, this.previewW, this.previewH).then((pm: image.PixelMap) => {
@@ -73,6 +77,12 @@ export struct AsyncImage {
           .width('100%')
           .height('100%')
           .objectFit(this.fit)
+          .syncLoad(this.synchronous)
+          .onComplete((event) => {
+            if (event !== undefined && event.loadingStatus === 1 && this.pixelMap !== undefined && !this.destroyed) {
+              this.onDisplayed(this.pixelMap);
+            }
+          })
       } else {
         Column()
           .width('100%')

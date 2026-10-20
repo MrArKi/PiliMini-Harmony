@@ -30,8 +30,8 @@ function fmtTime(ts: number): string {
 export struct CommentItemView {
   @ObjectLink item: CommentItem;
   @Prop upMid: number = 0;
-  /** 点击「共N条回复」→ 打开楼中楼面板/页面 */
-  onOpenSub: (item: CommentItem) => void = () => {
+  /** 子回复预览传目标ID；「共N条回复」传0，只打开楼中楼。 */
+  onOpenSub: (item: CommentItem, targetRpid: number) => void = () => {
   };
   /** 楼中楼页面中的「主评论」：不再显示「共N条回复」入口 */
   @Prop hideSubEntry: boolean = false;
@@ -154,6 +154,8 @@ export struct CommentItemView {
       top: first ? 8 : 4,
       bottom: last ? 8 : 4
     })
+    .id('comment_preview_' + sub.rpid.toString())
+    .onClick(() => { this.onOpenSub(this.item, sub.rpid); })
   }
 
   build() {
@@ -253,7 +255,7 @@ export struct CommentItemView {
               .width('100%')
               .padding({ left: 8, right: 5, top: 5, bottom: 8 })
               .onClick(() => {
-                this.onOpenSub(this.item);
+                this.onOpenSub(this.item, 0);
               })
           } else if (this.item.expanded) {
             Text(this.subFooterText())
@@ -266,7 +268,7 @@ export struct CommentItemView {
                 if (this.item.subErr || this.item.subHasMore) {
                   this.onSubMore(this.item);
                 } else {
-                  this.onOpenSub(this.item);
+                  this.onOpenSub(this.item, 0);
                 }
               })
           }

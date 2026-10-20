@@ -181,6 +181,16 @@ export interface SubReplyPage {
   hasMore: boolean;
 }
 
+/** 按子回复直达的时间序窗口，前后游标不能与普通页码混用。 */
+export interface SubReplyWindow {
+  items: CommentItem[];
+  total: number;
+  prevOffset: string;
+  nextOffset: string;
+  hasPrevious: boolean;
+  hasMore: boolean;
+}
+
 export interface ReplyPage {
   items: CommentItem[];
   topItems: CommentItem[];
@@ -247,6 +257,17 @@ interface ReplyPageRaw {
 interface SubReplyData {
   replies?: ReplyItemRaw[];
   page?: ReplyPageRaw;
+}
+
+interface SubReplyWindowCursor {
+  is_begin: boolean;
+  is_end: boolean;
+  pagination_reply?: Record<string, string>;
+}
+
+interface SubReplyWindowData {
+  root?: ReplyItemRaw;
+  cursor?: SubReplyWindowCursor;
 }
 
 export interface PageResult {
@@ -507,6 +528,7 @@ export class VideoService {
         title: stripTag(it.title),
         cover: fixUrl(it.pic),
         upName: it.owner.name,
+        upMid: it.owner.mid !== undefined ? it.owner.mid : 0,
         upFace: fixUrl(it.owner.face),
         playCount: it.stat.view,
         danmaku: it.stat.danmaku !== undefined ? it.stat.danmaku : 0,
@@ -537,6 +559,7 @@ export class VideoService {
         title: stripTag(it.title),
         cover: fixUrl(it.pic),
         upName: it.owner.name,
+        upMid: it.owner.mid !== undefined ? it.owner.mid : 0,
         upFace: fixUrl(it.owner.face),
         playCount: it.stat.view,
         danmaku: it.stat.danmaku !== undefined ? it.stat.danmaku : 0,
@@ -832,7 +855,36 @@ export class VideoService {
     }
   }
 
-  /** 楼中楼子评论（分页，无需签名；ps=20/页） */
+  /** 目标附近的楼中楼窗口，后续请求仅带前/后游标，不重复携带目标。 */
+  static async subReplyWindow(oid: string, commentType: number, rootRpid: number,
+    targetRpid: number = 0, offset: string = ''): Promise<SubReplyWindow> {
+    const params: Record<string, string> = {
+      'oid': oid, 'type': commentType.toString(), 'root': rootRpid.toString(), 'mode': '2', 'ps': '20'
+    };
+    if (targetRpid > 0) {
+      params['rpid'] = targetRpid.toString();
+    } else if (offset.length > 0) {
+      const pagination: Record<string, string> = { 'offset': offset };
+      params['pagination_str'] = JSON.stringify(pagination);
+    }
+    const raw: string = await getJson(API_BASE + '/x/v2/reply/detail?' + buildQuery(params));
+    const resp = parseEnvelope<SubReplyWindowData>(raw);
+    ensureOk(resp);
+    const data: SubReplyWindowData | undefined = resp.data;
+    if (data === undefined || data === null || data.root === undefined || data.root === null
+      || data.root.rpid !== rootRpid || data.cursor === undefined || data.cursor === null) {
+      throw new AppError('parse', -1, '评论详情数据不完整');
+    }
+    const root: CommentItem = mapComment(data.root);
+    const cursor: SubReplyWindowCursor = data.cursor;
+    const offsets: Record<string, string> | undefined = cursor.pagination_reply;
+    const prev: string = offsets !== undefined && offsets !== null ? (offsets['prev_offset'] || '') : '';
+    const next: string = offsets !== undefined && offsets !== null ? (offsets['next_offset'] || '') : '';
+    return { items: root.replies, total: root.rcount, prevOffset: prev, nextOffset: next,
+      hasPrevious: !cursor.is_begin && prev.length > 0, hasMore: !cursor.is_end && next.length > 0 };
+  }
+
+  /** 普通楼中楼分页，无需签名；ps=20/页。 */
   static async subReplies(aid: number, rootRpid: number, page: number): Promise<SubReplyPage> {
     const url: string = API_BASE + '/x/v2/reply/reply?oid=' + aid.toString() +
       '&type=1&root=' + rootRpid.toString() +

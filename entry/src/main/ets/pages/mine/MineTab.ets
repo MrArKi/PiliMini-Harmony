@@ -7,7 +7,7 @@
 import { promptAction, router } from '@kit.ArkUI';
 import { AsyncImage } from '../../components/AsyncImage';
 import { AuthService, UserInfo, RelStat } from '../../service/auth_service';
-import { HistoryService, HistoryItem } from '../../service/history_service';
+import { HistoryService, HistoryItem, HistoryPage } from '../../service/history_service';
 import { FavService, FavFolder, FavFolderPage } from '../../service/fav_service';
 import { FavFolderCard } from '../../components/FavFolderCard';
 import { onAuthLogout, onHistoryChanged } from '../../infra/event/app_events';
@@ -27,9 +27,13 @@ interface MineEntry {
 export struct MineTab {
   @State user: UserInfo | null = null;
   @State checked: boolean = false;
+  @State accountError: string = '';
   @State rel: RelStat = { following: 0, follower: 0 };
   @State history: HistoryItem[] = [];
+  @State historyReady: boolean = false;
+  @State historyError: string = '';
   @State folders: FavFolder[] = [];
+  @State folderReady: boolean = false;
   @State folderTotal: number = 0;
   @State folderError: string = '';
   @Prop @Watch('onShown') refreshTick: number = 0;
@@ -100,36 +104,46 @@ export struct MineTab {
 
   private async refresh(): Promise<void> {
     const request: number = ++this.accountRequest;
-    const u: UserInfo | null = await AuthService.fetchNav();
-    if (this.destroyed || request !== this.accountRequest) {
-      return;
-    }
-    this.user = u;
-    this.checked = true;
-    if (u === null) {
-      this.historyRequest++;
-      this.folderRequest++;
-      this.loadedMid = 0;
+    this.accountError = '';
+    if (this.user === null) { this.checked = false; }
+    // 只在首次读取时显示骨架；同账号刷新保留已经呈现的资料和卡片。
+    try {
+      const u: UserInfo | null = await AuthService.fetchNav(true);
+      if (this.destroyed || request !== this.accountRequest) { return; }
+      this.user = u;
+      this.checked = true;
+      if (u === null) {
+        this.historyRequest++; this.folderRequest++;
+        this.loadedMid = 0;
+        this.rel = { following: 0, follower: 0 };
+        this.history = []; this.folders = [];
+        this.historyDs.reload([]); this.folderDs.reload([]);
+        this.historyReady = true; this.folderReady = true;
+        this.historyError = ''; this.folderError = '';
+        this.folderTotal = 0;
+        return;
+      }
+      // 同账号普通路由返回不重拉/重建卡片；真实观看事件已单独标脏。
+      if (this.loadedMid === u.mid) {
+        if (this.historyDirty) { this.loadHistory(); }
+        return;
+      }
+      this.historyRequest++; this.folderRequest++;
       this.rel = { following: 0, follower: 0 };
-      this.history = [];
-      this.folders = [];
+      this.history = []; this.folders = []; this.folderTotal = 0;
       this.historyDs.reload([]); this.folderDs.reload([]);
-      this.folderTotal = 0;
-      this.folderError = '';
-      return;
+      this.historyReady = false; this.folderReady = false;
+      this.historyError = ''; this.folderError = '';
+      this.loadedMid = u.mid;
+      this.loadStat(u.mid);
+      this.loadHistory();
+      this.loadFolders(u.mid);
+    } catch (e) {
+      if (this.destroyed || request !== this.accountRequest) { return; }
+      this.checked = true;
+      this.accountError = '账号加载失败，点击重试';
+      if (this.user !== null) { this.toast('账号刷新失败，已保留当前内容'); }
     }
-    // 同账号普通路由返回不重拉/重建卡片；真实观看事件已单独标脏。
-    if (this.loadedMid === u.mid) {
-      if (this.historyDirty) { this.loadHistory(); }
-      return;
-    }
-    this.historyRequest++; this.folderRequest++;
-    this.history = []; this.folders = []; this.folderTotal = 0;
-    this.historyDs.reload([]); this.folderDs.reload([]);
-    this.loadedMid = u.mid;
-    this.loadStat(u.mid);
-    this.loadHistory();
-    this.loadFolders(u.mid);
   }
 
   private async loadStat(mid: number): Promise<void> {
@@ -144,11 +158,20 @@ export struct MineTab {
     const mid: number = this.loadedMid;
     if (mid === 0) { return; }
     this.historyDirty = false;
-    const list: HistoryItem[] = await HistoryService.recent(20);
-    if (!this.destroyed && request === this.historyRequest && mid === this.loadedMid) {
-      if (JSON.stringify(this.history) !== JSON.stringify(list)) {
-        this.history = list; this.historyDs.reload(list);
+    try {
+      // recent()会把网络错误吞成空数组；这里需区分真实空态和失败。
+      const page: HistoryPage = await HistoryService.page(0, 0, 20);
+      if (this.destroyed || request !== this.historyRequest || mid !== this.loadedMid) { return; }
+      this.historyError = '';
+      if (JSON.stringify(this.history) !== JSON.stringify(page.items)) {
+        this.history = page.items; this.historyDs.reload(page.items);
       }
+      this.historyReady = true;
+    } catch (e) {
+      if (this.destroyed || request !== this.historyRequest || mid !== this.loadedMid) { return; }
+      this.historyError = '观看记录加载失败，点击刷新重试';
+      this.historyReady = true;
+      if (this.history.length > 0) { this.toast('观看记录刷新失败，已保留当前内容'); }
     }
   }
 
@@ -162,9 +185,12 @@ export struct MineTab {
       if (JSON.stringify(this.folders) !== JSON.stringify(page.items)) {
         this.folders = page.items; this.folderDs.reload(page.items);
       }
+      this.folderReady = true;
     } catch (e) {
       if (!this.destroyed && request === this.folderRequest && mid === this.loadedMid) {
         this.folderError = '收藏夹加载失败，点击刷新重试';
+        this.folderReady = true;
+        if (this.folders.length > 0) { this.toast('收藏夹刷新失败，已保留当前内容'); }
       }
     }
   }
@@ -199,11 +225,59 @@ export struct MineTab {
     }
     .width('100%')
     .padding({ left: 16, right: 16, top: 6 + this.statusBarH })
+    .id('mine_top_bar')
+  }
+
+  @Builder
+  ProfilePlaceholder() {
+    Column({ space: 12 }) {
+      Row({ space: 14 }) {
+        Column().width(60).height(60).borderRadius(30)
+          .backgroundColor($r('app.color.btn_soft_bg'))
+        Column({ space: 7 }) {
+          Row() {
+            if (this.accountError.length > 0) {
+              Text('账号加载失败').fontSize(16).fontColor($r('app.color.text_secondary'))
+            } else {
+              Column().width(140).height(19).borderRadius(3)
+                .backgroundColor($r('app.color.btn_soft_bg'))
+            }
+          }.width('100%').height(24)
+          Row() {
+            if (this.accountError.length > 0) {
+              Text('点击重试').fontSize(12).fontColor($r('app.color.brand_pink'))
+            } else {
+              Column().width('80%').height(12).borderRadius(3)
+                .backgroundColor($r('app.color.btn_soft_bg'))
+            }
+          }.width('100%').height(16)
+          Column().width('100%').height(4).borderRadius(2)
+            .backgroundColor($r('app.color.divider'))
+        }.alignItems(HorizontalAlign.Start).layoutWeight(1)
+      }.width('100%').height(60)
+      Row() {
+        ForEach(['关注', '粉丝'], (label: string) => {
+          Column({ space: 3 }) {
+            Row() {
+              Column().width(26).height(16).borderRadius(3)
+                .backgroundColor($r('app.color.btn_soft_bg'))
+            }.height(19)
+            Text(label).fontSize(12).lineHeight(15).height(15)
+              .fontColor($r('app.color.text_secondary'))
+          }.layoutWeight(1)
+        }, (label: string) => label)
+      }.width('100%').height(45).padding({ top: 4, bottom: 4 })
+    }.width('100%').padding({ left: 16, right: 16, top: 8, bottom: 12 })
+      .onClick(() => {
+        if (this.accountError.length > 0) { this.refresh(); }
+      })
   }
 
   @Builder
   ProfileCard() {
-    if (this.user !== null) {
+    if (!this.checked || (this.user === null && this.accountError.length > 0)) {
+      this.ProfilePlaceholder()
+    } else if (this.user !== null) {
       Column({ space: 12 }) {
         Row({ space: 14 }) {
           Column() {
@@ -232,6 +306,7 @@ export struct MineTab {
                   .padding({ left: 4, right: 4, top: 1, bottom: 1 })
               }
             }
+            .height(24)
 
             Row({ space: 14 }) {
               Text('硬币 ' + (this.user as UserInfo).coins.toFixed(1))
@@ -247,6 +322,7 @@ export struct MineTab {
                   .fontColor($r('app.color.text_secondary'))
               }
             }
+            .height(16)
 
             Progress({
               value: (this.user as UserInfo).nextExp > 0 ? (this.user as UserInfo).curExp : 1,
@@ -262,15 +338,20 @@ export struct MineTab {
           .layoutWeight(1)
         }
         .width('100%')
+        .height(60)
 
         Row() {
           Column({ space: 3 }) {
             Text(formatPlayCount(this.rel.following))
               .fontSize(16)
+              .lineHeight(19)
+              .height(19)
               .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.text_primary'))
             Text('关注')
               .fontSize(12)
+              .lineHeight(15)
+              .height(15)
               .fontColor($r('app.color.text_secondary'))
           }
           .layoutWeight(1)
@@ -278,15 +359,20 @@ export struct MineTab {
           Column({ space: 3 }) {
             Text(formatPlayCount(this.rel.follower))
               .fontSize(16)
+              .lineHeight(19)
+              .height(19)
               .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.text_primary'))
             Text('粉丝')
               .fontSize(12)
+              .lineHeight(15)
+              .height(15)
               .fontColor($r('app.color.text_secondary'))
           }
           .layoutWeight(1)
         }
         .width('100%')
+        .height(45)
         .padding({ top: 4, bottom: 4 })
       }
       .width('100%')
@@ -309,7 +395,7 @@ export struct MineTab {
             .fontSize(18)
             .fontWeight(FontWeight.Medium)
             .fontColor($r('app.color.text_primary'))
-          Text(this.checked ? '扫码登录后可同步收藏与稍后再看' : '读取登录态…')
+          Text('扫码登录后可同步收藏与稍后再看')
             .fontSize(12)
             .fontColor($r('app.color.text_secondary'))
         }
@@ -428,19 +514,45 @@ export struct MineTab {
       }
     }
     .width('100%')
+    .height(40)
     .padding({ left: 16, right: 16, top: 10, bottom: 10 })
+  }
+
+  @Builder
+  PreviewPlaceholder(section: string) {
+    Row({ space: 14 }) {
+      ForEach([0, 1], (index: number) => {
+        Column() {
+          Column().width(180).height(110).borderRadius(6)
+            .backgroundColor($r('app.color.btn_soft_bg'))
+          Column().width(145).height(14).borderRadius(3).margin({ top: 10 })
+            .backgroundColor($r('app.color.btn_soft_bg'))
+          Column().width(75).height(10).borderRadius(3).margin({ top: 5 })
+            .backgroundColor($r('app.color.btn_soft_bg'))
+        }.width(180).alignItems(HorizontalAlign.Start)
+      }, (index: number) => index.toString())
+    }.width('100%').height(173).alignItems(VerticalAlign.Top)
+      .padding({ left: 20, right: 20, top: 10 }).clip(true)
+      .id('mine_' + section + '_placeholder')
   }
 
   @Builder
   HistorySection() {
     Column() {
       this.SectionTitle('观看记录', 'history')
-      if (this.history.length === 0) {
-        Text(this.checked && this.user !== null ? '暂无观看记录' : '登录后查看观看记录')
+      if (!this.checked || (this.user !== null && !this.historyReady)) {
+        this.PreviewPlaceholder('history')
+      } else if (this.history.length === 0) {
+        Text(this.accountError.length > 0 && this.user === null ? '账号加载失败，点击重试' :
+          (this.historyError || (this.user !== null ? '暂无观看记录' : '登录后查看观看记录')))
           .fontSize(13)
           .fontColor($r('app.color.text_secondary'))
           .width('100%')
           .padding({ left: 16, right: 16, top: 4, bottom: 16 })
+          .onClick(() => {
+            if (this.user === null && this.accountError.length > 0) { this.refresh(); }
+            else if (this.historyError.length > 0) { this.loadHistory(); }
+          })
       } else {
         List({ space: 14 }) {
           LazyForEach(this.historyDs, (item: HistoryItem) => {
@@ -463,12 +575,19 @@ export struct MineTab {
   FavSection() {
     Column() {
       this.SectionTitle('我的收藏', 'fav')
-      if (this.folders.length === 0) {
-        Text(this.folderError || (this.checked && this.user !== null ? '暂无收藏夹' : '登录后查看收藏'))
+      if (!this.checked || (this.user !== null && !this.folderReady)) {
+        this.PreviewPlaceholder('fav')
+      } else if (this.folders.length === 0) {
+        Text(this.accountError.length > 0 && this.user === null ? '账号加载失败，点击重试' :
+          (this.folderError || (this.user !== null ? '暂无收藏夹' : '登录后查看收藏')))
           .fontSize(13)
           .fontColor($r('app.color.text_secondary'))
           .width('100%')
           .padding({ left: 16, right: 16, top: 4, bottom: 16 })
+          .onClick(() => {
+            if (this.user === null && this.accountError.length > 0) { this.refresh(); }
+            else if (this.folderError.length > 0) { this.loadFolders(this.loadedMid); }
+          })
       } else {
         List({ space: 14 }) {
             LazyForEach(this.folderDs, (folder: FavFolder) => {
@@ -498,10 +617,10 @@ export struct MineTab {
     Scroll() {
       Column() {
         this.TopBar()
-        this.ProfileCard()
-        this.EntryRow()
-        this.HistorySection()
-        this.FavSection()
+        Column() { this.ProfileCard() }.width('100%').id('mine_profile_section')
+        Column() { this.EntryRow() }.width('100%').id('mine_entries_section')
+        Column() { this.HistorySection() }.width('100%').id('mine_history_section')
+        Column() { this.FavSection() }.width('100%').id('mine_fav_section')
 
         if (this.checked && this.user !== null) {
           Button('退出登录')
@@ -523,6 +642,8 @@ export struct MineTab {
     }
     .width('100%')
     .height('100%')
+    // Scroll默认居中；首批内容较短时也必须从顶部开始，避免整页随后上移。
+    .align(Alignment.TopStart)
     .scrollBar(BarState.Off)
   }
 }

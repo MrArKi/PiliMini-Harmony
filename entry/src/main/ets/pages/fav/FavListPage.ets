@@ -199,7 +199,8 @@ struct FavListPage {
               }
             }, (f: FavFolder) => f.id.toString())
             ListItem() {
-              LoadingFooter({ text: this.folderDs.size() === 0 ? '还没有收藏夹' : this.folderPager.footerText })
+              LoadingFooter({ text: this.folderDs.size() === 0 ? '还没有收藏夹' : this.folderPager.footerText,
+                loading: this.folderPager.loading || this.folderPager.loadingMore })
                 .padding({ bottom: 100 })
             }
           }
@@ -230,9 +231,10 @@ struct FavListPage {
                     this.refreshCurrent();
                   })
               } else if (!this.pager.hasMore) {
-                LoadingFooter({ text: this.ds.size() === 0 ? '收藏夹空空如也' : '没有更多了' })
+                LoadingFooter({ text: this.ds.size() === 0 ? '收藏夹空空如也' : '没有更多了', loading: false })
               } else {
-                LoadingFooter({ text: '加载中…' })
+                LoadingFooter({ text: this.pager.footerText,
+                  loading: this.pager.loading || this.pager.loadingMore })
               }
             }
           }

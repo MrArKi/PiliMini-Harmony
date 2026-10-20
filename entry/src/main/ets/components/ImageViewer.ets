@@ -43,10 +43,16 @@ export struct ImageViewer {
   @State pictureY: number = 0;
   @State pictureW: number = 1;
   @State pictureH: number = 1;
+  @State flightReady: boolean = false;
   private opening: boolean = true;
+  private openingStarted: boolean = false;
+  private openingFinished: boolean = false;
   private closing: boolean = false;
+  private closingStarted: boolean = false;
+  private closeRect: PreviewRect | undefined = undefined;
+  private displayedMap: image.PixelMap | undefined = undefined;
+  private displayedIndex: number = -1;
   private destroyed: boolean = false;
-  private openTimer: number = -1;
   private originX: number = 0;
   private originY: number = 0;
   @State curIndex: number = 0;
@@ -87,8 +93,8 @@ export struct ImageViewer {
   aboutToDisappear(): void {
     this.destroyed = true;
     this.stopFling();
+    this.displayedMap = undefined; this.flightMap = undefined; this.flightThumb = undefined;
     AppStorage.setOrCreate<string>('galleryFlightId', '');
-    if (this.openTimer !== -1) { clearTimeout(this.openTimer); this.openTimer = -1; }
   }
 
   private targetRect(): PreviewRect | undefined {
@@ -118,7 +124,8 @@ export struct ImageViewer {
 
   private prepareFlight(rect: PreviewRect | undefined): void {
     this.flightThumb = rect !== undefined ? rect.pixelMap : undefined;
-    this.flightMap = peekCachedImage(originalUrl(this.urls[this.curIndex]), 2048, 2048, true) || this.flightThumb;
+    this.flightMap = (this.displayedIndex === this.curIndex ? this.displayedMap : undefined) ||
+      peekCachedImage(originalUrl(this.urls[this.curIndex]), 2048, 2048, true) || this.flightThumb;
     if (this.flightMap !== undefined) {
       const info: image.ImageInfo = this.flightMap.getImageInfoSync();
       this.imageRatios.set(this.curIndex, info.size.width / Math.max(1, info.size.height));
@@ -126,10 +133,71 @@ export struct ImageViewer {
     }
   }
 
+  /** 接替图片节点解码就绪后才撤去Hero；syncLoad避免相同PixelMap的异步空帧。 */
+  private finishOpening(): void {
+    if (!this.openingFinished || this.displayedIndex !== this.curIndex || this.destroyed || this.closing) { return; }
+    this.inFlight = false;
+    this.flightMap = undefined; this.flightThumb = undefined;
+    AppStorage.setOrCreate<string>('galleryFlightId', '');
+  }
+
+  private startOpening(): void {
+    if (this.openingStarted || !this.layoutReady || this.destroyed || this.closing) { return; }
+    this.openingStarted = true;
+    this.getUIContext().animateTo({ duration: 300, curve: curves.cubicBezierCurve(0, 0, 0.58, 1),
+      onFinish: () => {
+        if (this.destroyed || this.closing) { return; }
+        this.opening = false; this.openingFinished = true;
+        this.finishOpening();
+        if (this.isLongPic()) { this.resetZoom(); }
+      } }, () => {
+      if (this.inFlight) { this.flightGeometry(undefined); }
+      this.flightRadius = 0; this.backdrop = 1; this.imageOpacity = 1;
+    });
+  }
+
+  private startClosing(): void {
+    if (this.closingStarted || this.destroyed) { return; }
+    this.closingStarted = true;
+    this.flightReady = true;
+    const rect: PreviewRect | undefined = this.closeRect;
+    if (rect !== undefined) { AppStorage.setOrCreate<string>('galleryFlightId', rect.tag); }
+    this.getUIContext().animateTo({ duration: 300, curve: curves.cubicBezierCurve(0, 0, 0.58, 1),
+      onFinish: () => {
+        if (this.destroyed) { return; }
+        AppStorage.setOrCreate<string>('galleryFlightId', '');
+        this.onClose();
+      } }, () => {
+      this.backdrop = 0;
+      if (rect !== undefined && this.flightThumb !== undefined) {
+        this.flightGeometry(rect); this.flightRadius = 4;
+      } else { this.imageOpacity = 0; }
+    });
+  }
+
+  private flightDisplayed(): void {
+    if (this.destroyed) { return; }
+    if (this.closing) {
+      if (this.closeRect !== undefined || this.inFlight) { this.startClosing(); }
+    }
+    else {
+      const rect: PreviewRect | undefined = this.targetRect();
+      if (rect !== undefined) { AppStorage.setOrCreate<string>('galleryFlightId', rect.tag); }
+      this.startOpening();
+    }
+  }
+
   private dismiss(): void {
-    if (this.closing || this.destroyed || this.opening) { return; }
+    if (this.closing || this.destroyed) { return; }
     this.closing = true;
     this.stopFling();
+    if (this.opening) {
+      // 无图/失败或开场未完成时也能退出；迟到的加载事件不能重新启动开场。
+      this.closingStarted = true;
+      AppStorage.setOrCreate<string>('galleryFlightId', '');
+      this.onClose();
+      return;
+    }
     // Nara gallery_viewer.dart:492：长图不包Hero，保持顶部阅读位置淡出。
     if (this.isLongPic()) {
       this.getUIContext().animateTo({ duration: 300, curve: curves.cubicBezierCurve(0, 0, 0.58, 1),
@@ -140,25 +208,21 @@ export struct ImageViewer {
     }
     const rect: PreviewRect | undefined = this.targetRect();
     this.prepareFlight(rect);
-    if (rect !== undefined) { AppStorage.setOrCreate<string>('galleryFlightId', rect.tag); }
+    this.closeRect = rect;
+    if (this.flightMap === undefined) {
+      this.getUIContext().animateTo({ duration: 300, curve: curves.cubicBezierCurve(0, 0, 0.58, 1),
+        onFinish: () => { if (!this.destroyed) { this.onClose(); } } }, () => {
+        this.imageOpacity = 0; this.backdrop = 0;
+      });
+      return;
+    }
     this.flightGeometry(undefined);
     // 从当前缩放/拖动位置接续，不能先跳回未缩放的全屏。
     this.pictureW *= this.zoom * this.dismissScale();
     this.pictureH *= this.zoom * this.dismissScale();
     this.pictureX = (this.viewW - this.pictureW) / 2 + this.offX + this.dragX;
     this.pictureY = (this.viewH - this.pictureH) / 2 + this.offY + this.dragY;
-    this.flightRadius = 0; this.inFlight = true;
-    this.openTimer = setTimeout(() => {
-      this.openTimer = -1;
-      if (this.destroyed) { return; }
-      this.getUIContext().animateTo({ duration: 300, curve: curves.cubicBezierCurve(0, 0, 0.58, 1),
-        onFinish: () => { if (!this.destroyed) { this.onClose(); } } }, () => {
-        this.backdrop = 0;
-        if (rect !== undefined && this.flightThumb !== undefined) {
-          this.flightGeometry(rect); this.flightRadius = 4;
-        } else { this.imageOpacity = 0; }
-      });
-    }, 16);
+    this.flightRadius = 0; this.flightReady = false; this.inFlight = true;
   }
 
   private resetZoom(): void {
@@ -245,7 +309,14 @@ export struct ImageViewer {
       if (index === this.curIndex) {
         AsyncImage({ src: originalUrl(url), w: 2048, h: 2048, original: true, fit: ImageFit.Contain,
         placeholder: Color.Transparent, previewSrc: this.thumbnails[index] || '',
-        previewW: this.thumbW, previewH: this.thumbH,
+        previewW: this.thumbW, previewH: this.thumbH, synchronous: true,
+        previewMap: this.sourceRects[index] !== undefined ? this.sourceRects[index].pixelMap : undefined,
+        onDisplayed: (pm: image.PixelMap) => {
+          if (index !== this.curIndex || this.destroyed) { return; }
+          this.displayedMap = pm; this.displayedIndex = index;
+          if (!this.inFlight && this.opening) { this.startOpening(); }
+          this.finishOpening();
+        },
         onImageSize: (w: number, h: number) => {
           if (h <= 0) { return; }
           const first: boolean = !this.imageRatios.has(index);
@@ -283,7 +354,7 @@ export struct ImageViewer {
       .width(this.viewW)
       .height(this.viewH)
       .position({ left: 0, top: 0 })
-      .opacity(this.inFlight ? 0 : this.imageOpacity)
+      .opacity(this.inFlight && (!this.closing || this.flightReady) ? 0 : this.imageOpacity)
       .index(this.curIndex)
       .loop(false)
       .indicator(false)
@@ -292,7 +363,8 @@ export struct ImageViewer {
       .curve(Curve.Ease)
       .disableSwipe(!this.atMinimum() || this.pinching || Math.abs(this.dragY) > 5)
       .onChange((index: number) => {
-        this.stopFling(); this.curIndex = index; this.resetZoom();
+        this.stopFling(); this.displayedMap = undefined; this.displayedIndex = -1;
+        this.curIndex = index; this.resetZoom();
       })
     .parallelGesture(GestureGroup(GestureMode.Parallel,
       GestureGroup(GestureMode.Exclusive,
@@ -373,6 +445,10 @@ export struct ImageViewer {
           if (this.flightMap !== undefined) {
             Image(this.flightMap).width(this.pictureW).height(this.pictureH).objectFit(ImageFit.Fill)
               .position({ x: this.pictureX, y: this.pictureY })
+              .syncLoad(true)
+              .onComplete((event) => {
+                if (event !== undefined && event.loadingStatus === 1) { this.flightDisplayed(); }
+              })
           }
         }
         .width(this.heroW).height(this.heroH).position({ x: this.heroX, y: this.heroY })
@@ -412,22 +488,11 @@ export struct ImageViewer {
           this.inFlight = false; this.imageOpacity = 0; this.resetZoom();
         } else {
           this.flightGeometry(rect);
-          if (rect !== undefined) { AppStorage.setOrCreate<string>('galleryFlightId', rect.tag); }
         }
         this.layoutReady = true;
-        this.openTimer = setTimeout(() => {
-          this.openTimer = -1;
-          if (this.destroyed) { return; }
-          this.getUIContext().animateTo({ duration: 300, curve: curves.cubicBezierCurve(0, 0, 0.58, 1),
-            onFinish: () => {
-              if (this.destroyed) { return; }
-              this.opening = false; this.inFlight = false; this.flightMap = undefined; this.flightThumb = undefined;
-              if (this.isLongPic()) { this.resetZoom(); }
-            } }, () => {
-            if (this.inFlight) { this.flightGeometry(undefined); }
-            this.flightRadius = 0; this.backdrop = 1; this.imageOpacity = 1;
-          });
-        }, 16);
+        // 普通图由Hero解码完成事件启动；无源图只能淡入，不隐藏底页缩略图。
+        if (this.flightMap === undefined) { this.inFlight = false; }
+        if (!this.inFlight && this.displayedIndex === this.curIndex) { this.startOpening(); }
       }
     })
   }

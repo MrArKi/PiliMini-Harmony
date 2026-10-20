@@ -231,7 +231,11 @@ struct DownloadPage {
       Row({ space: 12 }) {
         Image($r('app.media.icon_arrow_left')).width(22).height(22).fillColor($r('app.color.text_primary')).padding(6).onClick(() => { router.back(); })
         Text(this.pageTitle).fontSize(16).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary')).layoutWeight(1)
-        Image($r('app.media.icon_folder_add')).width(20).height(20).padding(6).fillColor($r('app.color.text_secondary')).id('download_new_folder').onClick(() => { this.editFolder = ''; this.nameFromPicker = false; this.folderName = ''; this.sheetKind = 'name'; this.sheetShown = true; })
+        Button({ type: ButtonType.Normal }) {
+          Image($r('app.media.icon_folder_add')).width(24).height(24).fillColor($r('app.color.text_secondary'))
+        }.width(44).height(44).padding(0).backgroundColor(Color.Transparent)
+          .accessibilityText('新建文件夹').id('download_new_folder')
+          .onClick(() => { this.editFolder = ''; this.nameFromPicker = false; this.folderName = ''; this.sheetKind = 'name'; this.sheetShown = true; })
         Text(this.selecting ? '完成' : '选择').fontSize(13).fontColor($r('app.color.brand_pink')).padding(6).id('download_select').onClick(() => { this.selecting = !this.selecting; this.selected = []; })
       }.width('100%').padding({ left: 8, right: 12, top: this.statusBarH + 10, bottom: 10 })
       Text('已用空间 ' + formatSize(this.total)).fontSize(12).fontColor($r('app.color.text_secondary')).width('100%').padding({ left: 12, bottom: 8 })

@@ -18,6 +18,9 @@ struct SearchPage {
   @State submitted: string = '';
   @State history: string[] = [];
   private destroyed: boolean = false;
+  private input: TextInputController = new TextInputController();
+  private initialFocusRequested: boolean = false;
+  private focusTimer: number = -1;
   private ds: BasicDataSource<VideoItem> = new BasicDataSource<VideoItem>();
   @State pager: Pager<VideoItem> = new Pager<VideoItem>();
   @StorageProp('statusBarHeight') statusBarH: number = 0;
@@ -27,7 +30,25 @@ struct SearchPage {
     this.loadHistory();
   }
 
-  aboutToDisappear(): void { this.destroyed = true; this.pager.cancel(); }
+  onPageShow(): void {
+    if (this.initialFocusRequested) { return; }
+    this.initialFocusRequested = true;
+    // 默认焦点先响应；入场结束后补一次焦点，避免路由动画与输入法抢占。
+    this.focusTimer = setTimeout(() => {
+      this.focusTimer = -1;
+      if (!this.destroyed && this.submitted.length === 0) {
+        this.getUIContext().getFocusController().requestFocus('home_search_input');
+      }
+    }, NARA_ROUTE_DURATION + 32);
+  }
+
+  onPageHide(): void { this.cancelFocus(); }
+
+  private cancelFocus(): void {
+    if (this.focusTimer >= 0) { clearTimeout(this.focusTimer); this.focusTimer = -1; }
+  }
+
+  aboutToDisappear(): void { this.destroyed = true; this.cancelFocus(); this.pager.cancel(); }
 
   private async loadHistory(): Promise<void> {
     const history: string[] = await SearchHistory.load();
@@ -49,6 +70,8 @@ struct SearchPage {
     if (used.length === 0) {
       return;
     }
+    this.cancelFocus();
+    this.input.stopEditing();
     this.keyword = used;
     this.submitted = used;
     this.pager.cancel();
@@ -91,9 +114,15 @@ struct SearchPage {
           .onClick(() => {
             router.back();
           })
-        TextInput({ text: this.keyword, placeholder: '搜索' })
+        TextInput({ text: this.keyword, placeholder: '搜索', controller: this.input })
+          .id('home_search_input')
+          .defaultFocus(true)
+          .enableKeyboardOnFocus(true)
+          .enterKeyType(EnterKeyType.Search)
           .layoutWeight(1)
           .fontSize(15)
+          .fontColor($r('app.color.text_primary'))
+          .placeholderColor($r('app.color.text_secondary'))
           .backgroundColor(Color.Transparent)
           .padding({ left: 0 })
           .onChange((v: string) => {
@@ -222,7 +251,7 @@ struct SearchPage {
                 .width('100%')
                 .textAlign(TextAlign.Center)
                 .padding(20)
-            } else {
+            } else if (this.pager.loadingMore) {
               LoadingFooter({ text: '加载中…' })
             }
           }

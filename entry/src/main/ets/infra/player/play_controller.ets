@@ -279,9 +279,14 @@ export class PlayController {
       if (!this.current(generation)) { return; }
       await this.closeEngine();
       if (!this.current(generation) || this.surface.length === 0) { return; }
-      const engine: MpvEngine = new MpvEngine(this.surface, this.hardware, (event: NativePlayerEvent): void => {
-        if (this.current(generation) && this.engine === engine) { this.onEvent(event); }
+      const surface: string = this.surface;
+      let created: MpvEngine | undefined = undefined;
+      created = await MpvEngine.create(surface, this.hardware, (event: NativePlayerEvent): void => {
+        if (created !== undefined && this.current(generation) && this.engine === created) { this.onEvent(event); }
       });
+      const engine: MpvEngine = created;
+      // 异步初始化仍占用kernelQueue；退页/切源的迟到实例先关闭，再让下个任务或Surface销毁继续。
+      if (!this.current(generation) || this.surface !== surface) { await engine.dispose(); return; }
       this.engine = engine;
       this.pendingSeek = -1; this.seekStarted = false;
       this.audioMissingAt = 0;

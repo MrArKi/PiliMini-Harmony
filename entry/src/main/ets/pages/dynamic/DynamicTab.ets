@@ -187,7 +187,7 @@ struct DynFeedList {
                     .width('100%')
                     .textAlign(TextAlign.Center)
                     .padding({ top: 20, bottom: 110 })
-                } else {
+                } else if (this.pager.loadingMore) {
                   LoadingFooter({ text: '加载中…' })
                 }
               }

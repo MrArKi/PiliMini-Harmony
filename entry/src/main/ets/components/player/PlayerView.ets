@@ -684,11 +684,30 @@ export struct PlayerView {
       .alignItems(VerticalAlign.Center)
     }
     .width('100%')
-    .padding({ left: 10, right: 10, top: 12, bottom: 12 })
+    .padding({ left: 10, right: 10, top: 4, bottom: 4 })
     .linearGradient({
       angle: 0,
       colors: [['#00000000', 0.0], ['#8A000000', 1.0]]
     })
+  }
+
+  /** Nara底缘轨道：3.5vp条中心位于底缘上0.3vp，裁去下侧1.45vp；不参与手势。 */
+  @Builder
+  EdgeProgress() {
+    Stack({ alignContent: Alignment.TopStart }) {
+      Rect().width('100%').height(3.5).radius(1.75).fill('#33FFFFFF')
+        .hitTestBehavior(HitTestMode.None)
+      Rect().width(Math.max(0, Math.min(100, this.bufferPercent)).toString() + '%')
+        .height(3.5).radius(1.75).fill('#66FB7299').hitTestBehavior(HitTestMode.None)
+      Rect().width((this.durMs > 0 ? Math.max(0, Math.min(100, this.posMs / this.durMs * 100)) : 0).toString() + '%')
+        .height(3.5).radius(1.75).fill($r('app.color.brand_pink')).hitTestBehavior(HitTestMode.None)
+    }
+    .id('player-edge-progress')
+    .width('100%').height(2.05)
+    .clip(true)
+    .position({ left: 0, bottom: 0 })
+    .hitTestBehavior(HitTestMode.None)
+    .accessibilityLevel('no')
   }
 
   private qnLabel(): string {
@@ -880,6 +899,12 @@ export struct PlayerView {
         .width('100%')
         .height('100%')
         .hitTestBehavior(HitTestMode.None)
+      }
+
+      // ⑤ 非全屏控件隐藏时，底缘只保留同一份播放快照的微进度。
+      if (!this.isFullscreen && !this.controlsVisible && this.collapseRatio <= 0 &&
+        this.state !== 'idle' && this.state !== 'error') {
+        this.EdgeProgress()
       }
 
       // ⑥ 锁定态：仅保留锁按钮

@@ -186,6 +186,69 @@ std::shared_ptr<Engine> Get(napi_env env, napi_value value) {
     return found->second;
 }
 
+// 该函数只接受C++值；mpv初始化和失败清理均在异步工作线程完成。
+void InitializeEngine(const std::shared_ptr<Engine> &engine, const std::string &surface, bool hardware) {
+    engine->mpv = mpv_create();
+    if (!engine->mpv) throw std::runtime_error("Cannot create libmpv");
+    Check(mpv_request_log_messages(engine->mpv, "warn"));
+    engine->Option("config", "no");
+    engine->Option("terminal", "no");
+    engine->Option("input-default-bindings", "no");
+    engine->Option("input-vo-keyboard", "no");
+    // 控制层由ArkUI绘制，禁止内核seek/音量命令再叠一层OSD进度细线。
+    engine->Option("osd-level", "0");
+    engine->Option("osd-bar", "no");
+    // CDN地址已由业务层解析，控制层由ArkUI负责，无需mpv内置Lua界面/解析器。
+    // Nara发布库默认会为这些脚本各启动线程；裁剪Lua的模拟器库没有相应选项。
+    const char *scripts[] = {"osc", "ytdl", "load-stats-overlay", "load-console",
+        "load-auto-profiles", "load-select", "load-positioning", "load-commands",
+        "load-context-menu", "load-scripts"};
+    for (const char *option : scripts) {
+        const int result = mpv_set_option_string(engine->mpv, option, "no");
+        if (result != MPV_ERROR_OPTION_NOT_FOUND) Check(result);
+    }
+    engine->Option("idle", "yes");
+    engine->Option("keep-open", "always");
+    engine->Option("pause", "yes");
+    engine->Option("video-sync", "display-resample");
+    engine->Option("cache", "yes");
+    engine->Option("demuxer-max-bytes", "4MiB");
+    engine->Option("demuxer-max-back-bytes", "4MiB");
+    engine->Option("cache-secs", "16");
+    engine->Option("demuxer-hysteresis-secs", "10.667");
+    engine->Option("network-timeout", "10");
+    engine->Option("vo", "gpu-next");
+    // 与Nara OHOS接入一致，允许发布库自动选择GPU后端。
+    // XComponent使用RGBA8888，避免EGL默认RGB配置在真机创建窗口失败；
+    // RGBA8同时保留OpenGL/OHCodec硬解通路，不能只靠Vulkan软解掩盖黑屏。
+    engine->Option("egl-output-format", "rgba8");
+    engine->Option("ao", "ohaudio");
+    engine->Option("hwdec", hardware ? "auto" : "no");
+    engine->Option("wid", surface);
+    Check(mpv_initialize(engine->mpv));
+    const char *properties[] = {"pause", "paused-for-cache", "seeking", "eof-reached", "video-params"};
+    for (const char *property : properties) Check(mpv_observe_property(engine->mpv, 0, property, MPV_FORMAT_NONE));
+    engine->Start();
+}
+
+struct Creation {
+    napi_async_work work = nullptr;
+    napi_deferred result = nullptr;
+    napi_async_cleanup_hook_handle cleanup = nullptr;
+    napi_env owner = nullptr;
+    std::shared_ptr<Engine> engine;
+    std::string surface;
+    std::string error;
+    std::atomic<bool> abandoned{false};
+    bool hardware = false;
+};
+
+void RejectCreation(napi_env env, napi_deferred result, const std::string &message) {
+    napi_value error;
+    napi_create_error(env, nullptr, Text(env, message), &error);
+    napi_reject_deferred(env, result, error);
+}
+
 napi_value Create(napi_env env, napi_callback_info info) {
     try {
         size_t argc = 3; napi_value args[3]; napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
@@ -193,54 +256,78 @@ napi_value Create(napi_env env, napi_callback_info info) {
         napi_valuetype listenerType;
         if (napi_typeof(env, args[2], &listenerType) != napi_ok || listenerType != napi_function)
             throw std::runtime_error("Invalid player callback");
-        auto engine = std::make_shared<Engine>();
-        engine->owner = env;
-        engine->mpv = mpv_create();
-        if (!engine->mpv) throw std::runtime_error("Cannot create libmpv");
-        Check(mpv_request_log_messages(engine->mpv, "warn"));
-        engine->Option("config", "no");
-        engine->Option("terminal", "no");
-        engine->Option("input-default-bindings", "no");
-        engine->Option("input-vo-keyboard", "no");
-        // CDN地址已由业务层解析，控制层由ArkUI负责，无需mpv内置Lua界面/解析器。
-        // Nara发布库默认会为这些脚本各启动线程；裁剪Lua的模拟器库没有相应选项。
-        const char *scripts[] = {"osc", "ytdl", "load-stats-overlay", "load-console",
-            "load-auto-profiles", "load-select", "load-positioning", "load-commands",
-            "load-context-menu", "load-scripts"};
-        for (const char *option : scripts) {
-            const int result = mpv_set_option_string(engine->mpv, option, "no");
-            if (result != MPV_ERROR_OPTION_NOT_FOUND) Check(result);
-        }
-        engine->Option("idle", "yes");
-        engine->Option("keep-open", "always");
-        engine->Option("pause", "yes");
-        engine->Option("video-sync", "display-resample");
-        engine->Option("cache", "yes");
-        engine->Option("demuxer-max-bytes", "4MiB");
-        engine->Option("demuxer-max-back-bytes", "4MiB");
-        engine->Option("cache-secs", "16");
-        engine->Option("demuxer-hysteresis-secs", "10.667");
-        engine->Option("network-timeout", "10");
-        engine->Option("vo", "gpu-next");
-        // 与Nara OHOS接入一致，允许发布库自动选择GPU后端。
-        // XComponent使用RGBA8888，避免EGL默认RGB配置在真机创建窗口失败；
-        // RGBA8同时保留OpenGL/OHCodec硬解通路，不能只靠Vulkan软解掩盖黑屏。
-        engine->Option("egl-output-format", "rgba8");
-        engine->Option("ao", "ohaudio");
-        const bool hardware = Flag(env, args[1]);
-        engine->Option("hwdec", hardware ? "auto" : "no");
-        engine->Option("wid", String(env, args[0]));
-        Check(mpv_initialize(engine->mpv));
-        const char *properties[] = {"pause", "paused-for-cache", "seeking", "eof-reached", "video-params"};
-        for (const char *property : properties) Check(mpv_observe_property(engine->mpv, 0, property, MPV_FORMAT_NONE));
-        napi_value label = Text(env, "PiliMini libmpv events");
-        if (napi_create_threadsafe_function(env, args[2], nullptr, label, 128, 1,
-            nullptr, nullptr, nullptr, Deliver, &engine->callback) != napi_ok) throw std::runtime_error("Cannot create player callback");
-        const uint32_t id = nextHandle++;
-        engine->Start();
-        { std::lock_guard<std::mutex> lock(registryMutex); registry.emplace(id, engine); }
-        OH_LOG_Print(LOG_APP, LOG_INFO, DOMAIN, "PiliMini-mpv", "created handle=%{public}u hardware=%{public}d", id, hardware);
-        return Number(env, id);
+        auto creation = std::make_unique<Creation>();
+        creation->owner = env;
+        creation->surface = String(env, args[0]);
+        creation->hardware = Flag(env, args[1]);
+        if (creation->surface.empty()) throw std::runtime_error("Invalid player surface");
+        creation->engine = std::make_shared<Engine>();
+        creation->engine->owner = env;
+        // JS引用只能在拥有env的线程创建；worker仅通过TSFN发送普通C++事件。
+        if (napi_create_threadsafe_function(env, args[2], nullptr, Text(env, "PiliMini libmpv events"), 128, 1,
+            nullptr, nullptr, nullptr, Deliver, &creation->engine->callback) != napi_ok)
+            throw std::runtime_error("Cannot create player callback");
+        napi_value promise;
+        if (napi_create_promise(env, &creation->result, &promise) != napi_ok)
+            throw std::runtime_error("Cannot create player promise");
+        const napi_status created = napi_create_async_work(env, nullptr, Text(env, "initialize libmpv"),
+            [](napi_env, void *data) {
+                auto *job = static_cast<Creation *>(data);
+                try {
+                    if (!job->abandoned.load()) { InitializeEngine(job->engine, job->surface, job->hardware); }
+                    if (job->abandoned.load()) { job->engine->Close(); }
+                }
+                catch (const std::exception &error) { job->error = error.what(); job->engine->Close(); }
+                catch (...) { job->error = "Cannot initialize libmpv"; job->engine->Close(); }
+            },
+            [](napi_env env, napi_status status, void *data) {
+                std::unique_ptr<Creation> job(static_cast<Creation *>(data));
+                // 被取消的work没有执行：Engine尚无mpv，只需释放主线程创建的TSFN。
+                if (job->abandoned.load()) {
+                    // env退出时不能注册迟到句柄或再访问JS Promise；异步cleanup持有env至此。
+                    job->engine->Close();
+                } else if (status != napi_ok || !job->error.empty()) {
+                    job->engine->Close();
+                    RejectCreation(env, job->result, job->error.empty() ? "Player initialization cancelled" : job->error);
+                } else {
+                    uint32_t registered = 0;
+                    try {
+                        const uint32_t id = nextHandle++;
+                        { std::lock_guard<std::mutex> lock(registryMutex);
+                            if (id == 0 || !registry.emplace(id, job->engine).second)
+                                throw std::runtime_error("Player handle limit reached");
+                            registered = id;
+                        }
+                        // 初始化完成前不向ArkTS暴露句柄，迟到实例由控制器在同一队列内先释放。
+                        if (napi_resolve_deferred(env, job->result, Number(env, id)) != napi_ok)
+                            throw std::runtime_error("Cannot deliver player handle");
+                        OH_LOG_Print(LOG_APP, LOG_INFO, DOMAIN, "PiliMini-mpv",
+                            "created handle=%{public}u hardware=%{public}d", id, job->hardware);
+                    } catch (const std::exception &error) {
+                        if (registered != 0) {
+                            std::lock_guard<std::mutex> lock(registryMutex); registry.erase(registered);
+                        }
+                        job->engine->Close();
+                        RejectCreation(env, job->result, error.what());
+                    }
+                }
+                napi_delete_async_work(env, job->work);
+                if (job->cleanup) { napi_remove_async_cleanup_hook(job->cleanup); }
+            }, creation.get(), &creation->work);
+        const napi_status guarded = created == napi_ok ? napi_add_async_cleanup_hook(env,
+            [](napi_async_cleanup_hook_handle, void *data) {
+                auto *job = static_cast<Creation *>(data);
+                job->abandoned.store(true);
+                // 已运行的initialize不能强杀；worker完成后关闭。未运行的work由complete负责清理。
+                napi_cancel_async_work(job->owner, job->work);
+            }, creation.get(), &creation->cleanup) : napi_generic_failure;
+        if (created != napi_ok || guarded != napi_ok || napi_queue_async_work(env, creation->work) != napi_ok) {
+            if (created == napi_ok) napi_delete_async_work(env, creation->work);
+            if (creation->cleanup) napi_remove_async_cleanup_hook(creation->cleanup);
+            // 任务尚未执行，没有mpv；unique_ptr销毁会abort TSFN，且不阻塞等待初始化。
+            RejectCreation(env, creation->result, "Cannot queue player initialization");
+        } else { creation.release(); }
+        return promise;
     } catch (const std::exception &error) { napi_throw_error(env, nullptr, error.what()); return nullptr; }
 }
 

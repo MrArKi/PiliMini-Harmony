@@ -9,6 +9,8 @@ export interface VideoItem {
   title: string;
   cover: string;
   upName: string;
+  /** UP UID（首页菜单直接访问空间；旧来源可缺省） */
+  upMid?: number;
   upFace: string;
   playCount: number;
   /** 弹幕数（Nara 卡片第二行展示） */
