@@ -65,7 +65,7 @@ export async function apiGet<T>(url: string): Promise<T> {
   return d;
 }
 
-async function buildGetHeaders(extraHeaders?: Record<string, string>): Promise<Record<string, string>> {
+export async function buildGetHeaders(extraHeaders?: Record<string, string>): Promise<Record<string, string>> {
   const headers: Record<string, string> = {
     'User-Agent': UA_PC,
     'Referer': BILI_REFERER

@@ -226,8 +226,10 @@ void InitializeEngine(const std::shared_ptr<Engine> &engine, const std::string &
     engine->Option("hwdec", hardware ? "auto" : "no");
     engine->Option("wid", surface);
     Check(mpv_initialize(engine->mpv));
-    const char *properties[] = {"pause", "paused-for-cache", "seeking", "eof-reached", "video-params"};
-    for (const char *property : properties) Check(mpv_observe_property(engine->mpv, 0, property, MPV_FORMAT_NONE));
+    // NONE会接收may-change，video-params随TICK每帧触发并把整批同步快照搬到UI线程。
+    // 视频尺寸/输出已有VIDEO_RECONFIG即时通知；四个状态按实际FLAG值去重。
+    const char *properties[] = {"pause", "paused-for-cache", "seeking", "eof-reached"};
+    for (const char *property : properties) Check(mpv_observe_property(engine->mpv, 0, property, MPV_FORMAT_FLAG));
     engine->Start();
 }
 

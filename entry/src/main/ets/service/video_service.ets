@@ -84,7 +84,27 @@ export interface VideoPageInfo {
   /** 分P 视频原始宽高（dimension；0 = 未知），用于竖屏视频判定（Nara isVertical 同构） */
   width: number;
   height: number;
+  cover?: string;
+  pubdate?: number;
 }
+
+/** UGC合集按接口原section顺序保留，下载seasonOrder仍使用全合集顺序。 */
+export interface VideoEpisode {
+  id: number;
+  aid: number;
+  bvid: string;
+  cid: number;
+  title: string;
+  cover: string;
+  duration: number;
+  pubdate: number;
+  viewCount: number;
+  danmakuCount: number;
+  pages: VideoPageInfo[];
+}
+
+export interface VideoSeasonSection { id: number; title: string; episodes: VideoEpisode[]; }
+export interface VideoSeason { id: string; title: string; sections: VideoSeasonSection[]; }
 
 export interface VideoDetail {
   aid: number;
@@ -104,6 +124,7 @@ export interface VideoDetail {
   seasonId?: string;
   seasonTitle?: string;
   seasonOrder?: number;
+  season?: VideoSeason;
 }
 
 interface ViewDimensionRaw {
@@ -118,6 +139,8 @@ interface ViewPageRaw {
   part: string;
   duration: number;
   dimension?: ViewDimensionRaw;
+  first_frame?: string;
+  ctime?: number;
 }
 
 interface ViewDataRaw {
@@ -134,8 +157,15 @@ interface ViewDataRaw {
   ugc_season?: ViewSeasonRaw;
 }
 
-interface ViewEpisodeRaw { aid?: number; bvid?: string; }
-interface ViewSectionRaw { episodes?: ViewEpisodeRaw[]; }
+interface ViewEpisodeArcRaw {
+  pic?: string; title?: string; duration?: number; pubdate?: number;
+  stat?: StatInfo;
+}
+interface ViewEpisodeRaw {
+  id?: number; aid?: number; bvid?: string; cid?: number; title?: string;
+  arc?: ViewEpisodeArcRaw; page?: ViewPageRaw; pages?: ViewPageRaw[];
+}
+interface ViewSectionRaw { id?: number; title?: string; episodes?: ViewEpisodeRaw[]; }
 interface ViewSeasonRaw { id: number; title: string; sections?: ViewSectionRaw[]; }
 
 // ===== 评论 =====
@@ -383,6 +413,39 @@ function parseDurationStr(d: string): number {
   return sec;
 }
 
+function mapVideoPages(raw: ViewPageRaw[]): VideoPageInfo[] {
+  return raw.filter((p: ViewPageRaw): boolean => Number.isSafeInteger(p.cid) && p.cid > 0)
+    .map((p: ViewPageRaw, index: number): VideoPageInfo => ({
+      cid: p.cid, page: p.page > 0 ? p.page : index + 1, part: p.part || '', duration: p.duration || 0,
+      width: p.dimension?.width || 0, height: p.dimension?.height || 0,
+      cover: p.first_frame ? fixUrl(p.first_frame) : '', pubdate: p.ctime || 0
+    }));
+}
+
+function mapVideoSeason(raw: ViewSeasonRaw | undefined): VideoSeason | undefined {
+  if (!raw || !Number.isSafeInteger(raw.id) || raw.id <= 0) { return undefined; }
+  const sections: VideoSeasonSection[] = [];
+  for (const section of raw.sections || []) {
+    const episodes: VideoEpisode[] = [];
+    for (const episode of section.episodes || []) {
+      // 只展示可导航的真实BV，不把缺失bvid误当成当前视频。
+      if (!episode.bvid || !/^BV[0-9A-Za-z]{10}$/.test(episode.bvid)) { continue; }
+      const pages: VideoPageInfo[] = mapVideoPages(episode.pages || (episode.page ? [episode.page] : []));
+      const cid: number = episode.cid || (pages.length > 0 ? pages[0].cid : 0);
+      if (!Number.isSafeInteger(cid) || cid <= 0) { continue; }
+      episodes.push({ id: episode.id || episode.aid || cid, aid: episode.aid || 0,
+        bvid: episode.bvid, cid: cid, title: episode.title || episode.arc?.title || '',
+        cover: episode.arc?.pic ? fixUrl(episode.arc.pic) : '',
+        duration: episode.arc?.duration || 0, pubdate: episode.arc?.pubdate || 0,
+        viewCount: episode.arc?.stat?.view || 0, danmakuCount: episode.arc?.stat?.danmaku || 0, pages: pages });
+    }
+    if (episodes.length > 0) {
+      sections.push({ id: section.id || sections.length + 1, title: section.title || '选集', episodes: episodes });
+    }
+  }
+  return sections.length > 0 ? { id: raw.id.toString(), title: raw.title || '', sections: sections } : undefined;
+}
+
 function mapComment(raw: ReplyItemRaw): CommentItem {
   const c: CommentItem = new CommentItem();
   c.rpid = raw.rpid;
@@ -623,21 +686,7 @@ export class VideoService {
     if (d === undefined) {
       throw new AppError('parse', -1, '详情数据为空');
     }
-    const pages: VideoPageInfo[] = [];
-    const rawPages: ViewPageRaw[] | undefined = d.pages;
-    if (rawPages !== undefined) {
-      for (let i = 0; i < rawPages.length; i++) {
-        const p: ViewPageRaw = rawPages[i];
-        let vw: number = 0;
-        let vh: number = 0;
-        const dim: ViewDimensionRaw | undefined = p.dimension;
-        if (dim !== undefined && dim.width !== undefined && dim.height !== undefined) {
-          vw = dim.width;
-          vh = dim.height;
-        }
-        pages.push({ cid: p.cid, page: p.page, part: p.part, duration: p.duration, width: vw, height: vh });
-      }
-    }
+    const pages: VideoPageInfo[] = mapVideoPages(d.pages || []);
     let seasonOrder: number = 0;
     let order: number = 0;
     for (const section of d.ugc_season?.sections || []) {
@@ -662,7 +711,8 @@ export class VideoService {
       replyCount: d.stat.reply !== undefined ? d.stat.reply : 0,
       pages: pages,
       seasonId: d.ugc_season ? d.ugc_season.id.toString() : '',
-      seasonTitle: d.ugc_season?.title || '', seasonOrder: seasonOrder
+      seasonTitle: d.ugc_season?.title || '', seasonOrder: seasonOrder,
+      season: mapVideoSeason(d.ugc_season)
     };
   }
 

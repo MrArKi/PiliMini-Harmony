@@ -2,7 +2,7 @@
  * 首页 Tab（spec-04 + 样式复刻 Nara）：
  *  - 顶部：搜索栏（高44/圆角25/黑5%）+ 用户头像（34，点击切"我的"）
  *  - 分类：Nara原生15sp文字标签（选中主色/加粗），内容Tabs保留各页位置
- *  - 内容：推荐 / 热门（下拉刷新 + 触底分页）
+ *  - 内容：推荐双列竖卡 / 热门单列横卡（下拉刷新 + 触底分页）
  */
 import { router, uiMaterial, LengthMetrics, curves } from '@kit.ArkUI';
 import { thumbUrl } from '../../infra/image/bili_image';
@@ -145,14 +145,14 @@ struct FeedList {
             GridItem() {
               Column()
                 .width('100%')
-                .height(this.topInset)
+                .height(this.topInset + (this.source === 'hot' ? 5 : 0))
             }
             .columnStart(0)
-            .columnEnd(1)
+            .columnEnd(this.source === 'hot' ? 0 : 1)
 
             LazyForEach(this.ds, (item: VideoItem) => {
               GridItem() {
-                VideoCardGrid({ model: item })
+                VideoCardGrid({ model: item, horizontal: this.source === 'hot' })
               }
               .width('100%')
             }, (item: VideoItem) => item.key)
@@ -171,12 +171,12 @@ struct FeedList {
               .padding({ top: 20, bottom: 110 })
             }
             .columnStart(0)
-            .columnEnd(1)
+            .columnEnd(this.source === 'hot' ? 0 : 1)
           }
-          .columnsTemplate('1fr 1fr')
-          .columnsGap(12)
-          .rowsGap(14)
-          .padding({ left: 12, right: 12 })
+          .columnsTemplate(this.source === 'hot' ? '1fr' : '1fr 1fr')
+          .columnsGap(this.source === 'hot' ? 0 : 8)
+          .rowsGap(this.source === 'hot' ? 2 : 8)
+          .padding({ left: this.source === 'hot' ? 0 : 12, right: this.source === 'hot' ? 0 : 12 })
           .scrollBar(BarState.Off)
           .cachedCount(6)
           .width('100%')
@@ -267,13 +267,17 @@ export struct HomeTab {
     }
   }
 
-  /** 顶栏展开/收起高度（含状态栏；搜索行 54 + 分类行 32 + 底部 6） */
+  /** Nara搜索行54、分类32；列表留白另按NativeTopSpacer的85计算。 */
   private expandedH(): number {
-    return this.statusBarH + 92;
+    return this.statusBarH + 86;
   }
 
   private collapsedH(): number {
-    return this.statusBarH + 40;
+    return this.statusBarH + 32;
+  }
+
+  private feedTopInset(): number {
+    return this.statusBarH + 85;
   }
 
   /** 顶栏玻璃底（Nara：linearGradient 蒙版 + linearGradientBlur 15，渐变方向 Bottom→Top） */
@@ -373,7 +377,7 @@ export struct HomeTab {
       this.ChipsBar()
     }
     .width('100%')
-    .padding({ top: this.statusBarH, bottom: 6 })
+    .padding({ top: this.statusBarH })
   }
 
   /** 顶栏宿主：透明 Navigation（空内容、STACK、显式高度）+ 渐变模糊底；上滑收起 */
@@ -416,7 +420,7 @@ export struct HomeTab {
             source: 'rcmd',
             selected: this.mode === 0,
             navRequest: this.feedNavRequests[0],
-            topInset: this.expandedH(),
+            topInset: this.feedTopInset(),
             topTick: this.topTick,
             onCollapse: (c: boolean) => {
               this.feedCollapsed[0] = c;
@@ -429,7 +433,7 @@ export struct HomeTab {
             source: 'hot',
             selected: this.mode === 1,
             navRequest: this.feedNavRequests[1],
-            topInset: this.expandedH(),
+            topInset: this.feedTopInset(),
             topTick: this.topTick,
             onCollapse: (c: boolean) => {
               this.feedCollapsed[1] = c;

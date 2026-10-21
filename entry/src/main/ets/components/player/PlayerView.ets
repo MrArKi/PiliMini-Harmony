@@ -1,15 +1,24 @@
 /** Nara布局/手势视图；单内核播放状态由PlayController管理。 */
 import { common } from '@kit.AbilityKit';
-import { window } from '@kit.ArkUI';
+import { window, uiMaterial } from '@kit.ArkUI';
+import { pasteboard } from '@kit.BasicServicesKit';
 import { image } from '@kit.ImageKit';
+import { AVVolumePanel } from '@kit.AudioKit';
 import { AsyncImage } from '../AsyncImage';
 import { PlayQuality } from '../../service/video_service';
-import { prefsPut } from '../../infra/storage/prefs';
 import { PlayController, PlaybackSnapshot, PlaybackSource } from '../../infra/player/play_controller';
 import { PlayerScreen } from '../../infra/player/screen_awake';
+import { PlayerBrightness } from '../../infra/player/player_brightness';
 import { VideoQuality } from '../../model/video_quality';
 import { PlayerProgressBar } from './PlayerProgressBar';
 import { PlayPauseIcon } from './PlayPauseIcon';
+import { DanmakuLayer } from './DanmakuLayer';
+import { DanmakuPanel } from './DanmakuPanel';
+import { DanmakuSelectionMenu } from './DanmakuSelectionMenu';
+import { DanmakuItem } from '../../model/danmaku';
+import { DanmakuPlaybackFeed, DanmakuLayerHandle } from '../../infra/danmaku/playback_feed';
+import { DanmakuPreferences, copyDanmakuPreferences } from '../../infra/danmaku/settings';
+import { DanmakuRule, DanmakuRuleStore } from '../../infra/danmaku/rules';
 
 function two(n: number): string { const s: string = Math.floor(n).toString(); return s.length >= 2 ? s : '0' + s; }
 function fmtMs(ms: number): string {
@@ -20,6 +29,7 @@ function fmtMs(ms: number): string {
 }
 const SPEEDS: number[] = [0.5, 0.75, 1, 1.25, 1.5, 2];
 const LONG_PRESS_SPEED: number = 3;
+interface DanmakuPopupState { isVisible: boolean; }
 
 class PlayerSurfaceController extends XComponentController {
   created: (surface: string) => void = () => {};
@@ -35,6 +45,8 @@ export struct PlayerView {
   @Prop bvid: string = '';
   @Prop @Watch('onVisibleChange') visible: boolean = true;
   @Prop @Watch('onCidChange') cid: number = 0;
+  /** 选集跨BV/分P一次提交源，避免分别更新bvid/cid造成混合取流。 */
+  @Prop @Watch('onPlaybackSourceChange') playbackSource: PlaybackSource | undefined = undefined;
   @Prop cover: string = '';
   @Prop sourceWidth: number = 0;
   @Prop sourceHeight: number = 0;
@@ -45,6 +57,24 @@ export struct PlayerView {
   @Prop artist: string = '';
   @Prop partText: string = '';
   @Prop danmakuCount: number = 0;
+  @Prop danmakuPreferences: DanmakuPreferences = new DanmakuPreferences();
+  @Prop danmakuReady: boolean = false;
+  onDanmakuChange: (value: DanmakuPreferences) => void = () => {};
+  private danmakuFeed: DanmakuPlaybackFeed = new DanmakuPlaybackFeed();
+  private danmakuHandle: DanmakuLayerHandle = new DanmakuLayerHandle();
+  @State danmakuStatus: string = '';
+  @State danmakuPanelShown: boolean = false;
+  @State danmakuInitialTab: number = 0;
+  @State nearbyDanmaku: DanmakuItem[] = [];
+  @State selectedDanmaku: DanmakuItem | undefined = undefined;
+  @State danmakuSelected: boolean = false;
+  @State danmakuMenuX: number = 0;
+  @State danmakuMenuY: number = 0;
+  private danmakuActionBusy: boolean = false;
+  private danmakuMenuMaterial: uiMaterial.ImmersiveMaterial | undefined = uiMaterial.isImmersiveMaterialSupported() &&
+    uiMaterial.getGlobalMaterialLevel() !== uiMaterial.MaterialLevel.SMOOTH ?
+    new uiMaterial.ImmersiveMaterial({ style: uiMaterial.ImmersiveStyle.ULTRA_THIN,
+      materialColor: '#B3000000', colorInvert: false, interactive: true, lightEffect: {} }) : undefined;
   @Prop isFullscreen: boolean = false;
   /** 进入即起播（详情页场景，用户决策 2026-10-11） */
   @Prop autoPlay: boolean = false;
@@ -112,7 +142,7 @@ export struct PlayerView {
   @State surfaceMounted: boolean = true;
   private surfaceRelease: Promise<void> = Promise.resolve();
   private visibilityGeneration: number = 0;
-  private exiting: boolean = false;
+  @State exiting: boolean = false;
 
   private controller: PlayController | undefined = undefined;
   private surfaceId: string = 'pm_surface_' + Date.now().toString();
@@ -140,14 +170,26 @@ export struct PlayerView {
   private panStartPos: number = 0;
   private areaWidth: number = 360;
   private panMode: string = 'none';
+  private panConsumed: boolean = false;
   private panStartX: number = 0;
-  private curBright: number = 0.5;
+  private curBright: number | undefined = undefined;
   private curVolume: number = 1;
-  private brightStart: number = 0.5;
-  private volStart: number = 1;
+  private brightStart: number = 0;
+  private volumeTarget: number = 0;
+  private volumeLastDy: number = 0;
+  private volumeRequests: number[] = [];
+  private systemVolumeReady: boolean = false;
+  private systemVolumeMin: number = 0;
+  private systemVolumeMax: number = 0;
+  private systemVolumeRevision: number = -1;
+  @State requestedSystemLevel: number = -1;
   private fsTriggered: boolean = false;
   private mainWin: window.Window | undefined = undefined;
-  private originalBrightness: number = -1;
+  private brightnessControl: PlayerBrightness = new PlayerBrightness((value: number | undefined, failed: boolean): void => {
+    if (this.destroyed) { return; }
+    this.curBright = value;
+    if (failed && this.visible && !this.appInBackground) { this.showToast('亮度调节暂不可用'); }
+  });
 
   private videoRatio(): number {
     return this.actualRatio > 0 ? this.actualRatio :
@@ -165,6 +207,8 @@ export struct PlayerView {
       (snapshot: PlaybackSnapshot): void => { this.receive(snapshot); });
     this.registerRelease((): Promise<void> => {
       this.exiting = true; this.visibilityGeneration++;
+      this.danmakuSelected = false; this.danmakuPanelShown = false;
+      this.requestedSystemLevel = -1; this.brightnessControl.setVisible(false);
       if (this.controller === undefined) { return this.surfaceRelease; }
       this.ready = false;
       this.surfaceRelease = this.controller.suspend();
@@ -187,8 +231,9 @@ export struct PlayerView {
     }).catch((): void => { if (!this.destroyed) { this.errorText = '播放器设置初始化失败'; this.state = 'error'; this.notifyState(); } });
     window.getLastWindow(getContext(this)).then((win: window.Window): void => {
       if (this.destroyed) { return; }
-      this.mainWin = win; this.originalBrightness = win.getWindowProperties().brightness;
-      if (this.originalBrightness >= 0) { this.curBright = this.originalBrightness; }
+      this.mainWin = win;
+      this.brightnessControl.setVisible(this.visible); this.brightnessControl.setBackground(this.appInBackground);
+      this.brightnessControl.initialize(win, getContext(this) as common.UIAbilityContext);
       this.updateScreenOn();
     }).catch(() => {});
   }
@@ -199,8 +244,17 @@ export struct PlayerView {
     this.state = snapshot.state; this.posMs = snapshot.position; this.durMs = snapshot.duration;
     this.speed = snapshot.speed; this.speedText = this.speed.toString() + 'X';
     this.qn = snapshot.quality; this.qualities = snapshot.qualities; this.bufferPercent = snapshot.bufferPercent;
-    this.curVolume = snapshot.volume; this.wanted = snapshot.wanted; this.started = snapshot.loaded;
+    this.wanted = snapshot.wanted; this.started = snapshot.loaded;
     this.errorText = snapshot.error; this.appInBackground = snapshot.background;
+    this.brightnessControl.setBackground(snapshot.background);
+    if (snapshot.background) { this.requestedSystemLevel = -1; this.volumeRequests = []; }
+    this.receiveSystemVolume(snapshot);
+    const source: PlaybackSource | undefined = this.playbackSource || this.localSource;
+    this.danmakuFeed.publish({ cid: (source ? source.localPath : this.localPath).length > 0 ? 0 : (source ? source.cid : this.cid),
+      duration: snapshot.duration, position: snapshot.position, speed: snapshot.speed,
+      running: snapshot.state === 'playing' && snapshot.loaded && !snapshot.background && !snapshot.seeking,
+      timeRevision: snapshot.timeRevision, sampledAt: snapshot.sampledAt, seeking: snapshot.seeking || !snapshot.loaded });
+    if (snapshot.background) { this.danmakuPanelShown = false; this.danmakuSelected = false; }
     if (snapshot.width > 0 && snapshot.height > 0) {
       const ratio: number = snapshot.width / snapshot.height;
       if (Math.abs(ratio - this.actualRatio) > 0.0001) { this.actualRatio = ratio; this.onVideoSize(snapshot.width, snapshot.height); }
@@ -220,14 +274,17 @@ export struct PlayerView {
     const rect: SurfaceRect = this.xcController.getXComponentSurfaceRect();
     this.controller.resizeSurface(rect.surfaceWidth, rect.surfaceHeight);
     if (this.routeSuspended) {
-      this.routeSuspended = false; this.controller.resumeSource();
+      this.routeSuspended = false; this.start(this.qn);
     } else if (this.settingsLoaded && this.autoPlay && (this.state === 'idle' || this.state === 'error')) { this.start(this.qn); }
   }
 
   private onVisibleChange(): void {
     if (this.destroyed || this.exiting || this.controller === undefined) { return; }
+    this.brightnessControl.setVisible(this.visible);
     const generation: number = ++this.visibilityGeneration;
     if (!this.visible) {
+      this.requestedSystemLevel = -1; this.volumeRequests = [];
+      this.danmakuPanelShown = false; this.danmakuSelected = false;
       if (!this.wanted) { this.capturePausedFrame(); }
       this.showPausedFrame = !this.wanted && this.pausedFrame !== undefined;
       this.routeSuspended = this.state !== 'idle'; this.ready = false;
@@ -235,7 +292,6 @@ export struct PlayerView {
       this.surfaceRelease.then((): void => {
         if (!this.destroyed && !this.visible && generation === this.visibilityGeneration) { this.surfaceMounted = false; }
       });
-      if (this.mainWin !== undefined) { this.mainWin.setWindowBrightness(this.originalBrightness).catch(() => {}); }
     } else {
       this.surfaceRelease.then((): void => {
         if (this.destroyed || !this.visible || generation !== this.visibilityGeneration || this.controller === undefined) { return; }
@@ -252,13 +308,22 @@ export struct PlayerView {
   }
 
   onCidChange(): void {
-    if (this.destroyed || this.localPath.length > 0) { return; }
+    if (this.destroyed || this.localPath.length > 0 || this.playbackSource !== undefined) { return; }
+    this.danmakuPanelShown = false; this.danmakuSelected = false;
     this.actualRatio = 0; this.pausedFrame = undefined; this.showPausedFrame = false; this.controlsVisible = true;
     if (this.ready && this.settingsLoaded && this.visible) { this.start(this.qn, false); }
   }
 
   private onLocalSourceChange(): void {
     if (!this.localSource || this.destroyed) { return; }
+    this.danmakuSelected = false; this.danmakuPanelShown = false;
+    this.actualRatio = 0; this.pausedFrame = undefined; this.showPausedFrame = false; this.controlsVisible = true;
+    if (this.ready && this.settingsLoaded && this.visible) { this.start(this.qn, false); }
+  }
+
+  private onPlaybackSourceChange(): void {
+    if (!this.playbackSource || this.destroyed) { return; }
+    this.danmakuPanelShown = false; this.danmakuSelected = false;
     this.actualRatio = 0; this.pausedFrame = undefined; this.showPausedFrame = false; this.controlsVisible = true;
     if (this.ready && this.settingsLoaded && this.visible) { this.start(this.qn, false); }
   }
@@ -266,7 +331,7 @@ export struct PlayerView {
   private start(quality: number, preserve: boolean = true): void {
     if (this.controller === undefined || !this.controller.ready() || this.destroyed || !this.visible) { return; }
     if (preserve && !this.wanted) { this.capturePausedFrame(); this.showPausedFrame = this.pausedFrame !== undefined; }
-    const source: PlaybackSource = this.localSource || { bvid: this.bvid, cid: this.cid, localPath: this.localPath,
+    const source: PlaybackSource = this.playbackSource || this.localSource || { bvid: this.bvid, cid: this.cid, localPath: this.localPath,
       title: this.partText || this.title, artist: this.artist, cover: this.cover,
       localDuration: this.localDuration, offlineScope: this.offlineScope, offlineKey: this.offlineKey };
     this.controller.start(source, quality, preserve);
@@ -281,7 +346,7 @@ export struct PlayerView {
   private applySpeed(value: number): void { if (this.controller !== undefined) { this.controller.speed(value); } }
   private syncSession(): void {
     if (this.controller !== undefined) {
-      const source = this.localSource;
+      const source = this.playbackSource || this.localSource;
       this.controller.setMetadata(source ? source.title : this.partText || this.title,
         source ? source.artist : this.artist, source ? source.cover : this.cover);
     }
@@ -304,16 +369,20 @@ export struct PlayerView {
     catch (error) { this.pausedFrame = undefined; }
   }
   private showToast(text: string): void {
+    if (!text.startsWith('音量 ')) { this.requestedSystemLevel = -1; }
     this.toast = text;
     if (this.toastTimer !== -1) { clearTimeout(this.toastTimer); }
-    this.toastTimer = setTimeout((): void => { this.toastTimer = -1; if (!this.destroyed) { this.toast = ''; } }, 1600);
+    this.toastTimer = setTimeout((): void => {
+      this.toastTimer = -1;
+      if (!this.destroyed) { this.toast = ''; this.requestedSystemLevel = -1; }
+    }, 1600);
   }
   private armControls(): void {
     if (this.controlTimer !== -1) { clearTimeout(this.controlTimer); }
     this.controlTimer = setTimeout((): void => {
       this.controlTimer = -1;
       if (!this.destroyed && this.state === 'playing' && !this.locked && !this.longPressActive && !this.panSeeking && this.seekPreviewMs < 0 &&
-        !this.speedMenuVisible && !this.qualityMenuVisible) {
+        !this.speedMenuVisible && !this.qualityMenuVisible && !this.danmakuPanelShown && !this.danmakuSelected) {
         this.controlsVisible = false;
       }
     }, 3000);
@@ -326,18 +395,116 @@ export struct PlayerView {
     if (this.controlTimer !== -1) { clearTimeout(this.controlTimer); }
     this.xcController.created = () => {}; this.xcController.removed = () => {}; this.xcController.resized = () => {};
     if (this.controller !== undefined) { this.controller.dispose(); this.controller = undefined; }
+    this.danmakuFeed.clear();
+    this.requestedSystemLevel = -1; this.brightnessControl.dispose();
     if (this.mainWin !== undefined) {
-      this.mainWin.setWindowBrightness(this.originalBrightness).catch(() => {});
       PlayerScreen.update(this.mainWin, this.surfaceBase, false);
     }
   }
 
-  private onSingleTap(): void {
+  private onSingleTap(event: GestureEvent): void {
+    if (this.panConsumed) { return; }
     if (!this.isFullscreen && this.collapseRatio > 0 && this.state !== 'playing') { this.togglePlay(); return; }
     if (this.locked) {
       return;
     }
+    if (this.danmakuReady && this.danmakuPreferences.enabled && this.collapseRatio <= 0 && event.fingerList.length > 0) {
+      const finger: FingerInfo = event.fingerList[0];
+      const scale: number = this.canvasScale();
+      const x: number = (finger.localX - this.canvasW() / 2) / scale + this.surfaceWidth() / 2;
+      const y: number = (finger.localY - this.viewportH() / 2) / scale + this.surfaceHeight() / 2;
+      const item: DanmakuItem | undefined = this.danmakuHandle.hitTest(x, y);
+      if (item !== undefined) {
+        this.selectedDanmaku = item; this.danmakuMenuX = Math.max(8, Math.min(this.playerW - 8, finger.localX));
+        this.danmakuMenuY = Math.max(8, Math.min(this.playerH - 8, finger.localY));
+        this.danmakuSelected = true; return;
+      }
+    }
     this.doSingleTap();
+  }
+
+  private openDanmakuPanel(tab: number = 0): void {
+    this.danmakuSelected = false; this.danmakuInitialTab = tab;
+    this.nearbyDanmaku = this.danmakuHandle.nearby(); this.danmakuPanelShown = true;
+  }
+
+  private toggleDanmaku(): void {
+    const value: DanmakuPreferences = copyDanmakuPreferences(this.danmakuPreferences);
+    value.enabled = !value.enabled; this.onDanmakuChange(value); this.armControls();
+  }
+
+  private async copyDanmaku(item: DanmakuItem): Promise<void> {
+    this.danmakuSelected = false;
+    try {
+      await pasteboard.getSystemPasteboard().setData(pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, item.text));
+      if (!this.destroyed) { this.showToast('已复制弹幕'); }
+    } catch (_) { if (!this.destroyed) { this.showToast('复制失败，请重试'); } }
+  }
+
+  private async blockDanmakuSender(item: DanmakuItem): Promise<void> {
+    if (this.danmakuActionBusy || item.midHash.length === 0) { return; }
+    this.danmakuActionBusy = true;
+    try {
+      const rules: DanmakuRule[] = await DanmakuRuleStore.load();
+      const existing: DanmakuRule | undefined = rules.find((rule: DanmakuRule): boolean =>
+        rule.kind === 'sender' && rule.value === item.midHash.toLowerCase());
+      if (existing === undefined) {
+        await DanmakuRuleStore.save(DanmakuRuleStore.add(rules, 'sender', item.midHash));
+      } else if (!existing.enabled) {
+        await DanmakuRuleStore.save(DanmakuRuleStore.toggle(rules, existing.id));
+      }
+      if (!this.destroyed) {
+        this.danmakuHandle.refreshRules(); this.danmakuSelected = false; this.showToast('已在本机屏蔽该发送者的弹幕');
+      }
+    } catch (error) { if (!this.destroyed) { this.showToast((error as Error).message || '屏蔽失败，请重试'); } }
+    finally { this.danmakuActionBusy = false; }
+  }
+
+  @Builder
+  DanmakuSelection() {
+    WithTheme({ colorMode: ThemeColorMode.DARK }) {
+      if (this.selectedDanmaku !== undefined) {
+        DanmakuSelectionMenu({ item: this.selectedDanmaku,
+          maxHeight: this.isFullscreen ? Math.min(400, Math.max(80, this.canvasH() - 64)) : 400,
+          onClose: (): void => { this.danmakuSelected = false; },
+          onCopy: (item: DanmakuItem): void => { this.copyDanmaku(item); },
+          onHide: (item: DanmakuItem): void => {
+            try {
+              this.danmakuHandle.hide(item.key); this.danmakuSelected = false; this.showToast('已隐藏，可在弹幕设置恢复');
+            } catch (error) { this.showToast((error as Error).message); }
+          },
+          onKeyword: (_item: DanmakuItem): void => { this.openDanmakuPanel(2); },
+          onSender: (item: DanmakuItem): void => { this.blockDanmakuSender(item); }
+        })
+      }
+    }
+  }
+
+  @Builder
+  DanmakuCover() {
+    Stack({ alignContent: this.isFullscreen && this.canvasW() > this.canvasH() ? Alignment.End : Alignment.Bottom }) {
+      Column().width('100%').height('100%').backgroundColor('#55000000')
+        .onClick((): void => { this.danmakuPanelShown = false; })
+      DanmakuPanel({ preferences: this.danmakuPreferences,
+        status: this.localPath.length > 0 ? '离线视频暂不支持弹幕' : this.danmakuStatus,
+        nearby: this.nearbyDanmaku, initialTab: this.danmakuInitialTab,
+        onChange: (value: DanmakuPreferences): void => { this.onDanmakuChange(value); },
+        onClose: (): void => { this.danmakuPanelShown = false; this.armControls(); },
+        onRetry: (): void => { this.danmakuHandle.retry(); this.nearbyDanmaku = this.danmakuHandle.nearby(); },
+        onRefreshNearby: (): void => { this.nearbyDanmaku = this.danmakuHandle.nearby(); },
+        onSelect: (item: DanmakuItem): void => {
+          this.danmakuPanelShown = false; this.selectedDanmaku = item;
+          this.danmakuMenuX = this.playerW / 2; this.danmakuMenuY = this.playerH / 2;
+          this.danmakuSelected = true;
+        },
+        onRulesChanged: (): void => { this.danmakuHandle.refreshRules(); },
+        onRestoreHidden: (): void => {
+          this.danmakuHandle.restoreHidden(); this.nearbyDanmaku = this.danmakuHandle.nearby();
+          this.showToast('已恢复本视频隐藏的弹幕');
+        }
+      }).width(this.isFullscreen && this.canvasW() > this.canvasH() ? '50%' : '100%')
+        .height(this.isFullscreen && this.canvasW() > this.canvasH() ? '100%' : '70%').constraintSize({ maxWidth: 512 })
+    }.width('100%').height('100%')
   }
 
   /** 双击由ArkUI互斥识别器优先处理，单击不再自行计时。 */
@@ -351,7 +518,7 @@ export struct PlayerView {
   }
 
   private onDoubleTap(): void {
-    if (this.locked) {
+    if (this.locked || this.panConsumed) {
       return;
     }
     this.togglePlay();
@@ -381,18 +548,22 @@ export struct PlayerView {
   }
 
   private onPanStart(startX: number): void {
-    if (this.locked) {
+    if (this.locked || !this.visible || this.appInBackground || this.exiting) {
       return;
     }
     this.panMode = 'none';
+    this.panConsumed = true;
+    this.requestedSystemLevel = -1;
     this.fsTriggered = false;
     this.panSeeking = false;
     this.panStartPos = this.posMs;
     this.panStartX = startX;
+    this.brightnessControl.sync();
+    this.controller?.syncSystemVolume();
   }
 
   private onPanUpdate(dx: number, dy: number): void {
-    if (this.locked) {
+    if (this.locked || !this.visible || this.appInBackground || this.exiting) {
       return;
     }
     // 长按期间垂直滑动 → 锁定/解除锁定倍速
@@ -424,13 +595,15 @@ export struct PlayerView {
         // 分区按按压起点 X：左 1/3 亮度 / 中 1/3 全屏 / 右 1/3 音量
         const w: number = this.playerW > 0 ? this.playerW : 360;
         if (this.panStartX < w / 3) {
+          if (this.curBright === undefined) { this.showToast('暂时无法读取亮度'); return; }
           this.panMode = 'bright';
           this.brightStart = this.curBright;
         } else if (this.panStartX < w * 2 / 3) {
           this.panMode = 'fs';
         } else {
+          if (!this.systemVolumeReady) { this.showToast('暂时无法读取系统音量'); return; }
           this.panMode = 'volume';
-          this.volStart = this.curVolume;
+          this.volumeTarget = this.curVolume; this.volumeLastDy = 0; this.volumeRequests = [];
         }
       } else {
         return;
@@ -450,9 +623,9 @@ export struct PlayerView {
       this.showToast('亮度 ' + Math.round(v * 100) + '%');
     } else if (this.panMode === 'volume') {
       const h: number = this.playerH > 0 ? this.playerH : 400;
-      const v: number = Math.max(0, Math.min(this.volStart - dy / (h * 0.5), 1));
+      const v: number = Math.max(0, Math.min(this.volumeTarget - (dy - this.volumeLastDy) / (h * 0.5), 1));
+      this.volumeTarget = v; this.volumeLastDy = dy;
       this.applyVolume(v);
-      this.showToast('音量 ' + Math.round(v * 100) + '%');
     } else if (this.panMode === 'fs') {
       // 中间上划进全屏 / 下滑退全屏（Nara 默认方向）
       if (!this.fsTriggered && dy < -15 && !this.isFullscreen) {
@@ -467,23 +640,35 @@ export struct PlayerView {
 
   /** 亮度：窗口级亮度（0~1，退出页面后恢复系统亮度） */
   private applyBrightness(v: number): void {
-    this.curBright = v;
-    const win: window.Window | undefined = this.mainWin;
-    if (win !== undefined) {
-      try {
-        win.setWindowBrightness(v).catch(() => {
-          // 忽略
-        });
-      } catch (e) {
-        // 忽略
-      }
+    this.brightnessControl.apply(v);
+  }
+
+  private receiveSystemVolume(snapshot: PlaybackSnapshot): void {
+    if (snapshot.systemVolumeRevision === this.systemVolumeRevision) { return; }
+    this.systemVolumeRevision = snapshot.systemVolumeRevision;
+    this.systemVolumeReady = snapshot.systemVolumeReady;
+    this.systemVolumeMin = snapshot.systemVolumeMin; this.systemVolumeMax = snapshot.systemVolumeMax;
+    if (!this.systemVolumeReady) { this.requestedSystemLevel = -1; return; }
+    this.curVolume = (snapshot.systemVolumeLevel - this.systemVolumeMin) / (this.systemVolumeMax - this.systemVolumeMin);
+    const own: number = this.volumeRequests.indexOf(snapshot.systemVolumeLevel);
+    if (own >= 0) { this.volumeRequests.splice(0, own + 1); }
+    else if (this.panMode === 'volume') { this.volumeTarget = this.curVolume; this.volumeRequests = []; }
+    if (snapshot.systemVolumeShowUi && this.visible && !this.appInBackground && !this.exiting) {
+      if (this.panMode !== 'volume') { this.requestedSystemLevel = -1; }
+      this.showToast('音量 ' + Math.round(this.curVolume * 100) + '%');
     }
   }
 
-  /** 应用内音量由单内核管理。 */
+  /** 仅前台用户手势更新AVVolumePanel；普通快照不写系统音量。 */
   private applyVolume(v: number): void {
-    this.curVolume = v;
-    if (this.controller !== undefined) { this.controller.volume(v); }
+    if (!this.systemVolumeReady || !this.visible || this.appInBackground || this.exiting || this.panMode !== 'volume') { return; }
+    const level: number = Math.round(this.systemVolumeMin + v * (this.systemVolumeMax - this.systemVolumeMin));
+    this.showToast('音量 ' + Math.round((level - this.systemVolumeMin) / (this.systemVolumeMax - this.systemVolumeMin) * 100) + '%');
+    if (this.requestedSystemLevel !== level) {
+      this.volumeRequests.push(level);
+      if (this.volumeRequests.length > 32) { this.volumeRequests.shift(); }
+      this.requestedSystemLevel = level;
+    }
   }
 
   private onPanEnd(): void {
@@ -492,7 +677,7 @@ export struct PlayerView {
       this.showToast('已定位到 ' + fmtMs(this.seekPreviewMs));
     }
     if (this.panMode === 'volume') {
-      prefsPut('setting_player_volume', this.curVolume.toString());
+      this.controller?.syncSystemVolume();
     }
     this.panMode = 'none';
     this.fsTriggered = false;
@@ -593,6 +778,23 @@ export struct PlayerView {
       }
       .layoutWeight(1)
       .alignItems(HorizontalAlign.Start)
+
+      Row() {
+        if (this.isFullscreen) {
+          Button({ type: ButtonType.Normal }) {
+            Image(this.danmakuPreferences.enabled ? $r('app.media.icon_dm_on') : $r('app.media.icon_dm_off'))
+              .width(20).height(20).fillColor('#FFFFFF')
+          }.width(40).height(34).padding(0).backgroundColor(Color.Transparent).enabled(this.danmakuReady)
+            .id('danmaku_fullscreen_toggle')
+            .accessibilityText(this.danmakuPreferences.enabled ? '关闭弹幕' : '开启弹幕')
+            .onClick((): void => { this.toggleDanmaku(); })
+        }
+        Button({ type: ButtonType.Normal }) {
+          Image($r('app.media.icon_dm_settings')).width(20).height(20).fillColor('#FFFFFF')
+        }.width(40).height(34).padding(0).backgroundColor(Color.Transparent).enabled(this.danmakuReady)
+          .id('danmaku_settings').accessibilityText('弹幕设置')
+          .onClick((): void => { this.openDanmakuPanel(); })
+      }
 
       Button({ type: ButtonType.Normal }) {
         Image($r('app.media.icon_unlock')).width(15).height(15).fillColor('#FFFFFF')
@@ -787,6 +989,16 @@ export struct PlayerView {
             .hitTestBehavior(HitTestMode.None)
         }
 
+        if (this.danmakuReady) {
+          DanmakuLayer({ cid: this.playbackSource ? this.playbackSource.cid : (this.localPath.length > 0 ? 0 : this.cid),
+            preferences: this.danmakuPreferences, fullscreen: this.isFullscreen,
+            visible: this.visible && !this.exiting && (this.isFullscreen || this.collapseRatio < 1) &&
+              this.localPath.length === 0,
+            feed: this.danmakuFeed, handle: this.danmakuHandle,
+            onStatus: (message: string): void => { if (!this.destroyed) { this.danmakuStatus = message; } }
+          }).width(this.surfaceWidth()).height(this.surfaceHeight())
+        }
+
       }
       .width('100%').height(this.canvasH())
       .scale({ x: this.canvasScale(), y: this.canvasScale() })
@@ -795,11 +1007,12 @@ export struct PlayerView {
 
       // 画布独占手势；上层菜单、进度条与按钮保持独立命中。
       Column().width('100%').height('100%')
+        .onTouch((event: TouchEvent): void => { if (event.type === TouchType.Down) { this.panConsumed = false; } })
     .gesture(
       GestureGroup(GestureMode.Parallel,
         GestureGroup(GestureMode.Exclusive,
           TapGesture({ count: 2 }).onAction(() => { this.onDoubleTap(); }),
-          TapGesture({ count: 1 }).onAction(() => { this.onSingleTap(); })
+          TapGesture({ count: 1 }).onAction((event: GestureEvent): void => { this.onSingleTap(event); })
         ),
         LongPressGesture({ repeat: false, duration: 400 })
           .onAction(() => {
@@ -825,6 +1038,16 @@ export struct PlayerView {
           })
       )
     )
+      WithTheme({ colorMode: ThemeColorMode.DARK }) {
+        Column().width(1).height(1).position({ x: this.danmakuMenuX, y: this.danmakuMenuY })
+          .bindPopup(this.danmakuSelected, { builder: this.DanmakuSelection, placement: Placement.Bottom,
+            enableArrow: true, radius: 12, colorMode: AnchoredColorMode.FOLLOW_TARGET,
+            popupColor: this.danmakuMenuMaterial !== undefined ? Color.Transparent : '#242424',
+            backgroundBlurStyle: BlurStyle.NONE, systemMaterial: this.danmakuMenuMaterial,
+            onStateChange: (event: DanmakuPopupState): void => {
+              if (!event.isVisible) { this.danmakuSelected = false; this.armControls(); }
+            } })
+      }
 
       // ② 封面遮罩（未起播）
       if (this.state === 'idle') {
@@ -925,6 +1148,11 @@ export struct PlayerView {
       }
 
       // ⑦ toast / 拖动时间提示
+      if (this.requestedSystemLevel >= 0 && this.toast.startsWith('音量 ') &&
+        this.visible && !this.appInBackground && !this.exiting) {
+        AVVolumePanel({ volumeLevel: this.requestedSystemLevel, volumeParameter: { position: { x: -1, y: -1 } } })
+          .width(1).height(1).hitTestBehavior(HitTestMode.None)
+      }
       if (this.toast.length > 0 || this.seekPreviewMs >= 0) {
         Text(this.seekPreviewMs >= 0
           ? (fmtMs(this.seekPreviewMs) + ' / ' + fmtMs(this.durMs))
@@ -939,6 +1167,10 @@ export struct PlayerView {
     .width('100%')
     .height(this.viewHeight)
     .backgroundColor('#000000')
+    .bindContentCover(this.danmakuPanelShown, this.DanmakuCover(), {
+      modalTransition: ModalTransition.NONE, backgroundColor: Color.Transparent,
+      onDisappear: (): void => { this.danmakuPanelShown = false; this.armControls(); }
+    })
     .onAreaChange((oldV: Area, newV: Area) => {
       // 手势分区与灵敏度按播放器实际尺寸计算
       this.playerW = Number(newV.width);

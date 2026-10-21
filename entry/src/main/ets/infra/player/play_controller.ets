@@ -1,4 +1,5 @@
 import { common } from '@kit.AbilityKit';
+import systemDateTime from '@ohos.systemDateTime';
 import { audio } from '@kit.AudioKit';
 import { NativePlayerEvent, NativePlayerSnapshot } from 'libpilimini_player.so';
 import { MpvEngine } from './mpv_engine';
@@ -22,9 +23,20 @@ export interface PlaybackSource {
 export class PlaybackSnapshot {
   state: string = 'idle';
   position: number = 0;
+  /** 与position同次采样的ACTIVE单调毫秒，供画面弹幕插值，不增加原生轮询。 */
+  sampledAt: number = 0;
+  timeRevision: number = 0;
+  seeking: boolean = false;
   duration: number = 0;
   speed: number = 1;
+  /** 内核增益恒1；界面音量为系统媒体级别，避免双重衰减。 */
   volume: number = 1;
+  systemVolumeReady: boolean = false;
+  systemVolumeLevel: number = 0;
+  systemVolumeMin: number = 0;
+  systemVolumeMax: number = 0;
+  systemVolumeRevision: number = 0;
+  systemVolumeShowUi: boolean = false;
   quality: number = 80;
   qualities: PlayQuality[] = [];
   bufferPercent: number = 0;
@@ -41,6 +53,9 @@ export class PlaybackSnapshot {
 export class PlayController {
   // 路由切换时不同视图也共享释放顺序，避免旧音频尚在退出就创建新输出。
   private static kernelQueue: Promise<void> = Promise.resolve();
+  // AudioSession是应用级单例；旧页的迟到停用不能抢走新页已取得的焦点。
+  private static focusQueue: Promise<void> = Promise.resolve();
+  private static focusOwner: string = '';
   readonly state: PlaybackSnapshot = new PlaybackSnapshot();
   private readonly owner: string = 'mpv_' + Date.now().toString() + '_' + Math.random().toString(36).slice(2);
   private engine: MpvEngine | undefined = undefined;
@@ -59,6 +74,7 @@ export class PlayController {
   private initialization: Promise<void> | undefined = undefined;
   private focusSubscribed: boolean = false;
   private deviceSubscribed: boolean = false;
+  private volumeSubscribed: boolean = false;
   private hardware: boolean = true;
   private p1080: boolean = true;
   private timer: number = -1;
@@ -75,29 +91,48 @@ export class PlayController {
   private videoBackup: number = 0;
   private audioBackup: number = 0;
   private refreshed: boolean = false;
-  private focusPaused: boolean = false;
+  private focusPausedGeneration: number = -1;
+  private focusRevision: number = 0;
+  private focusActivatedRevision: number = -1;
   private pendingSeek: number = -1;
   private seekStarted: boolean = false;
   private seekAt: number = 0;
   private focusManager: audio.AudioSessionManager = audio.getAudioManager().getSessionManager();
   private routing: audio.AudioRoutingManager = audio.getAudioManager().getRoutingManager();
+  private volumeManager: audio.AudioVolumeManager = audio.getAudioManager().getVolumeManager();
   private offBg: (() => void) | undefined = undefined;
   private offFg: (() => void) | undefined = undefined;
   private readonly focusListener = (event: audio.AudioSessionStateChangedEvent): void => {
+    if (this.disposed || !this.visible || this.source === undefined || PlayController.focusOwner !== this.owner) { return; }
     const hint: audio.AudioSessionStateChangeHint = event.stateChangeHint;
+    console.info('[PiliMini-focus] hint=' + hint.toString() + ' wanted=' + this.state.wanted.toString());
     if (hint === audio.AudioSessionStateChangeHint.AUDIO_SESSION_STATE_CHANGE_HINT_PAUSE) {
-      this.focusPaused = this.state.wanted;
+      // 重复PAUSE不能用已经暂停的wanted覆盖第一次保存的恢复资格。
+      if (this.state.wanted && this.state.state !== 'completed' && this.state.state !== 'error') {
+        this.focusPausedGeneration = this.generation;
+      }
       this.setWanted(false, false);
     } else if (hint === audio.AudioSessionStateChangeHint.AUDIO_SESSION_STATE_CHANGE_HINT_RESUME) {
-      if (this.focusPaused) { this.focusPaused = false; this.setWanted(true, false); }
+      const resume: boolean = this.focusPausedGeneration === this.generation && !this.state.wanted &&
+        this.state.state !== 'completed' && this.state.state !== 'error';
+      this.focusPausedGeneration = -1;
+      if (resume) { this.setWanted(true, false); }
     } else if (hint === audio.AudioSessionStateChangeHint.AUDIO_SESSION_STATE_CHANGE_HINT_STOP ||
       hint === audio.AudioSessionStateChangeHint.AUDIO_SESSION_STATE_CHANGE_HINT_TIME_OUT_STOP) {
-      this.focusPaused = false;
+      this.clearFocusResume();
       this.setWanted(false, false);
     }
   };
   private readonly deviceListener = (event: audio.DeviceChangeAction): void => {
-    if (event.type === audio.DeviceChangeType.DISCONNECT && this.state.wanted) { this.setWanted(false); }
+    if (event.type === audio.DeviceChangeType.DISCONNECT && (this.state.wanted || this.focusPausedGeneration >= 0)) {
+      this.setWanted(false);
+    }
+    this.syncSystemVolume();
+  };
+  private readonly volumeListener = (event: audio.StreamVolumeEvent): void => {
+    if (this.disposed || event.streamUsage !== audio.StreamUsage.STREAM_USAGE_MUSIC) { return; }
+    this.readSystemVolume(event.volume, event.updateUi);
+    this.emit();
   };
 
   private ctx: common.UIAbilityContext;
@@ -117,18 +152,21 @@ export class PlayController {
     this.hardware = (await prefsGet('setting_enable_ha', '1')) !== '0';
     this.p1080 = (await prefsGet('setting_p1080', '1')) !== '0';
     const qn: number = parseInt(await prefsGet('setting_default_qn', '80'), 10);
-    const volume: number = parseFloat(await prefsGet('setting_player_volume', '1'));
     if (this.disposed) { return; }
     this.state.quality = Number.isFinite(qn) && qn > 0 ? qn : 80;
-    this.state.volume = Number.isFinite(volume) ? Math.max(0, Math.min(1, volume)) : 1;
+    this.state.volume = 1;
     this.initialized = true;
     this.offBg = onAppBackground((): void => { this.onBackground(); });
     this.offFg = onAppForeground((): void => { this.onForeground(); });
-    this.focusManager.setAudioSessionScene(audio.AudioSessionScene.AUDIO_SESSION_SCENE_MEDIA);
     this.focusManager.on('audioSessionStateChanged', this.focusListener);
     this.focusSubscribed = true;
     this.routing.on('deviceChange', audio.DeviceFlag.OUTPUT_DEVICES_FLAG, this.deviceListener);
     this.deviceSubscribed = true;
+    try {
+      this.volumeManager.on('streamVolumeChange', audio.StreamUsage.STREAM_USAGE_MUSIC, this.volumeListener);
+      this.volumeSubscribed = true;
+    } catch (_) { console.warn('[PiliMini-volume] subscription unavailable'); }
+    this.readSystemVolume();
     this.emit();
   }
 
@@ -209,6 +247,7 @@ export class PlayController {
 
   async start(source: PlaybackSource, quality: number, preserve: boolean = true): Promise<void> {
     if (!this.ready()) { return; }
+    this.clearFocusResume();
     const previous: PlaybackSource | undefined = this.source;
     const same: boolean = preserve && previous !== undefined && previous.bvid === source.bvid &&
       previous.cid === source.cid && previous.localPath === source.localPath;
@@ -229,6 +268,9 @@ export class PlayController {
     this.videoBackup = 0; this.audioBackup = 0; this.refreshed = false;
     this.state.wanted = wanted;
     this.state.position = position;
+    this.state.sampledAt = systemDateTime.getUptime(systemDateTime.TimeType.ACTIVE);
+    this.state.timeRevision++;
+    this.state.seeking = false;
     this.state.loaded = false;
     this.state.audioOnly = false;
     this.state.error = '';
@@ -292,10 +334,16 @@ export class PlayController {
       this.audioMissingAt = 0;
       this.state.loaded = false;
       this.state.position = position;
+      this.state.sampledAt = systemDateTime.getUptime(systemDateTime.TimeType.ACTIVE);
+      this.state.seeking = false;
       this.prepareAt = Date.now();
       if (this.surfaceW > 0 && this.surfaceH > 0) { engine.resize(this.surfaceW, this.surfaceH); }
       engine.speed(this.state.speed); engine.volume(this.state.volume);
-      engine.load(info.videoUrl, info.isDash ? info.audioUrl : '', position, !this.state.wanted);
+      // 官方要求先激活会话再起流；mpv准备阶段也不能先播放再补申请焦点。
+      if (this.state.wanted) { await this.activateFocus(generation, this.focusRevision); }
+      if (!this.current(generation) || this.engine !== engine) { return; }
+      // 激活期间用户可暂停/续播；先以暂停载入，FILE_LOADED再按最新意图和焦点起播。
+      engine.load(info.videoUrl, info.isDash ? info.audioUrl : '', position, true);
       if (this.background && this.state.wanted) { this.startBackground(); }
       this.scheduleRefresh();
       this.emit();
@@ -312,7 +360,7 @@ export class PlayController {
     if (event.type === 'loaded') {
       this.state.loaded = true;
       if (this.engine !== undefined) {
-        if (this.state.wanted) { this.engine.play(); this.activateFocus(); }
+        if (this.state.wanted) { this.playAfterFocus(this.engine); }
         else { this.engine.pause(); if (this.background) { this.stopBackgroundVideo(); } }
       }
     }
@@ -340,6 +388,7 @@ export class PlayController {
       }
       const diagnostic: boolean = Date.now() - this.lastDiagnosticAt >= (this.background ? 60000 : 30000);
       const native: NativePlayerSnapshot = this.engine.snapshot(diagnostic);
+      const sampledAt: number = systemDateTime.getUptime(systemDateTime.TimeType.ACTIVE);
       // 外置音轨打开失败时mpv仍可能正常播放视频，不能仅凭FILE_LOADED判定音画齐全。
       if (this.info !== undefined && this.info.isDash && this.info.audioUrl.length > 0 && !native.audioReady && !native.ended) {
         if (this.audioMissingAt === 0) { this.audioMissingAt = Date.now(); }
@@ -363,14 +412,15 @@ export class PlayController {
           ' instances=' + stats.instances.toString() + ' threads=' + stats.eventThreads.toString());
       }
       if (this.pendingSeek >= 0 && Date.now() - this.seekAt > 8000) { this.pendingSeek = -1; this.retry('定位播放进度超时'); return; }
-      if (!native.seeking && this.pendingSeek < 0) { this.state.position = Math.max(0, native.position); }
+      this.state.seeking = native.seeking || this.pendingSeek >= 0;
+      if (!this.state.seeking) { this.state.position = Math.max(0, native.position); this.state.sampledAt = sampledAt; }
       if (native.duration > 0) { this.state.duration = native.duration; }
       if (native.width > 0 && native.height > 0) { this.state.width = native.width; this.state.height = native.height; }
       this.state.bufferPercent = this.state.duration > 0 ? Math.min(100,
         Math.max(this.state.position, native.buffered) / this.state.duration * 100) : 0;
       if (native.ended && !native.seeking && this.pendingSeek < 0) { this.finishPlayback(!native.audioReady); return; }
       this.setState(!this.state.wanted ? 'paused' :
-        (native.buffering || native.seeking || this.pendingSeek >= 0 || this.restoring ? 'loading' : 'playing'));
+        (native.paused || native.buffering || native.seeking || this.pendingSeek >= 0 || this.restoring ? 'loading' : 'playing'));
       if (this.history !== undefined) {
         this.history.observe(native.position, this.state.state === 'playing', native.seeking || this.pendingSeek >= 0,
           this.state.state === 'paused', this.background);
@@ -385,7 +435,11 @@ export class PlayController {
     if (this.pendingSeek >= 0) { return this.pendingSeek; }
     if (this.engine !== undefined && this.state.loaded) {
       try { const native: NativePlayerSnapshot = this.engine.snapshot();
-        if (!native.seeking && native.position >= 0) { return native.position; }
+        if (!native.seeking && native.position >= 0) {
+          this.state.position = native.position;
+          this.state.sampledAt = systemDateTime.getUptime(systemDateTime.TimeType.ACTIVE);
+          return native.position;
+        }
       } catch (error) {}
     }
     return this.state.position;
@@ -398,21 +452,22 @@ export class PlayController {
 
   setWanted(wanted: boolean, user: boolean = true): void {
     if (this.disposed || !this.visible) { return; }
-    if (user) { this.focusPaused = false; }
+    if (user) { this.clearFocusResume(); }
+    else { this.focusRevision++; }
     this.state.wanted = wanted;
     this.state.position = this.position();
     if (this.engine !== undefined) {
       try {
         if (wanted) {
           if (this.state.state === 'completed') { this.seek(0); }
-          this.engine.play(); this.activateFocus();
-          if (this.background) { this.startBackground(); }
+          if (this.state.loaded) { this.playAfterFocus(this.engine); }
         } else {
           this.engine.pause(); this.clearBackgroundTimer(); BgAudio.stop(this.owner);
           if (this.background) { this.stopBackgroundVideo(); }
         }
       } catch (error) { this.fail('播放控制失败'); return; }
     }
+    if (!wanted && user) { this.releaseFocus(); }
     this.savePosition(true);
     this.setState(wanted ? 'loading' : 'paused');
     this.refresh();
@@ -426,6 +481,8 @@ export class PlayController {
       this.pendingSeek = target; this.seekStarted = false; this.seekAt = Date.now();
       this.engine.seek(target);
       this.state.position = target;
+      this.state.sampledAt = systemDateTime.getUptime(systemDateTime.TimeType.ACTIVE);
+      this.state.timeRevision++; this.state.seeking = true;
       if (this.state.state === 'completed') { this.state.wanted = false; }
       this.setState(this.state.wanted ? 'loading' : 'paused');
       this.syncSession();
@@ -435,15 +492,30 @@ export class PlayController {
 
   speed(value: number): void {
     if (!Number.isFinite(value) || value < 0.25 || value > 5 || this.disposed) { return; }
+    this.state.position = this.position();
     this.state.speed = value;
     if (this.engine !== undefined) { this.engine.speed(value); }
     this.syncSession(); this.emit();
   }
-  volume(value: number): void {
-    if (!Number.isFinite(value) || this.disposed) { return; }
-    this.state.volume = Math.max(0, Math.min(1, value));
-    if (this.engine !== undefined) { this.engine.volume(this.state.volume); }
-    this.emit();
+  /** 真实系统音量只读入口；用户调节由前台AVVolumePanel显式完成。 */
+  syncSystemVolume(): void {
+    if (this.disposed) { return; }
+    this.readSystemVolume(); this.emit();
+  }
+  private readSystemVolume(level: number = -1, showUi: boolean = false): void {
+    this.state.systemVolumeRevision++;
+    this.state.systemVolumeShowUi = false;
+    try {
+      const usage: audio.StreamUsage = audio.StreamUsage.STREAM_USAGE_MUSIC;
+      const min: number = this.volumeManager.getMinVolumeByStream(usage);
+      const max: number = this.volumeManager.getMaxVolumeByStream(usage);
+      const current: number = level >= 0 ? level : this.volumeManager.getVolumeByStream(usage);
+      if (!Number.isFinite(min) || !Number.isFinite(max) || !Number.isFinite(current) || max <= min ||
+        current < min || current > max) { this.state.systemVolumeReady = false; return; }
+      this.state.systemVolumeMin = min; this.state.systemVolumeMax = max;
+      this.state.systemVolumeLevel = current; this.state.systemVolumeReady = true;
+      this.state.systemVolumeShowUi = showUi && this.visible && !this.background;
+    } catch (_) { this.state.systemVolumeReady = false; }
   }
 
   private retry(message: string, audioFailure: boolean = false): void {
@@ -487,6 +559,7 @@ export class PlayController {
   }
   private complete(): void {
     if (this.state.state === 'completed') { return; }
+    this.clearFocusResume(); this.releaseFocus();
     this.state.wanted = false;
     this.state.position = this.state.duration;
     if (this.history !== undefined) { this.history.complete(); }
@@ -494,6 +567,7 @@ export class PlayController {
     BgAudio.stop(this.owner); this.savePosition(true); this.setState('completed'); this.scheduleRefresh();
   }
   private fail(message: string): void {
+    this.clearFocusResume(); this.releaseFocus();
     this.state.wanted = false; this.state.error = message;
     if (this.history !== undefined) { this.history.flush(); }
     this.clearBackgroundTimer(); this.clearRestore();
@@ -524,10 +598,61 @@ export class PlayController {
     }
   }
 
-  private activateFocus(): void {
-    const generation: number = this.generation;
-    this.focusManager.activateAudioSession({ concurrencyMode: audio.AudioConcurrencyMode.CONCURRENCY_DEFAULT })
-      .catch((): void => { if (this.current(generation)) { this.setWanted(false, false); } });
+  private clearFocusResume(): void {
+    this.focusPausedGeneration = -1;
+    this.focusRevision++;
+  }
+
+  private activateFocus(generation: number, revision: number): Promise<boolean> {
+    const valid = (): boolean => this.current(generation) && this.state.wanted && revision === this.focusRevision;
+    const work: Promise<boolean> = PlayController.focusQueue.then(async (): Promise<boolean> => {
+      if (!valid()) { return false; }
+      try {
+        if (PlayController.focusOwner === this.owner && this.focusActivatedRevision === revision &&
+          this.focusManager.isAudioSessionActivated()) { return true; }
+        // PAUSE后系统停用会话；每次恢复都需重设scene/behavior，再激活。
+        this.focusManager.setAudioSessionScene(audio.AudioSessionScene.AUDIO_SESSION_SCENE_MEDIA);
+        this.focusManager.setAudioSessionBehavior(audio.AudioSessionBehaviorFlags.PAUSE_WHEN_INTERRUPTED);
+        PlayController.focusOwner = this.owner;
+        await this.focusManager.activateAudioSession({ concurrencyMode: audio.AudioConcurrencyMode.CONCURRENCY_DEFAULT });
+        if (!valid()) { return false; }
+        this.focusActivatedRevision = revision;
+        console.info('[PiliMini-focus] activated pause-when-interrupted');
+        return true;
+      } catch (_) {
+        if (valid()) {
+          console.warn('[PiliMini-focus] activation failed');
+          this.clearFocusResume();
+          this.setWanted(false, false);
+          this.releaseFocus();
+        }
+        return false;
+      }
+    });
+    PlayController.focusQueue = work.then((): void => {}, (): void => {});
+    return work;
+  }
+
+  private async playAfterFocus(engine: MpvEngine): Promise<void> {
+    const generation: number = this.generation, revision: number = this.focusRevision;
+    if (!await this.activateFocus(generation, revision) || !this.current(generation) ||
+      revision !== this.focusRevision || !this.state.wanted || this.engine !== engine) { return; }
+    try {
+      engine.play();
+      if (this.background) { this.startBackground(); }
+      this.refresh();
+    } catch (_) { this.fail('播放控制失败'); }
+  }
+
+  private releaseFocus(): void {
+    this.focusActivatedRevision = -1;
+    const work: Promise<void> = PlayController.focusQueue.then(async (): Promise<void> => {
+      if (PlayController.focusOwner !== this.owner) { return; }
+      PlayController.focusOwner = '';
+      try { await this.focusManager.deactivateAudioSession(); }
+      catch (_) { console.warn('[PiliMini-focus] deactivation failed'); }
+    });
+    PlayController.focusQueue = work.catch((): void => {});
   }
 
   private onBackground(): void {
@@ -560,6 +685,7 @@ export class PlayController {
   private onForeground(): void {
     this.background = false; this.state.background = false; this.clearBackgroundTimer(); BgAudio.stop(this.owner);
     if (this.disposed || !this.visible) { return; }
+    this.readSystemVolume();
     if (this.state.audioOnly && this.engine !== undefined) {
       this.state.audioOnly = false; this.restoring = true; this.restoreAttempt = 0;
       try { this.engine.video(true); this.waitRestore(); }
@@ -595,15 +721,16 @@ export class PlayController {
     if (this.disposed || !this.visible) { return this.nativeQueue; }
     this.state.position = this.position(); this.savePosition(true);
     if (this.history !== undefined) { this.history.flush(); }
+    this.clearFocusResume();
     this.visible = false; this.generation++; this.surface = '';
     this.scheduleRefresh();
     this.clearBackgroundTimer(); this.clearRestore(); this.state.loaded = false;
     const released: Promise<void> = this.enqueue(async (): Promise<void> => { await this.closeEngine(); });
     BgAudio.release(this.owner);
-    this.focusManager.deactivateAudioSession().catch(() => {});
+    this.releaseFocus();
     return released;
   }
-  resume(): void { if (!this.disposed) { this.visible = true; } }
+  resume(): void { if (!this.disposed) { this.visible = true; this.syncSystemVolume(); } }
   resumeSource(): void {
     if (!this.ready() || this.source === undefined) { return; }
     this.start(this.source, this.state.quality);
@@ -613,6 +740,7 @@ export class PlayController {
     if (this.disposed) { return this.nativeQueue; }
     this.state.position = this.position(); this.savePosition(true);
     if (this.history !== undefined) { this.history.flush(); this.history = undefined; }
+    this.clearFocusResume();
     this.disposed = true; this.generation++;
     this.clearBackgroundTimer(); this.clearRestore();
     if (this.timer !== -1) { clearTimeout(this.timer); this.timer = -1; }
@@ -626,8 +754,12 @@ export class PlayController {
       this.routing.off('deviceChange', this.deviceListener);
       this.deviceSubscribed = false;
     }
+    if (this.volumeSubscribed) {
+      this.volumeManager.off('streamVolumeChange', this.volumeListener);
+      this.volumeSubscribed = false;
+    }
     BgAudio.release(this.owner);
-    this.focusManager.deactivateAudioSession().catch(() => {});
+    this.releaseFocus();
     return this.enqueue(async (): Promise<void> => {
       await this.closeEngine();
       const stats = MpvEngine.stats();

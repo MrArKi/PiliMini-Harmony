@@ -273,9 +273,11 @@ export struct SubReplyPanel {
                 .fontSize(13)
                 .fontColor($r('app.color.text_secondary'))
             }
+            .height(40)
           }
           .width('100%')
-          .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+          .height(45)
+          .padding({ left: 12, right: 6, top: 2.5, bottom: 2.5 })
         }
         .width('100%')
 
@@ -329,7 +331,7 @@ export struct SubReplyPanel {
             }
           }
           .width('100%')
-          .height(100 + this.navBarH)
+          .height(125 + this.navBarH)
           .justifyContent(FlexAlign.Center)
         }
         .width('100%')

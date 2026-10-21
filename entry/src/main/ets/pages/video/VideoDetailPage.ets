@@ -18,14 +18,16 @@ import { PlaybackSource } from '../../infra/player/play_controller';
 import { LoadingFooter } from '../../components/StateViews';
 import { formatPlayCount, formatDuration } from '../../components/VideoCard';
 import { VideoItem } from '../../model/video_item';
-import { VideoService, VideoDetail, VideoPageInfo, CommentItem, SubReplyPage } from '../../service/video_service';
+import { VideoService, VideoDetail, VideoPageInfo, VideoSeasonSection, VideoEpisode, CommentItem, SubReplyPage } from '../../service/video_service';
 import { SubReplyPanel } from '../../components/SubReplyPanel';
+import { VideoPartsStrip, VideoEpisodePanel, EpisodeSelection, makeVideoPartsSource } from '../../components/VideoEpisodePanel';
 import { AuthService } from '../../service/auth_service';
 import { FavService, FavFolder } from '../../service/fav_service';
 import { DownloadService, DownloadTask } from '../../service/download_service';
 import { DownloadLibraryService } from '../../service/download_library_service';
 import { OfflineContext } from '../../model/download';
 import { prefsGet } from '../../infra/storage/prefs';
+import { DanmakuPreferences, DanmakuSettings, copyDanmakuPreferences } from '../../infra/danmaku/settings';
 
 function two(n: number): string {
   const s: string = n.toString();
@@ -57,6 +59,14 @@ struct VideoDetailPage {
   @State descExpanded: boolean = false;
   @State @Watch('onPageIndexChange') currentPageIdx: number = 0;
   private initialCid: number = 0;
+  @State onlineSource: PlaybackSource | undefined = undefined;
+  @State partsSource: string = '';
+  @State partsCount: number = 0;
+  @State episodeShown: boolean = false;
+  @State episodeSeason: boolean = false;
+  @State episodeSwitching: boolean = false;
+  private detailGeneration: number = 0;
+  private detailContentGeneration: number = 0;
   @State loggedIn: boolean = false;
   /** spec-06a：内嵌播放器全屏态 */
   @State @Watch('syncFullscreenBars') isFullscreen: boolean = false;
@@ -146,6 +156,9 @@ struct VideoDetailPage {
   @State followBusy: boolean = false;
   /** 收窄交互：播放状态 / 累计滚动 / 收窄比例(0~1) / 继续播放命令计数 */
   @State playerState: string = 'idle';
+  @State danmakuPreferences: DanmakuPreferences = new DanmakuPreferences();
+  @State danmakuReady: boolean = false;
+  private danmakuRevision: number = 0;
   @State collapseRatio: number = 0;
   @State resumeTick: number = 0;
   @State subShown: boolean = false;
@@ -168,6 +181,11 @@ struct VideoDetailPage {
   @StorageProp('navBarHeight') navBarH: number = 0;
 
   aboutToAppear(): void {
+    DanmakuSettings.load().then((value: DanmakuPreferences): void => {
+      if (!this.destroyed && this.danmakuRevision === 0) { this.danmakuPreferences = value; this.danmakuReady = true; }
+    }).catch((): void => {
+      if (!this.destroyed) { this.danmakuReady = true; promptAction.showToast({ message: '弹幕偏好读取失败，使用默认设置' }); }
+    });
     this.settleTimer = setTimeout((): void => {
       this.settleTimer = -1;
       this.routeSettled = true;
@@ -232,6 +250,7 @@ struct VideoDetailPage {
     this.flushContentWaiters();
     refreshSystemBars(getContext(this) as common.UIAbilityContext);
     this.commentGeneration++;
+    this.detailGeneration++;
     this.orientationGeneration++;
     if (this.fsFallbackTimer !== -1) {
       clearTimeout(this.fsFallbackTimer);
@@ -271,8 +290,9 @@ struct VideoDetailPage {
     this.routeIndex = router.getState().index;
     this.routeVisible = true;
     if (this.upMid > 0) {
-      VideoService.relationState(this.upMid).then((followed: boolean) => {
-        if (!this.destroyed) { this.followed = followed; }
+      const ownerMid: number = this.upMid;
+      VideoService.relationState(ownerMid).then((followed: boolean) => {
+        if (!this.destroyed && this.upMid === ownerMid) { this.followed = followed; }
       });
     }
     this.syncFullscreenBars();
@@ -296,6 +316,101 @@ struct VideoDetailPage {
   }
 
   private onPageIndexChange(): void { this.nativeWidth = 0; this.nativeHeight = 0; }
+
+  /** BV/cid/元数据为单次播放器输入，避免跨合集切换字段Watch交叉。 */
+  private syncOnlineSource(): void {
+    const d: VideoDetail | undefined = this.detail;
+    if (!d || this.localPath.length > 0 || d.pages.length === 0) { return; }
+    const p: VideoPageInfo = d.pages[Math.min(this.currentPageIdx, d.pages.length - 1)];
+    this.onlineSource = { bvid: d.bvid, cid: p.cid, localPath: '', title: this.partLabel() || d.title,
+      artist: d.ownerName, cover: d.cover, localDuration: 0, offlineScope: '', offlineKey: '' };
+  }
+
+  private currentSeasonSection(): number {
+    return Math.max(0, this.detail?.season?.sections.findIndex((section: VideoSeasonSection): boolean =>
+      section.episodes.some((episode: VideoEpisode): boolean => episode.bvid === this.bvid)) ?? 0);
+  }
+
+  private seasonProgress(): string {
+    const section = this.detail?.season?.sections[this.currentSeasonSection()];
+    if (!section) { return ''; }
+    const index: number = section.episodes.findIndex((episode: VideoEpisode): boolean => episode.bvid === this.bvid);
+    return (index >= 0 ? index + 1 : 1).toString() + '/' + section.episodes.length.toString();
+  }
+
+  private openEpisodes(season: boolean): void {
+    if (this.episodeSwitching) { return; }
+    this.episodeSeason = season; this.episodeShown = true;
+  }
+
+  private async selectEpisode(selection: EpisodeSelection): Promise<void> {
+    if (this.destroyed || this.exitPending || this.localPath.length > 0) { return; }
+    if (this.cacheSubmitting || this.favSubmitting || this.laterSubmitting || this.followBusy) {
+      promptAction.showToast({ message: '请等待当前操作完成' }); return;
+    }
+    if (selection.bvid === this.bvid) {
+      const index: number = this.detail?.pages.findIndex((p: VideoPageInfo): boolean => p.cid === selection.cid) ?? -1;
+      if (index < 0) { promptAction.showToast({ message: '该分集暂不可用' }); return; }
+      this.detailGeneration++; this.episodeSwitching = false; this.episodeShown = false;
+      if (index !== this.currentPageIdx) { this.currentPageIdx = index; this.syncOnlineSource(); }
+      return;
+    }
+    const generation: number = ++this.detailGeneration;
+    this.episodeSwitching = true;
+    try {
+      const detail: VideoDetail = await VideoService.viewDetail(selection.bvid);
+      if (this.destroyed || this.exitPending || generation !== this.detailGeneration) { return; }
+      if (this.cacheSubmitting || this.favSubmitting || this.laterSubmitting || this.followBusy) {
+        promptAction.showToast({ message: '请等待当前操作完成后重新选集' }); return;
+      }
+      const index: number = detail.pages.findIndex((p: VideoPageInfo): boolean => p.cid === selection.cid);
+      if (index < 0) { throw new Error('该分集暂不可用'); }
+      this.episodeShown = false;
+      this.applyOnlineDetail(detail, index);
+      this.loadOnlineExtras(detail);
+    } catch (_) {
+      if (!this.destroyed && generation === this.detailGeneration) {
+        promptAction.showToast({ message: '切换失败，请重试' });
+      }
+    } finally { if (!this.destroyed && generation === this.detailGeneration) { this.episodeSwitching = false; } }
+  }
+
+  private applyOnlineDetail(detail: VideoDetail, index: number): void {
+    const changed: boolean = this.bvid !== detail.bvid || this.aid !== detail.aid;
+    this.detailContentGeneration++;
+    this.bvid = detail.bvid; this.currentPageIdx = index; this.detail = detail;
+    this.partsSource = makeVideoPartsSource(detail.bvid, detail.pages); this.partsCount = detail.pages.length;
+    this.aid = detail.aid; this.upMid = detail.ownerMid; this.replyTotal = detail.replyCount;
+    this.nativeWidth = 0; this.nativeHeight = 0; this.syncOnlineSource(); this.refreshCacheState();
+    if (changed) {
+      this.commentGeneration++; this.loadingMoreReply = false; this.ds.reload([]); this.topItems = [];
+      this.nextOffset = ''; this.replyEnd = false; this.replyErr = ''; this.replyHeaderOffset = 0;
+      this.lastReplyOffset = 0; this.effectiveReplyOffset = 0;
+      this.relatedDs.reload([]); this.relatedCount = 0; this.upFans = 0; this.followed = false;
+      this.favoured = false; this.laterAdded = false; this.favFoldersReady = false;
+      this.folders = []; this.folderOriginal = []; this.folderChecked = [];
+      this.descExpanded = false; this.subShown = false; this.subRoot = undefined;
+      try { this.replyScroller.scrollEdge(Edge.Top); this.introScroller.scrollEdge(Edge.Top); } catch (_) {}
+    }
+    this.loadComments(true);
+  }
+
+  private loadOnlineExtras(detail: VideoDetail): void {
+    const generation: number = this.detailContentGeneration;
+    VideoService.fans(detail.ownerMid).then((n: number): void => {
+      if (!this.destroyed && generation === this.detailContentGeneration) { this.upFans = n; }
+    }).catch(() => {});
+    this.loadFavState();
+    VideoService.related(detail.bvid).then(async (list: VideoItem[]): Promise<void> => {
+      await this.waitForContentIdle();
+      if (!this.destroyed && generation === this.detailContentGeneration) {
+        this.relatedDs.reload(list); this.relatedCount = list.length;
+      }
+    }).catch(() => {});
+    VideoService.relationState(detail.ownerMid).then((value: boolean): void => {
+      if (!this.destroyed && generation === this.detailContentGeneration) { this.followed = value; }
+    }).catch(() => {});
+  }
 
   private sourceDimension(width: boolean): number {
     const d: VideoDetail | undefined = this.detail;
@@ -422,41 +537,12 @@ struct VideoDetailPage {
         return;
       }
       const initialPage: number = d.pages.findIndex((p: VideoPageInfo): boolean => p.cid === this.initialCid);
-      if (initialPage >= 0) { this.currentPageIdx = initialPage; }
       this.initialCid = 0;
-      this.detail = d;
-      this.aid = d.aid;
-      this.upMid = d.ownerMid;
-      this.replyTotal = d.replyCount;
+      this.applyOnlineDetail(d, Math.max(0, initialPage));
       this.loggedIn = await AuthService.isLogin();
-      if (this.destroyed) {
-        return;
-      }
+      if (this.destroyed) { return; }
       this.loading = false;
-      this.loadComments(true);
-      // UP 主粉丝数（R8，非阻塞）
-      VideoService.fans(d.ownerMid).then((n: number) => {
-        if (!this.destroyed) {
-          this.upFans = n;
-        }
-      });
-      // 收藏状态 + 收藏夹列表（spec-07，非阻塞）
-      this.loadFavState();
-      // 相关推荐（spec-05 V2「简介」面板底部，非阻塞）
-      VideoService.related(this.bvid).then(async (list: VideoItem[]): Promise<void> => {
-        await this.waitForContentIdle();
-        if (!this.destroyed) {
-          this.relatedDs.reload(list);
-          this.relatedCount = list.length;
-        }
-      }).catch(() => {
-      });
-      // UP 关注状态（非阻塞）
-      VideoService.relationState(d.ownerMid).then((f: boolean) => {
-        if (!this.destroyed) {
-          this.followed = f;
-        }
-      });
+      this.loadOnlineExtras(d);
     } catch (e) {
       if (this.destroyed) {
         return;
@@ -596,14 +682,14 @@ struct VideoDetailPage {
     try {
       const win: window.Window = await this.getWin();
       if (this.destroyed || generation !== this.orientationGeneration) { return; }
-      await win.setPreferredOrientation(target ? window.Orientation.LANDSCAPE : window.Orientation.PORTRAIT);
+      await win.setPreferredOrientation(target ? window.Orientation.AUTO_ROTATION_LANDSCAPE : window.Orientation.PORTRAIT);
       if (this.destroyed) { await win.setPreferredOrientation(window.Orientation.PORTRAIT); return; }
       if (generation === this.orientationGeneration) {
         this.finishFullscreen(this.viewportWidth, this.viewportHeight);
       } else {
         // 超时后的迟到请求不能把新请求/已提交的页面留在旧方向。
         const landscape: boolean = this.fullscreenTarget ?? this.isFullscreen;
-        await win.setPreferredOrientation(landscape ? window.Orientation.LANDSCAPE : window.Orientation.PORTRAIT);
+        await win.setPreferredOrientation(landscape ? window.Orientation.AUTO_ROTATION_LANDSCAPE : window.Orientation.PORTRAIT);
       }
     } catch (e) {
       this.cancelFullscreen(generation);
@@ -625,7 +711,7 @@ struct VideoDetailPage {
     this.orientationGeneration++;
     this.syncFullscreenBars();
     if (this.mainWin !== undefined) {
-      this.mainWin.setPreferredOrientation(this.isFullscreen ? window.Orientation.LANDSCAPE : window.Orientation.PORTRAIT)
+      this.mainWin.setPreferredOrientation(this.isFullscreen ? window.Orientation.AUTO_ROTATION_LANDSCAPE : window.Orientation.PORTRAIT)
         .catch((): void => { console.warn('[VideoDetail] 恢复屏幕方向失败'); });
     }
     console.warn('[VideoDetail] 全屏方向切换未完成');
@@ -652,6 +738,7 @@ struct VideoDetailPage {
 
   /** 系统返回（侧滑/按键）：全屏时先退全屏，不退出页面 */
   onBackPress(): boolean {
+    if (this.episodeShown) { this.episodeShown = false; return true; }
     if (this.subShown || this.subClosing) { this.closeSub(); return true; }
     if (this.fullscreenTarget !== undefined) {
       return true;
@@ -779,23 +866,24 @@ struct VideoDetailPage {
     if (!this.loggedIn || this.aid === 0) {
       return;
     }
+    const generation: number = this.detailContentGeneration;
+    const aid: number = this.aid;
+    const bvid: string = this.bvid;
     try {
       const u = await AuthService.fetchNav();
-      if (u === null) {
-        return;
-      }
-      const folders: FavFolder[] = await FavService.folders(u.mid, this.aid);
-      if (this.destroyed) { return; }
+      if (u === null || this.destroyed || generation !== this.detailContentGeneration) { return; }
+      const folders: FavFolder[] = await FavService.folders(u.mid, aid);
+      if (this.destroyed || generation !== this.detailContentGeneration) { return; }
       this.folders = folders;
       this.favFoldersReady = folders.every((f: FavFolder): boolean => f.stateKnown === true);
       this.folderOriginal = folders.map((f: FavFolder): boolean => f.favState === true);
       this.favoured = this.folderOriginal.some((v: boolean): boolean => v);
       // 稍后再看状态（列表量小，直接查）
       const later = await FavService.laterList();
-      if (this.destroyed) { return; }
+      if (this.destroyed || generation !== this.detailContentGeneration) { return; }
       this.laterAdded = false;
       for (let i = 0; i < later.length; i++) {
-        if (later[i].bvid === this.bvid) {
+        if (later[i].bvid === bvid) {
           this.laterAdded = true;
           break;
         }
@@ -838,7 +926,7 @@ struct VideoDetailPage {
   // ===== 详情头（含 R8 UP 主区） =====
   @Builder
   Header(d: VideoDetail) {
-    Column({ space: 10 }) {
+    Column() {
       Row({ space: 6 }) {
         Text(this.bvid)
           .fontSize(11)
@@ -848,6 +936,7 @@ struct VideoDetailPage {
       .width('100%')
 
       Text(d.title)
+        .margin({ top: 10 })
         .fontSize(17)
         .fontWeight(FontWeight.Medium)
         .fontColor($r('app.color.text_primary'))
@@ -856,7 +945,7 @@ struct VideoDetailPage {
       Text(formatPlayCount(d.viewCount) + '播放 · ' + formatPlayCount(d.danmakuCount) + '弹幕 · ' + fmtDate(d.pubdate))
         .fontSize(12)
         .fontColor($r('app.color.text_secondary'))
-        .width('100%')
+        .width('100%').margin({ top: 10 })
 
       Column({ space: 2 }) {
         Text(d.desc.length > 0 ? d.desc : '（无简介）')
@@ -875,48 +964,35 @@ struct VideoDetailPage {
         }
       }
       .width('100%')
-      .alignItems(HorizontalAlign.Start)
-
-      if (d.pages.length > 1) {
-        Column({ space: 6 }) {
-          Text('选集（' + d.pages.length.toString() + ' P）')
-            .fontSize(13)
-            .fontWeight(FontWeight.Medium)
-            .fontColor($r('app.color.text_primary'))
-            .width('100%')
-          Scroll() {
-            Row({ space: 8 }) {
-              ForEach(d.pages, (p: VideoPageInfo, i: number) => {
-                Text('P' + p.page.toString() + ' ' + p.part)
-                  .fontSize(12)
-                  .fontColor(i === this.currentPageIdx ? Color.White : $r('app.color.text_primary'))
-                  .backgroundColor(i === this.currentPageIdx ? $r('app.color.brand_pink') : $r('app.color.bg_page'))
-                  .padding({ left: 10, right: 10, top: 6, bottom: 6 })
-                  .borderRadius(14)
-                  .maxLines(1)
-                  .onClick(() => {
-                    this.currentPageIdx = i;
-                  })
-              }, (p: VideoPageInfo, i: number) => 'pg_' + i.toString() + '_' + p.cid.toString())
-            }
-          }
-          .scrollable(ScrollDirection.Horizontal)
-          .scrollBar(BarState.Off)
-          .width('100%')
-        }
-        .width('100%')
-      }
+      .alignItems(HorizontalAlign.Start).margin({ top: 10 })
 
       Row({ space: 10 }) {
         this.DetailAction(0)
         this.DetailAction(1)
         this.DetailAction(2)
       }
-      .width('100%')
+      .width('100%').margin({ top: 10 })
+      if (d.season !== undefined) {
+        Row({ space: 10 }) {
+          Text('合集：' + d.season.title).fontSize(12).fontColor($r('app.color.text_primary'))
+            .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).layoutWeight(1)
+          Image($r('app.media.icon_living_static')).width(12).height(12).fillColor($r('app.color.brand_pink')).margin({ left: 5 })
+          Text(this.seasonProgress()).fontSize(12).fontColor($r('app.color.text_primary'))
+          Image($r('app.media.icon_arrow_right')).width(13).height(13).fillColor($r('app.color.text_primary')).margin({ left: -4 })
+        }.width('calc(100% - 4vp)').padding({ left: 8, right: 8, top: 12, bottom: 12 })
+          .backgroundColor($r('app.color.btn_soft_bg')).borderRadius(6).margin({ left: 2, right: 2, top: 8 })
+          .id('video_season_entry').accessibilityText('合集：' + d.season.title + ' ' + this.seasonProgress())
+          .onClick(() => { this.openEpisodes(true); })
+      }
+      if (this.partsCount > 1) {
+        // 不捕获Builder参数d；BV和pages由页面一次提交的primitive快照统一传递。
+        VideoPartsStrip({ source: this.partsSource, currentCid: this.currentCid(),
+          onOpen: () => { this.openEpisodes(false); }, onSelect: (selection: EpisodeSelection): void => { this.selectEpisode(selection); } })
+      }
     }
     .width('100%')
     .padding({ left: 12, right: 12, top: 12, bottom: 10 })
-    .alignItems(HorizontalAlign.Start)
+    .alignItems(HorizontalAlign.Start).backgroundColor($r('app.color.card_bg'))
   }
 
   /** 分段 tab：简介 / 评论(N)（Nara 详情页顶部 tab；弹幕功能未实现故不设「发弹幕」） */
@@ -944,8 +1020,28 @@ struct VideoDetailPage {
     return this.introLabelWidth * (1 - this.tabProgress) + this.replyLabelWidth * this.tabProgress;
   }
 
+  private async changeDanmaku(value: DanmakuPreferences): Promise<void> {
+    if (!this.danmakuReady) { return; }
+    const previous: DanmakuPreferences = this.danmakuPreferences;
+    const revision: number = ++this.danmakuRevision;
+    this.danmakuPreferences = copyDanmakuPreferences(value);
+    try { await DanmakuSettings.save(this.danmakuPreferences); }
+    catch (_) {
+      if (!this.destroyed && revision === this.danmakuRevision) {
+        this.danmakuPreferences = previous;
+        promptAction.showToast({ message: '弹幕设置保存失败，请重试' });
+      }
+    }
+  }
+
+  private toggleDanmaku(): void {
+    const value: DanmakuPreferences = copyDanmakuPreferences(this.danmakuPreferences);
+    value.enabled = !value.enabled; this.changeDanmaku(value);
+  }
+
   @Builder
   TabBar() {
+    Row() {
     Stack({ alignContent: Alignment.BottomStart }) {
       Row() {
         this.TabLabel('简介', 0)
@@ -957,38 +1053,44 @@ struct VideoDetailPage {
         .position({ x: this.tabBarWidth * (0.25 + this.tabProgress * 0.5) - this.indicatorWidth() / 2, y: 45 })
         .hitTestBehavior(HitTestMode.None)
     }
-    .width('100%')
+    .layoutWeight(1)
     .height(48)
     .onAreaChange((_old: Area, area: Area): void => { this.tabBarWidth = Number(area.width); })
+    Button({ type: ButtonType.Normal }) {
+      Image(this.danmakuPreferences.enabled ? $r('app.media.icon_dm_on') : $r('app.media.icon_dm_off'))
+        .width(22).height(22)
+        .fillColor(this.danmakuPreferences.enabled ? $r('app.color.nara_secondary') : $r('app.color.nara_outline'))
+    }.width(38).height(38).padding(0).margin({ right: 14 }).backgroundColor(Color.Transparent)
+      .enabled(this.danmakuReady)
+      .id('danmaku_inline_toggle')
+      .accessibilityText(this.danmakuPreferences.enabled ? '关闭弹幕' : '开启弹幕')
+      .onClick((): void => { this.toggleDanmaku(); })
+    }.width('100%').height(48)
     .backgroundColor($r('app.color.card_bg'))
   }
 
   private async toggleFollow(): Promise<void> {
-    if (this.followBusy || this.upMid <= 0) {
+    if (this.followBusy || this.upMid <= 0 || this.exitPending) {
       return;
     }
-    const logged: boolean = await AuthService.isLogin();
-    if (this.destroyed) {
-      return;
-    }
-    if (!logged) {
-      promptAction.showToast({ message: '请先登录' });
-      return;
-    }
+    const ownerMid: number = this.upMid;
+    const generation: number = this.detailContentGeneration;
     this.followBusy = true;
     try {
+      const logged: boolean = await AuthService.isLogin();
+      if (this.destroyed || this.exitPending || generation !== this.detailContentGeneration) { return; }
+      if (!logged) { promptAction.showToast({ message: '请先登录' }); return; }
       const next: boolean = !this.followed;
-      await VideoService.relationModify(this.upMid, next);
-      if (!this.destroyed) {
+      await VideoService.relationModify(ownerMid, next);
+      if (!this.destroyed && !this.exitPending && generation === this.detailContentGeneration) {
         this.followed = next;
         promptAction.showToast({ message: next ? '已关注' : '已取消关注' });
       }
     } catch (e) {
-      if (!this.destroyed) {
+      if (!this.destroyed && !this.exitPending && generation === this.detailContentGeneration) {
         promptAction.showToast({ message: '操作失败，请重试' });
       }
-    }
-    this.followBusy = false;
+    } finally { this.followBusy = false; }
   }
 
   /** 相关推荐行（Nara：横图 + 标题 2 行 + UP 名 + 播放/弹幕） */
@@ -1462,7 +1564,7 @@ struct VideoDetailPage {
                 }
                 .width('100%')
               }
-              .cachedCount(3)
+              .cachedCount(1)
               .width('100%')
               .height('100%')
               .divider({ strokeWidth: 0.3, color: '#14000000', startMargin: 55, endMargin: 15 })
@@ -1514,6 +1616,20 @@ struct VideoDetailPage {
         })
         }
         .width('100%').height(this.visibleBodyHeight())
+        if (this.episodeShown && this.detail !== undefined) {
+          VideoEpisodePanel({ detail: this.detail, currentCid: this.currentCid(), seasonMode: this.episodeSeason,
+            initialSection: this.currentSeasonSection(), onClose: () => { this.episodeShown = false; },
+            onSelect: (selection: EpisodeSelection): void => { this.selectEpisode(selection); } })
+            .width('100%').height(this.visibleBodyHeight())
+            .transition(TransitionEffect.move(TransitionEdge.BOTTOM))
+        }
+        if (this.episodeSwitching) {
+          Row({ space: 6 }) {
+            LoadingProgress().width(16).height(16).color($r('app.color.brand_pink'))
+            Text('正在切换…').fontSize(12).fontColor($r('app.color.text_secondary'))
+          }.padding(8).borderRadius(8).backgroundColor($r('app.color.card_bg')).position({ x: 12, y: 50 })
+            .hitTestBehavior(HitTestMode.None)
+        }
         if (this.subShown && this.subRoot !== undefined) {
           SubReplyPanel({ embedded: true, root: this.subRoot, upMid: this.upMid, aid: this.aid,
             targetRpid: this.subTargetRpid,
@@ -1559,10 +1675,14 @@ struct VideoDetailPage {
               artist: this.detail !== undefined ? this.detail.ownerName : this.localArtist,
               partText: this.partLabel(),
               danmakuCount: this.detail !== undefined ? this.detail.danmakuCount : 0,
+              danmakuPreferences: this.danmakuPreferences,
+              danmakuReady: this.danmakuReady,
+              onDanmakuChange: (value: DanmakuPreferences): void => { this.changeDanmaku(value); },
               isFullscreen: this.isFullscreen,
               autoPlay: true,
               localPath: this.localPath,
               localSource: this.localSource,
+              playbackSource: this.onlineSource,
               localDuration: this.localDuration,
               offlineScope: this.offlineContext.scope,
               offlineKey: this.offlineContext.key,

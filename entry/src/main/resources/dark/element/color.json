@@ -1,7 +1,10 @@
 {
   "color": [
+    { "name": "nara_secondary", "value": "#E4BDC4" },
+    { "name": "nara_outline", "value": "#9E8C8F" },
     { "name": "comment_focus_bg", "value": "#262626" },
     { "name": "member_secondary_container", "value": "#5B3F45" },
+    { "name": "video_part_badge_bg", "value": "#B35B3F45" },
     { "name": "member_on_secondary_container", "value": "#FFD9E0" },
     {
       "name": "start_window_background",

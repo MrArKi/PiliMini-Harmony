@@ -1,7 +1,8 @@
 /**
  * 评论条目组件（spec-05 返工 R1~R9，1:1 对齐 PiliNara reply_item_grpc.dart）
  *  卡片 padding LTRB(12,14,8,5)｜头像 34（间距 12）｜名字 13sp + UP/TOP 徽章
- *  正文 14sp 行高 25｜评论图片网格（R9）｜子回复浅灰容器 radius6（R1/R2）
+ *  名字13/时间11头部后10｜正文14sp行高24.5｜操作前4（带图额外4）
+ *  评论图片网格（R9）｜子回复浅灰容器radius6，外top5/bottom12（R1/R2）
  *  「共N条回复」→ 楼中楼面板（R3）｜操作行高 32，右侧点赞 icon16+数字（R4）
  */
 import { AsyncImage } from './AsyncImage';
@@ -10,21 +11,7 @@ import { GalleryThumbnail, nextGalleryId } from './GalleryThumbnail';
 import { thumbUrl } from '../infra/image/bili_image';
 import { formatPlayCount } from './VideoCard';
 import { CommentItem, CommentPic } from '../service/video_service';
-
-function two(n: number): string {
-  const s: string = n.toString();
-  return s.length >= 2 ? s : '0' + s;
-}
-
-function fmtTime(ts: number): string {
-  const d = new Date(ts * 1000);
-  const now = new Date();
-  const sameYear: boolean = d.getFullYear() === now.getFullYear();
-  if (sameYear) {
-    return two(d.getMonth() + 1) + '-' + two(d.getDate()) + ' ' + two(d.getHours()) + ':' + two(d.getMinutes());
-  }
-  return d.getFullYear().toString() + '-' + two(d.getMonth() + 1) + '-' + two(d.getDate());
-}
+import { naraDate } from '../common/nara_date';
 
 @Component
 export struct CommentItemView {
@@ -40,6 +27,7 @@ export struct CommentItemView {
   };
 
   private galleryId: string = nextGalleryId();
+  private hasSubFooter(): boolean { return this.item.expanded || this.item.rcount > this.item.replies.length; }
   private pictureUrls(pics: CommentPic[]): string[] { return pics.map((p: CommentPic) => p.url); }
   private pictureThumbs(pics: CommentPic[]): string[] {
     return pics.map((p: CommentPic) => thumbUrl(p.url, pics.length === 1 ? 480 : 320, 320));
@@ -144,15 +132,15 @@ export struct CommentItemView {
         .fontColor($r('app.color.text_primary'))
         .fontSize(14)
     }
-    .lineHeight(22)
+    .lineHeight(22.4)
     .maxLines(2)
     .textOverflow({ overflow: TextOverflow.Ellipsis })
     .width('100%')
     .padding({
       left: 8,
       right: 8,
-      top: first ? 8 : 4,
-      bottom: last ? 8 : 4
+      top: this.item.replies.length === 1 && !this.hasSubFooter() ? 5 : (first ? 8 : 4),
+      bottom: this.item.replies.length === 1 && !this.hasSubFooter() ? 5 : (last ? 8 : 4)
     })
     .id('comment_preview_' + sub.rpid.toString())
     .onClick(() => { this.onOpenSub(this.item, sub.rpid); })
@@ -160,7 +148,7 @@ export struct CommentItemView {
 
   build() {
     Column() {
-      // ===== 主体：头像 + 内容 =====
+      // Nara头部是独立的34头像＋名字/时间列；不能把头像与整段正文并排。
       Row({ space: 12 }) {
         Column() {
           AsyncImage({ src: thumbUrl(this.item.avatar, 96, 96), w: 96, h: 96 })
@@ -171,7 +159,7 @@ export struct CommentItemView {
         .clip(true)
         .backgroundColor($r('app.color.btn_soft_bg'))
 
-        Column({ space: 10 }) {
+        Column() {
           // 名字行（13sp + UP/TOP 徽章）
           Row({ space: 6 }) {
             Text(this.item.uname)
@@ -199,43 +187,47 @@ export struct CommentItemView {
             }
           }
           .width('100%')
-
-          // 正文（14sp / 行高 25）
-          if (this.item.message.length > 0) {
-            Text(this.item.message)
-              .fontSize(14)
-              .lineHeight(25)
-              .fontColor($r('app.color.text_primary'))
-              .width('100%')
-          }
-
-          // 评论图片（R9）
-          if (this.item.pics.length > 0) {
-            this.PicGrid(this.item.pics)
-          }
-
-          // 操作行（R4：高 32，右侧点赞 icon16 + 数字）
-          Row() {
-            Blank()
-            Row({ space: 4 }) {
-              Image($r('app.media.icon_thumbup'))
-                .width(16)
-                .height(16)
-                .fillColor($r('app.color.text_secondary'))
-              Text(formatPlayCount(this.item.like))
-                .fontSize(11)
-                .fontColor($r('app.color.text_secondary'))
-            }
-          }
-          .width('100%')
-          .height(32)
-          .padding({ right: 5 })
+          Text(naraDate(this.item.ctime))
+            .fontSize(11)
+            .fontColor($r('app.color.text_secondary'))
+            .maxLines(1)
+            .width('100%')
         }
         .layoutWeight(1)
         .alignItems(HorizontalAlign.Start)
       }
       .width('100%')
-      .alignItems(VerticalAlign.Top)
+      .alignItems(VerticalAlign.Center)
+
+      // 正文/图片只应用Nara规定的段间距，不用Column(space:10)扩散到操作行。
+      Column() {
+        if (this.item.message.length > 0) {
+          Text(this.item.message)
+            .fontSize(14)
+            .lineHeight(24.5)
+            .fontColor($r('app.color.text_primary'))
+            .width('100%')
+        }
+        if (this.item.pics.length > 0) {
+          this.PicGrid(this.item.pics)
+          Column().height(4)
+        }
+      }
+      .width('100%')
+      .padding({ left: 45, right: 6 })
+      .margin({ top: 10 })
+      .alignItems(HorizontalAlign.Start)
+
+      Row() {
+        Blank()
+        Row({ space: 4 }) {
+          Image($r('app.media.icon_thumbup'))
+            .width(16).height(16).fillColor($r('app.color.text_secondary'))
+          Text(formatPlayCount(this.item.like))
+            .fontSize(11).fontColor($r('app.color.text_secondary'))
+        }
+      }
+      .width('100%').height(32).padding({ right: 5 }).margin({ top: 4 })
 
       // ===== 子回复容器（R1/R2）=====
       // hideSubEntry：楼中楼页面里的「主评论」不再显示「共N条回复」入口（用户指正 2026-10-12）
@@ -244,26 +236,26 @@ export struct CommentItemView {
           if (this.item.replies.length > 0) {
             ForEach(this.item.replies, (sub: CommentItem, si: number) => {
               this.SubLine(sub, si === 0, si === this.item.replies.length - 1
-                && (!this.item.subHasMore || !this.item.expanded) && this.item.rcount <= this.item.replies.length)
+                && !this.hasSubFooter())
             }, (sub: CommentItem) => 'sub_' + sub.rpid.toString())
           }
           if (!this.item.expanded && this.item.rcount > this.item.replies.length) {
             Text('共 ' + this.item.rcount.toString() + ' 条回复，点击查看')
               .fontSize(12)
-              .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.brand_pink'))
               .width('100%')
-              .padding({ left: 8, right: 5, top: 5, bottom: 8 })
+              .padding({ left: 8, right: 8, top: this.item.replies.length === 0 ? 6 : 5,
+                bottom: this.item.replies.length === 0 ? 6 : 8 })
               .onClick(() => {
                 this.onOpenSub(this.item, 0);
               })
           } else if (this.item.expanded) {
             Text(this.subFooterText())
               .fontSize(12)
-              .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.brand_pink'))
               .width('100%')
-              .padding({ left: 8, right: 5, top: 5, bottom: 8 })
+              .padding({ left: 8, right: 8, top: this.item.replies.length === 0 ? 6 : 5,
+                bottom: this.item.replies.length === 0 ? 6 : 8 })
               .onClick(() => {
                 if (this.item.subErr || this.item.subHasMore) {
                   this.onSubMore(this.item);
@@ -276,13 +268,18 @@ export struct CommentItemView {
         .width('calc(100% - 46vp)')
         .backgroundColor($r('app.color.comment_sub_bg'))
         .borderRadius(6)
+        .clip(true)
+        .id('comment_replies_' + this.item.rpid.toString())
         .alignItems(HorizontalAlign.Start)
-        .margin({ left: 42, right: 4, top: 2 })
+        .margin({ left: 42, right: 4, top: 5, bottom: 12 })
       }
     }
     .width('100%')
     .padding({ left: 12, right: 8, top: 14, bottom: 5 })
     .alignItems(HorizontalAlign.Start)
+    // 主评论surface与回复灰底必须分开；楼中楼保持透明，不能盖住父行的目标高亮。
+    .backgroundColor(this.hideSubEntry ? Color.Transparent
+      : (this.item.isUpTop ? $r('app.color.comment_top_bg') : $r('app.color.card_bg')))
   }
 
   /** 展开态底部文案 */
