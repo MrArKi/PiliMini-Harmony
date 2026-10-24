@@ -11,7 +11,8 @@ import { HomeTab } from '../home/HomeTab';
 import { DynamicTab } from '../dynamic/DynamicTab';
 import { MineTab } from '../mine/MineTab';
 import { AuthService } from '../../service/auth_service';
-import { onAuthLogout } from '../../infra/event/app_events';
+import { onAuthLogout, onAppBackground, onAppForeground } from '../../infra/event/app_events';
+import { DynamicUnread } from '../../infra/event/dynamic_unread';
 import { prefsGet } from '../../infra/storage/prefs';
 import { FeedNavRequest } from '../../common/feed_navigation';
 
@@ -29,9 +30,15 @@ struct MainShell {
   @State homeNavRequest: FeedNavRequest = new FeedNavRequest();
   @State dynamicNavRequest: FeedNavRequest = new FeedNavRequest();
   @State materialLevel: number = 10;
+  @StorageProp('dynamicUnreadCount') dynamicUnreadCount: number = 0;
+  @State appForeground: boolean = true;
   @StorageProp('navBarHeight') navBarH: number = 0;
   private tabsCtrl: HdsTabsController = new HdsTabsController();
   private offAuth: (() => void) | undefined = undefined;
+  private offBackground: (() => void) | undefined = undefined;
+  private offForeground: (() => void) | undefined = undefined;
+  private unreadTimer: number = -1;
+  private destroyed: boolean = false;
   private firstShow: boolean = true;
   private logoutPending: boolean = false;
   private touchX: number = 0;
@@ -53,8 +60,10 @@ struct MainShell {
       }
     } else {
       this.lastReselectIndex = -1;
+      if (index === 1) { DynamicUnread.dismissBadge(); }
       this.currentIndex = index;
     }
+    this.updateUnreadSchedule();
     this.onScrollHidden(false);
   }
 
@@ -75,8 +84,10 @@ struct MainShell {
   }
 
   aboutToAppear(): void {
+    DynamicUnread.reset();
     // -101 全局登出 → 清失效 Cookie + 回登录页（spec-03 验收 6）
     this.offAuth = onAuthLogout(() => {
+      DynamicUnread.reset();
       // 已在登录页：并发 -101 去重
       if (this.logoutPending || router.getState().path === 'pages/login/LoginPage') {
         return;
@@ -92,10 +103,23 @@ struct MainShell {
         this.logoutPending = false;
       });
     });
+    this.offBackground = onAppBackground(() => {
+      this.appForeground = false;
+      this.stopUnreadSchedule();
+    });
+    this.offForeground = onAppForeground(() => {
+      this.appForeground = true;
+      this.updateUnreadSchedule();
+    });
     this.loadMaterialLevel();
+    this.updateUnreadSchedule();
   }
 
   aboutToDisappear(): void {
+    this.destroyed = true;
+    this.stopUnreadSchedule();
+    if (this.offBackground) { this.offBackground(); this.offBackground = undefined; }
+    if (this.offForeground) { this.offForeground(); this.offForeground = undefined; }
     if (this.offAuth !== undefined) {
       this.offAuth();
       this.offAuth = undefined;
@@ -126,6 +150,7 @@ struct MainShell {
   onPageShow(): void {
     this.pageVisible = true;
     this.loadMaterialLevel();
+    this.updateUnreadSchedule();
     if (this.firstShow) {
       this.firstShow = false;
       return;
@@ -133,7 +158,26 @@ struct MainShell {
     this.shownTick++;
   }
 
-  onPageHide(): void { this.pageVisible = false; }
+  onPageHide(): void { this.pageVisible = false; this.stopUnreadSchedule(); }
+
+  private stopUnreadSchedule(): void {
+    if (this.unreadTimer >= 0) { clearTimeout(this.unreadTimer); this.unreadTimer = -1; }
+    DynamicUnread.cancel();
+  }
+
+  /** Nara 默认五分钟；只在主壳前台且不在动态页时工作。 */
+  private updateUnreadSchedule(): void {
+    if (this.destroyed || !this.pageVisible || !this.appForeground || this.currentIndex === 1) {
+      this.stopUnreadSchedule(); return;
+    }
+    // aboutToAppear/onPageShow、导航点击/onChange 成对出现，复用同一前台周期。
+    if (this.unreadTimer >= 0) { return; }
+    DynamicUnread.refresh();
+    this.unreadTimer = setTimeout(() => {
+      this.unreadTimer = -1;
+      this.updateUnreadSchedule();
+    }, 5 * 60 * 1000);
+  }
 
   /** 列表下滑：底栏动画隐藏（Nara：HdsTabsController.applyHideAnimation(SCROLL_ANIMATION)） */
   private onScrollHidden(hidden: boolean): void {
@@ -154,6 +198,7 @@ struct MainShell {
   onBackPress(): boolean {
     if (this.currentIndex !== 0) {
       this.currentIndex = 0;
+      this.updateUnreadSchedule();
       this.homeTopTick++;
       this.onScrollHidden(false);
       return true;
@@ -164,10 +209,17 @@ struct MainShell {
   @Builder
   NavItem(label: string, icon: Resource, index: number) {
     Column({ space: 2 }) {
-      Image(icon)
-        .width(24)
-        .height(24)
-        .fillColor(this.currentIndex === index ? $r('app.color.brand_pink') : $r('app.color.text_secondary'))
+      if (index === 1 && this.dynamicUnreadCount > 0) {
+        Badge({ count: this.dynamicUnreadCount, maxCount: 99, position: BadgePosition.RightTop,
+          style: { badgeSize: 13, fontSize: 8, fontWeight: FontWeight.Medium,
+            badgeColor: $r('app.color.brand_pink'), color: '#FFFFFF', borderColor: '#FFFFFF' } }) {
+          Image(icon).width(24).height(24)
+            .fillColor(this.currentIndex === index ? $r('app.color.brand_pink') : $r('app.color.text_secondary'))
+        }
+      } else {
+        Image(icon).width(24).height(24)
+          .fillColor(this.currentIndex === index ? $r('app.color.brand_pink') : $r('app.color.text_secondary'))
+      }
       Text(label)
         .fontSize(10)
         .fontColor(this.currentIndex === index ? $r('app.color.brand_pink') : $r('app.color.text_secondary'))
@@ -213,7 +265,8 @@ struct MainShell {
 
       TabContent() {
         Stack() {
-          DynamicTab({ active: this.currentIndex === 1, navRequest: this.dynamicNavRequest })
+          DynamicTab({ active: this.pageVisible && this.appForeground && this.currentIndex === 1,
+            navRequest: this.dynamicNavRequest })
         }
         .width('100%')
         .height('100%')
@@ -246,7 +299,9 @@ struct MainShell {
     .onTouch((event: TouchEvent) => { this.onShellTouch(event); })
     .onTabBarClick((index: number): void => { this.onNavClick(index); })
     .onChange((index: number) => {
+      if (index === 1 && index !== this.currentIndex) { DynamicUnread.dismissBadge(); }
       this.currentIndex = index;
+      this.updateUnreadSchedule();
       this.onScrollHidden(false);
     })
   }

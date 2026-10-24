@@ -21,4 +21,6 @@ export interface VideoItem {
   duration: number;
   /** avid（稍后再看/收藏删除等写操作用；列表页可能为 0） */
   aid?: number;
+  /** 列表接口已有的频道名；本地屏蔽不逐卡查询详情。 */
+  zoneName?: string;
 }

@@ -11,6 +11,7 @@ import { PlayerScreen } from '../../infra/player/screen_awake';
 import { PlayerBrightness } from '../../infra/player/player_brightness';
 import { VideoQuality } from '../../model/video_quality';
 import { PlayerProgressBar } from './PlayerProgressBar';
+import { SeekPreview } from './SeekPreview';
 import { PlayPauseIcon } from './PlayPauseIcon';
 import { DanmakuLayer } from './DanmakuLayer';
 import { DanmakuPanel } from './DanmakuPanel';
@@ -29,6 +30,8 @@ function fmtMs(ms: number): string {
 }
 const SPEEDS: number[] = [0.5, 0.75, 1, 1.25, 1.5, 2];
 const LONG_PRESS_SPEED: number = 3;
+/** Nara默认绝对横滑：整屏宽固定90秒；底部进度条仍映射整片时长。 */
+const PAN_SEEK_SPAN_MS: number = 90000;
 interface DanmakuPopupState { isVisible: boolean; }
 
 class PlayerSurfaceController extends XComponentController {
@@ -51,6 +54,8 @@ export struct PlayerView {
   @Prop sourceWidth: number = 0;
   @Prop sourceHeight: number = 0;
   onVideoSize: (w: number, h: number) => void = () => {};
+  onInitialLayout: () => void = () => {};
+  private initialLayoutNotified: boolean = false;
   registerRelease: (release: () => Promise<void>) => void = () => {};
   @State actualRatio: number = 0;
   @Prop title: string = '';
@@ -76,6 +81,9 @@ export struct PlayerView {
     new uiMaterial.ImmersiveMaterial({ style: uiMaterial.ImmersiveStyle.ULTRA_THIN,
       materialColor: '#B3000000', colorInvert: false, interactive: true, lightEffect: {} }) : undefined;
   @Prop isFullscreen: boolean = false;
+  @Prop controlInsetTop: number = 0;
+  @Prop controlInsetLeft: number = 0;
+  @Prop controlInsetRight: number = 0;
   /** 进入即起播（详情页场景，用户决策 2026-10-11） */
   @Prop autoPlay: boolean = false;
   /** 本地文件路径（非空 = 离线播放：跳取流，直接播该文件；与在线播放同一套 UI/手势） */
@@ -124,7 +132,7 @@ export struct PlayerView {
   @Prop canvasWidth: number = 0;
   @Prop viewportHeight: number = 0;
 
-  @State state: string = 'idle'; // idle | loading | playing | paused | error
+  @State state: string = 'idle'; // idle | loading | playing | paused | completed | error
   @State controlsVisible: boolean = true;
   @State posMs: number = 0;
   @State durMs: number = 0;
@@ -135,7 +143,6 @@ export struct PlayerView {
   @State qualityMenuVisible: boolean = false;
   @State speedMenuVisible: boolean = false;
   @State seekPreviewMs: number = -1;
-  @State locked: boolean = false;
   @State toast: string = '';
   @State errorText: string = '';
   @State ready: boolean = false;
@@ -168,6 +175,8 @@ export struct PlayerView {
   private speedBeforePress: number = 1;
   private panSeeking: boolean = false;
   private panStartPos: number = 0;
+  private panLastDx: number = 0;
+  @State private seekCancelHint: boolean = false;
   private areaWidth: number = 360;
   private panMode: string = 'none';
   private panConsumed: boolean = false;
@@ -207,6 +216,7 @@ export struct PlayerView {
       (snapshot: PlaybackSnapshot): void => { this.receive(snapshot); });
     this.registerRelease((): Promise<void> => {
       this.exiting = true; this.visibilityGeneration++;
+      this.onPanEnd(true);
       this.danmakuSelected = false; this.danmakuPanelShown = false;
       this.requestedSystemLevel = -1; this.brightnessControl.setVisible(false);
       if (this.controller === undefined) { return this.surfaceRelease; }
@@ -247,7 +257,10 @@ export struct PlayerView {
     this.wanted = snapshot.wanted; this.started = snapshot.loaded;
     this.errorText = snapshot.error; this.appInBackground = snapshot.background;
     this.brightnessControl.setBackground(snapshot.background);
-    if (snapshot.background) { this.requestedSystemLevel = -1; this.volumeRequests = []; }
+    if (snapshot.background) {
+      this.requestedSystemLevel = -1; this.volumeRequests = [];
+      if (this.seekPreviewMs >= 0 || this.seekCancelHint || this.panMode !== 'none') { this.onPanEnd(true); }
+    }
     this.receiveSystemVolume(snapshot);
     const source: PlaybackSource | undefined = this.playbackSource || this.localSource;
     this.danmakuFeed.publish({ cid: (source ? source.localPath : this.localPath).length > 0 ? 0 : (source ? source.cid : this.cid),
@@ -283,6 +296,7 @@ export struct PlayerView {
     this.brightnessControl.setVisible(this.visible);
     const generation: number = ++this.visibilityGeneration;
     if (!this.visible) {
+      this.onPanEnd(true);
       this.requestedSystemLevel = -1; this.volumeRequests = [];
       this.danmakuPanelShown = false; this.danmakuSelected = false;
       if (!this.wanted) { this.capturePausedFrame(); }
@@ -310,6 +324,7 @@ export struct PlayerView {
   onCidChange(): void {
     if (this.destroyed || this.localPath.length > 0 || this.playbackSource !== undefined) { return; }
     this.danmakuPanelShown = false; this.danmakuSelected = false;
+    this.onPanEnd(true);
     this.actualRatio = 0; this.pausedFrame = undefined; this.showPausedFrame = false; this.controlsVisible = true;
     if (this.ready && this.settingsLoaded && this.visible) { this.start(this.qn, false); }
   }
@@ -317,6 +332,7 @@ export struct PlayerView {
   private onLocalSourceChange(): void {
     if (!this.localSource || this.destroyed) { return; }
     this.danmakuSelected = false; this.danmakuPanelShown = false;
+    this.onPanEnd(true);
     this.actualRatio = 0; this.pausedFrame = undefined; this.showPausedFrame = false; this.controlsVisible = true;
     if (this.ready && this.settingsLoaded && this.visible) { this.start(this.qn, false); }
   }
@@ -324,6 +340,7 @@ export struct PlayerView {
   private onPlaybackSourceChange(): void {
     if (!this.playbackSource || this.destroyed) { return; }
     this.danmakuPanelShown = false; this.danmakuSelected = false;
+    this.onPanEnd(true);
     this.actualRatio = 0; this.pausedFrame = undefined; this.showPausedFrame = false; this.controlsVisible = true;
     if (this.ready && this.settingsLoaded && this.visible) { this.start(this.qn, false); }
   }
@@ -381,7 +398,7 @@ export struct PlayerView {
     if (this.controlTimer !== -1) { clearTimeout(this.controlTimer); }
     this.controlTimer = setTimeout((): void => {
       this.controlTimer = -1;
-      if (!this.destroyed && this.state === 'playing' && !this.locked && !this.longPressActive && !this.panSeeking && this.seekPreviewMs < 0 &&
+      if (!this.destroyed && this.state === 'playing' && !this.longPressActive && !this.panSeeking && this.seekPreviewMs < 0 &&
         !this.speedMenuVisible && !this.qualityMenuVisible && !this.danmakuPanelShown && !this.danmakuSelected) {
         this.controlsVisible = false;
       }
@@ -405,9 +422,6 @@ export struct PlayerView {
   private onSingleTap(event: GestureEvent): void {
     if (this.panConsumed) { return; }
     if (!this.isFullscreen && this.collapseRatio > 0 && this.state !== 'playing') { this.togglePlay(); return; }
-    if (this.locked) {
-      return;
-    }
     if (this.danmakuReady && this.danmakuPreferences.enabled && this.collapseRatio <= 0 && event.fingerList.length > 0) {
       const finger: FingerInfo = event.fingerList[0];
       const scale: number = this.canvasScale();
@@ -518,15 +532,20 @@ export struct PlayerView {
   }
 
   private onDoubleTap(): void {
-    if (this.locked || this.panConsumed) {
+    if (this.panConsumed || this.controller === undefined) {
       return;
     }
+    // 恢复会同步经过loading；反馈必须取切换前的播放意图，不能读切换后的state。
+    const completed: boolean = this.state === 'completed';
+    const initial: boolean = this.state === 'idle' || this.state === 'error';
+    if (initial && (!this.controller.ready() || this.destroyed || !this.visible)) { return; }
+    const pause: boolean = !completed && !initial && this.wanted;
     this.togglePlay();
-    this.showToast(this.state === 'playing' ? '继续播放' : '已暂停');
+    this.showToast(pause ? '已暂停' : completed ? '重新播放' : initial ? '开始播放' : '继续播放');
   }
 
   private onLongPressStart(): void {
-    if (this.locked || this.state === 'idle' || this.state === 'error') {
+    if (this.state === 'idle' || this.state === 'error') {
       return;
     }
     if (!this.speedLocked) { this.speedBeforePress = this.speed; }
@@ -548,7 +567,7 @@ export struct PlayerView {
   }
 
   private onPanStart(startX: number): void {
-    if (this.locked || !this.visible || this.appInBackground || this.exiting) {
+    if (!this.visible || this.appInBackground || this.exiting) {
       return;
     }
     this.panMode = 'none';
@@ -557,13 +576,15 @@ export struct PlayerView {
     this.fsTriggered = false;
     this.panSeeking = false;
     this.panStartPos = this.posMs;
+    this.panLastDx = 0;
+    this.seekCancelHint = false;
     this.panStartX = startX;
     this.brightnessControl.sync();
     this.controller?.syncSystemVolume();
   }
 
-  private onPanUpdate(dx: number, dy: number): void {
-    if (this.locked || !this.visible || this.appInBackground || this.exiting) {
+  private onPanUpdate(dx: number, dy: number, x: number, y: number): void {
+    if (!this.visible || this.appInBackground || this.exiting) {
       return;
     }
     // 长按期间垂直滑动 → 锁定/解除锁定倍速
@@ -612,9 +633,22 @@ export struct PlayerView {
 
     if (this.panMode === 'seek') {
       this.panSeeking = true;
+      const stepX: number = dx - this.panLastDx;
+      this.panLastDx = dx;
+      // Nara：当前触点进入两个上角各1/8区时取消本次进退；这里没有Y位置敏感度。
+      const corner: boolean = y <= this.playerH * 0.125 &&
+        (x <= this.playerW * 0.125 || x >= this.playerW * 0.875);
+      if (corner) {
+        this.seekCancelHint = true;
+        this.seekPreviewMs = -1;
+        return;
+      }
+      this.seekCancelHint = false;
       if (this.durMs > 0) {
-        const delta: number = dx / this.areaWidth * this.durMs;
-        this.seekPreviewMs = Math.max(0, Math.min(this.panStartPos + delta, this.durMs - 1000));
+        const from: number = this.seekPreviewMs >= 0 ? this.seekPreviewMs : this.panStartPos;
+        const delta: number = Math.round(stepX / Math.max(1, this.areaWidth) * PAN_SEEK_SPAN_MS);
+        this.panStartPos = Math.max(0, Math.min(from + delta, Math.max(0, this.durMs - 1000)));
+        this.seekPreviewMs = this.panStartPos;
       }
     } else if (this.panMode === 'bright') {
       const h: number = this.playerH > 0 ? this.playerH : 400;
@@ -671,40 +705,21 @@ export struct PlayerView {
     }
   }
 
-  private onPanEnd(): void {
-    if (this.panMode === 'seek' && this.panSeeking && this.seekPreviewMs >= 0) {
+  private onPanEnd(cancelled: boolean = false): void {
+    if (!cancelled && !this.seekCancelHint && this.panMode === 'seek' && this.panSeeking && this.seekPreviewMs >= 0) {
       this.seekTo(this.seekPreviewMs);
       this.showToast('已定位到 ' + fmtMs(this.seekPreviewMs));
     }
-    if (this.panMode === 'volume') {
-      this.controller?.syncSystemVolume();
-    }
+    const syncVolume: boolean = this.panMode === 'volume';
     this.panMode = 'none';
     this.fsTriggered = false;
     this.panSeeking = false;
     this.seekPreviewMs = -1;
+    this.seekCancelHint = false;
+    if (syncVolume) { this.controller?.syncSystemVolume(); }
   }
 
   // ===== 控制层 =====
-  @Builder
-  LockOverlay() {
-    Column() {
-      Image($r('app.media.icon_lock'))
-        .width(15)
-        .height(15)
-        .fillColor('#FFFFFF')
-    }
-    .width(34)
-    .height(34)
-    .borderRadius(8)
-    .backgroundColor('#45000000')
-    .justifyContent(FlexAlign.Center)
-    .onClick(() => {
-      this.locked = false;
-      this.controlsVisible = true;
-    })
-  }
-
   @Builder
   SpeedMenu() {
     Column() {
@@ -796,17 +811,11 @@ export struct PlayerView {
           .onClick((): void => { this.openDanmakuPanel(); })
       }
 
-      Button({ type: ButtonType.Normal }) {
-        Image($r('app.media.icon_unlock')).width(15).height(15).fillColor('#FFFFFF')
-      }.width(34).height(34).padding(0).borderRadius(8).backgroundColor('#45000000')
-        .accessibilityText('锁定控制层')
-        .onClick(() => {
-          this.locked = true;
-          this.showToast('已锁定控制层');
-        })
     }
     .width('100%')
-    .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+    .padding({ left: 12 + (this.isFullscreen ? this.controlInsetLeft : 0),
+      right: 12 + (this.isFullscreen ? this.controlInsetRight : 0),
+      top: 8 + (this.isFullscreen ? this.controlInsetTop : 0), bottom: 8 })
     .alignItems(VerticalAlign.Center)
     .linearGradient({
       angle: 180,
@@ -886,7 +895,8 @@ export struct PlayerView {
       .alignItems(VerticalAlign.Center)
     }
     .width('100%')
-    .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+    .padding({ left: 10 + (this.isFullscreen ? this.controlInsetLeft : 0),
+      right: 10 + (this.isFullscreen ? this.controlInsetRight : 0), top: 4, bottom: 4 })
     .linearGradient({
       angle: 0,
       colors: [['#00000000', 0.0], ['#8A000000', 1.0]]
@@ -942,11 +952,11 @@ export struct PlayerView {
         .width(92)
         .justifyContent(FlexAlign.Start)
 
-        // 中：继续播放 / 重新播放（占比居中）
-        Row({ space: 3 }) {
-          Image(this.state === 'paused' ? $r('app.media.icon_play') : $r('app.media.icon_replay'))
-            .width(18).height(18).fillColor($r('app.color.brand_pink'))
-          Text(this.state === 'paused' ? '继续播放' : '重新播放')
+        // Nara：实心play_arrow_rounded；未起播/暂停/完成分别立即/继续/重新播放。
+        Row({ space: 2 }) {
+          Image(this.state === 'completed' ? $r('app.media.icon_replay') : $r('app.media.icon_player_play_rounded'))
+            .width(24).height(24).fillColor($r('app.color.brand_pink'))
+          Text(this.state === 'completed' ? '重新播放' : (this.started || this.posMs > 0 ? '继续播放' : '立即播放'))
             .fontSize(14)
             .fontWeight(FontWeight.Medium)
             .fontColor($r('app.color.brand_pink'))
@@ -1028,13 +1038,15 @@ export struct PlayerView {
             this.onPanStart(x);
           })
           .onActionUpdate((e: GestureEvent) => {
-            this.onPanUpdate(e.offsetX, e.offsetY);
+            const finger: FingerInfo | undefined = e.fingerList.length > 0 ? e.fingerList[0] : undefined;
+            this.onPanUpdate(e.offsetX, e.offsetY, finger ? finger.localX : this.panStartX + e.offsetX,
+              finger ? finger.localY : this.playerH / 2 + e.offsetY);
           })
           .onActionEnd(() => {
             this.onPanEnd();
           })
           .onActionCancel(() => {
-            this.onPanEnd();
+            this.onPanEnd(true);
           })
       )
     )
@@ -1113,7 +1125,7 @@ export struct PlayerView {
       }
 
       // ④ 控制层
-      if (this.controlsVisible && !this.locked && this.state !== 'idle') {
+      if (this.controlsVisible && this.state !== 'idle') {
         Column() {
           this.TopBar()
           Blank().hitTestBehavior(HitTestMode.None)
@@ -1130,21 +1142,37 @@ export struct PlayerView {
         this.EdgeProgress()
       }
 
-      // ⑥ 锁定态：仅保留锁按钮
-      if (this.locked) {
-        Column() {
-          this.LockOverlay()
-        }
-        .width('100%')
-        .height('100%')
-        .justifyContent(FlexAlign.Center)
-        .alignItems(HorizontalAlign.Start)
-        .padding({ left: 12 })
+      // ⑧ 收窄条（暂停 + 详情页上滑）：必须在播放器子树内（页面层覆盖层收不到表面触摸）
+      if (!this.isFullscreen && this.collapseRatio > 0 && this.state !== 'playing' && this.state !== 'loading') {
+        this.CollapseBar()
       }
 
-      // ⑧ 收窄条（暂停 + 详情页上滑）：必须在播放器子树内（页面层覆盖层收不到表面触摸）
-      if (!this.isFullscreen && this.collapseRatio > 0 && this.state !== 'playing' && this.state !== 'loading' && !this.locked) {
-        this.CollapseBar()
+      // Nara默认开启服务端快照；稳定保留组件仅复用本源索引，松手立即取消图片工作。
+      SeekPreview({ bvid: this.playbackSource ? this.playbackSource.bvid : this.bvid,
+        cid: this.playbackSource ? this.playbackSource.cid : this.cid,
+        cacheAllowed: this.visible && !this.appInBackground && !this.exiting && this.localPath.length === 0 &&
+          (!this.playbackSource || this.playbackSource.localPath.length === 0) &&
+          (!this.localSource || this.localSource.localPath.length === 0),
+        active: this.seekPreviewMs >= 0 && !this.seekCancelHint && this.visible && !this.appInBackground &&
+          !this.exiting && this.localPath.length === 0 && (!this.playbackSource || this.playbackSource.localPath.length === 0) &&
+          (!this.localSource || this.localSource.localPath.length === 0),
+        positionMs: Math.max(0, this.seekPreviewMs), playerWidth: this.playerW, playerHeight: this.playerH,
+        fullscreen: this.isFullscreen, vertical: this.videoRatio() < 1 })
+
+      if (this.seekPreviewMs >= 0) {
+        Text(fmtMs(this.seekPreviewMs) + ' / ' + fmtMs(this.durMs))
+          .id('player-seek-preview-time')
+          .fontSize(12).fontColor('#FFFFFF').backgroundColor('#88000000').borderRadius(64)
+          .padding({ left: 10, right: 10, top: 8, bottom: 8 })
+          .position({ x: '50%', y: this.isFullscreen ? 36 : 24 }).translate({ x: '-50%' })
+          .transition(TransitionEffect.OPACITY.animation({ duration: 150, curve: Curve.EaseInOut }))
+          .hitTestBehavior(HitTestMode.None)
+      }
+      if (this.seekCancelHint) {
+        Text('松开手指，取消进退').fontSize(14).fontColor($r('app.color.text_primary'))
+          .id('player-seek-cancel-hint')
+          .backgroundColor($r('app.color.btn_soft_bg')).borderRadius(6)
+          .padding({ left: 8, right: 8, top: 4, bottom: 4 }).hitTestBehavior(HitTestMode.None)
       }
 
       // ⑦ toast / 拖动时间提示
@@ -1153,15 +1181,14 @@ export struct PlayerView {
         AVVolumePanel({ volumeLevel: this.requestedSystemLevel, volumeParameter: { position: { x: -1, y: -1 } } })
           .width(1).height(1).hitTestBehavior(HitTestMode.None)
       }
-      if (this.toast.length > 0 || this.seekPreviewMs >= 0) {
-        Text(this.seekPreviewMs >= 0
-          ? (fmtMs(this.seekPreviewMs) + ' / ' + fmtMs(this.durMs))
-          : this.toast)
+      if (this.toast.length > 0 && this.seekPreviewMs < 0 && !this.seekCancelHint) {
+        Text(this.toast)
           .fontSize(12)
           .fontColor('#FFFFFF')
           .backgroundColor('#8A000000')
           .borderRadius(4)
           .padding({ left: 10, right: 10, top: 5, bottom: 5 })
+          .hitTestBehavior(HitTestMode.None)
       }
     }
     .width('100%')
@@ -1176,6 +1203,10 @@ export struct PlayerView {
       this.playerW = Number(newV.width);
       this.playerH = Number(newV.height);
       this.areaWidth = this.playerW;
+      if (!this.initialLayoutNotified && this.playerW > 0 && this.playerH > 0) {
+        this.initialLayoutNotified = true;
+        this.onInitialLayout();
+      }
     })
 
   }

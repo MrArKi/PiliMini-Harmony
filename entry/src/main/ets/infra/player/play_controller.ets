@@ -1,7 +1,7 @@
 import { common } from '@kit.AbilityKit';
 import systemDateTime from '@ohos.systemDateTime';
 import { audio } from '@kit.AudioKit';
-import { NativePlayerEvent, NativePlayerSnapshot } from 'libpilimini_player.so';
+import type { NativePlayerEvent, NativePlayerSnapshot } from 'libpilimini_player.so';
 import { MpvEngine } from './mpv_engine';
 import { BgAudio } from './audio_mode';
 import { PlaybackHistory } from './playback_history';
@@ -78,6 +78,9 @@ export class PlayController {
   private hardware: boolean = true;
   private p1080: boolean = true;
   private timer: number = -1;
+  private refreshInFlight: boolean = false;
+  private refreshAgain: boolean = false;
+  private refreshRevision: number = 0;
   private backgroundTimer: number = -1;
   private restoreTimer: number = -1;
   private restoring: boolean = false;
@@ -96,6 +99,7 @@ export class PlayController {
   private focusActivatedRevision: number = -1;
   private pendingSeek: number = -1;
   private seekStarted: boolean = false;
+  private pendingEnd: boolean = false;
   private seekAt: number = 0;
   private focusManager: audio.AudioSessionManager = audio.getAudioManager().getSessionManager();
   private routing: audio.AudioRoutingManager = audio.getAudioManager().getRoutingManager();
@@ -186,7 +190,7 @@ export class PlayController {
   /** 原生事件即时响应；只有播放/准备/seek需要快照，稳定暂停无定时任务。 */
   private scheduleRefresh(): void {
     if (this.timer !== -1) { clearTimeout(this.timer); this.timer = -1; }
-    if (this.disposed || !this.visible || this.engine === undefined ||
+    if (this.refreshInFlight || this.disposed || !this.visible || this.engine === undefined ||
       this.state.state === 'error' || this.state.state === 'completed' ||
       (this.state.loaded && !this.state.wanted && this.pendingSeek < 0 && !this.restoring && this.audioMissingAt === 0)) { return; }
     const urgent: boolean = !this.state.loaded || this.pendingSeek >= 0 || this.restoring || this.audioMissingAt > 0;
@@ -251,6 +255,7 @@ export class PlayController {
     const previous: PlaybackSource | undefined = this.source;
     const same: boolean = preserve && previous !== undefined && previous.bvid === source.bvid &&
       previous.cid === source.cid && previous.localPath === source.localPath;
+    this.commitPosition();
     if (this.history !== undefined) { this.history.flush(); }
     if (source.localPath.length > 0) {
       this.history = undefined;
@@ -330,7 +335,10 @@ export class PlayController {
       // 异步初始化仍占用kernelQueue；退页/切源的迟到实例先关闭，再让下个任务或Surface销毁继续。
       if (!this.current(generation) || this.surface !== surface) { await engine.dispose(); return; }
       this.engine = engine;
+      // 深诊断不参与起播判定，避开首次解码/音轨准备时额外查询。
+      this.lastDiagnosticAt = Date.now();
       this.pendingSeek = -1; this.seekStarted = false;
+      this.pendingEnd = false;
       this.audioMissingAt = 0;
       this.state.loaded = false;
       this.state.position = position;
@@ -357,6 +365,8 @@ export class PlayController {
       if (!this.state.loaded) { this.retry('媒体加载失败（' + event.code.toString() + '）'); }
       return;
     }
+    // 事件到达时在途读取可能尚未包含该变化，丢弃旧结果并只补采一次。
+    this.invalidateSnapshot();
     if (event.type === 'loaded') {
       this.state.loaded = true;
       if (this.engine !== undefined) {
@@ -365,30 +375,51 @@ export class PlayController {
       }
     }
     if (event.type === 'seek' && this.pendingSeek >= 0) { this.seekStarted = true; }
-    if (event.type === 'restart' && this.pendingSeek >= 0 && this.seekStarted && this.engine !== undefined) {
-      const native: NativePlayerSnapshot = this.engine.snapshot();
-      if (!native.seeking && Math.abs(native.position - this.pendingSeek) < 2000) { this.pendingSeek = -1; }
-    }
     if (event.type === 'ended') {
-      if (this.pendingSeek < 0) { this.finishPlayback(this.audioMissingAt > 0); }
+      if (this.pendingSeek < 0) { this.pendingEnd = true; this.refresh(); }
       return;
     }
     this.refresh();
-    if (this.restoring && event.type === 'restart' && this.engine !== undefined &&
-      this.engine.snapshot().outputReady) { this.clearRestore(); this.refresh(); }
   }
 
   private refresh(): void {
     if (this.disposed || !this.visible || this.engine === undefined ||
       this.state.state === 'error' || this.state.state === 'completed') { return; }
+    if (this.timer !== -1) { clearTimeout(this.timer); this.timer = -1; }
+    if (this.refreshInFlight) { this.refreshAgain = true; return; }
+    this.refreshInFlight = true;
+    this.refreshAgain = false;
+    this.refreshSnapshot().finally((): void => {
+      this.refreshInFlight = false;
+      const again: boolean = this.refreshAgain;
+      this.refreshAgain = false;
+      if (again) { this.refresh(); }
+      else { this.scheduleRefresh(); }
+    });
+  }
+
+  private async refreshSnapshot(): Promise<void> {
+    const engine: MpvEngine | undefined = this.engine;
+    const generation: number = this.generation, revision: number = this.refreshRevision;
+    if (engine === undefined) { return; }
+    const valid = (): boolean => this.current(generation) && this.engine === engine &&
+      revision === this.refreshRevision && this.state.state !== 'error' && this.state.state !== 'completed';
     try {
       if (!this.state.loaded) {
         if (Date.now() - this.prepareAt > 20000) { this.retry('播放准备超时'); }
         return;
       }
-      const diagnostic: boolean = Date.now() - this.lastDiagnosticAt >= (this.background ? 60000 : 30000);
-      const native: NativePlayerSnapshot = this.engine.snapshot(diagnostic);
-      const sampledAt: number = systemDateTime.getUptime(systemDateTime.TimeType.ACTIVE);
+      const now: number = Date.now();
+      const diagnostic: boolean = this.state.state === 'playing' && this.pendingSeek < 0 && !this.restoring &&
+        now - this.lastDiagnosticAt >= (this.background ? 60000 : 30000);
+      // 音轨未就绪等分支会提前返回，必须在查询前记录以免事件簇重复深诊断。
+      if (diagnostic) { this.lastDiagnosticAt = now; }
+      const native: NativePlayerSnapshot = await engine.snapshot(diagnostic);
+      if (!valid()) { return; }
+      const uptime: number = systemDateTime.getUptime(systemDateTime.TimeType.ACTIVE);
+      const sampledAt: number = uptime - Math.min(uptime, Math.max(0, native.sampleAgeMs));
+      if (this.pendingSeek >= 0 && this.seekStarted && !native.seeking &&
+        Math.abs(native.position - this.pendingSeek) < 2000) { this.pendingSeek = -1; }
       // 外置音轨打开失败时mpv仍可能正常播放视频，不能仅凭FILE_LOADED判定音画齐全。
       if (this.info !== undefined && this.info.isDash && this.info.audioUrl.length > 0 && !native.audioReady && !native.ended) {
         if (this.audioMissingAt === 0) { this.audioMissingAt = Date.now(); }
@@ -402,7 +433,6 @@ export class PlayController {
         this.clearRestore();
       }
       if (diagnostic) {
-        this.lastDiagnosticAt = Date.now();
         const stats = MpvEngine.stats();
         console.info('[PiliMini-mpv] clock syncValid=' + native.syncValid + ' avMs=' +
           native.avSyncMs.toFixed(2) + ' output=' + native.outputReady + ' decoder=' + native.decoder +
@@ -418,7 +448,9 @@ export class PlayController {
       if (native.width > 0 && native.height > 0) { this.state.width = native.width; this.state.height = native.height; }
       this.state.bufferPercent = this.state.duration > 0 ? Math.min(100,
         Math.max(this.state.position, native.buffered) / this.state.duration * 100) : 0;
-      if (native.ended && !native.seeking && this.pendingSeek < 0) { this.finishPlayback(!native.audioReady); return; }
+      if ((native.ended || this.pendingEnd) && !native.seeking && this.pendingSeek < 0) {
+        this.pendingEnd = false; this.finishPlayback(!native.audioReady); return;
+      }
       this.setState(!this.state.wanted ? 'paused' :
         (native.paused || native.buffering || native.seeking || this.pendingSeek >= 0 || this.restoring ? 'loading' : 'playing'));
       if (this.history !== undefined) {
@@ -427,22 +459,29 @@ export class PlayController {
       }
       this.savePosition(false);
       if (Date.now() - this.lastSessionAt >= (this.background ? 30000 : 15000)) { this.syncSession(); }
-    } catch (error) { this.retry('播放器状态异常'); }
-    finally { this.scheduleRefresh(); }
+    } catch (error) { if (valid()) { this.retry('播放器状态异常'); } }
   }
 
   private position(): number {
     if (this.pendingSeek >= 0) { return this.pendingSeek; }
-    if (this.engine !== undefined && this.state.loaded) {
-      try { const native: NativePlayerSnapshot = this.engine.snapshot();
-        if (!native.seeking && native.position >= 0) {
-          this.state.position = native.position;
-          this.state.sampledAt = systemDateTime.getUptime(systemDateTime.TimeType.ACTIVE);
-          return native.position;
-        }
-      } catch (error) {}
+    let value: number = this.state.position;
+    if (this.state.state === 'playing' && this.state.wanted && this.state.loaded && !this.state.seeking &&
+      !this.restoring && this.state.sampledAt > 0) {
+      // 读取/线程池异常迟到时不把长期旧快照外推到片尾；正常上限覆盖原采样周期。
+      const elapsed: number = Math.max(0, systemDateTime.getUptime(systemDateTime.TimeType.ACTIVE) - this.state.sampledAt);
+      value += Math.min(elapsed, this.background ? 6000 : 1500) * this.state.speed;
     }
-    return this.state.position;
+    return Math.max(0, this.state.duration > 0 ? Math.min(value, this.state.duration) : value);
+  }
+
+  private commitPosition(): void {
+    this.state.position = this.position();
+    this.state.sampledAt = systemDateTime.getUptime(systemDateTime.TimeType.ACTIVE);
+  }
+
+  private invalidateSnapshot(): void {
+    this.refreshRevision++;
+    if (this.refreshInFlight) { this.refreshAgain = true; }
   }
 
   toggle(): void {
@@ -454,8 +493,8 @@ export class PlayController {
     if (this.disposed || !this.visible) { return; }
     if (user) { this.clearFocusResume(); }
     else { this.focusRevision++; }
+    this.commitPosition(); this.invalidateSnapshot();
     this.state.wanted = wanted;
-    this.state.position = this.position();
     if (this.engine !== undefined) {
       try {
         if (wanted) {
@@ -478,6 +517,8 @@ export class PlayController {
     if (this.disposed || !this.visible || this.engine === undefined || !this.state.loaded || !Number.isFinite(ms)) { return; }
     const target: number = Math.max(0, Math.min(ms, Math.max(0, this.state.duration - 1000)));
     try {
+      this.invalidateSnapshot();
+      this.pendingEnd = false;
       this.pendingSeek = target; this.seekStarted = false; this.seekAt = Date.now();
       this.engine.seek(target);
       this.state.position = target;
@@ -492,7 +533,7 @@ export class PlayController {
 
   speed(value: number): void {
     if (!Number.isFinite(value) || value < 0.25 || value > 5 || this.disposed) { return; }
-    this.state.position = this.position();
+    this.commitPosition(); this.invalidateSnapshot();
     this.state.speed = value;
     if (this.engine !== undefined) { this.engine.speed(value); }
     this.syncSession(); this.emit();
@@ -567,6 +608,7 @@ export class PlayController {
     BgAudio.stop(this.owner); this.savePosition(true); this.setState('completed'); this.scheduleRefresh();
   }
   private fail(message: string): void {
+    this.commitPosition();
     this.clearFocusResume(); this.releaseFocus();
     this.state.wanted = false; this.state.error = message;
     if (this.history !== undefined) { this.history.flush(); }
@@ -638,6 +680,7 @@ export class PlayController {
     if (!await this.activateFocus(generation, revision) || !this.current(generation) ||
       revision !== this.focusRevision || !this.state.wanted || this.engine !== engine) { return; }
     try {
+      this.invalidateSnapshot();
       engine.play();
       if (this.background) { this.startBackground(); }
       this.refresh();
@@ -656,6 +699,7 @@ export class PlayController {
   }
 
   private onBackground(): void {
+    this.commitPosition(); this.invalidateSnapshot();
     this.background = true; this.state.background = true; this.savePosition(true);
     if (this.history !== undefined) { this.history.flush(); }
     if (this.visible && this.state.wanted && this.engine !== undefined) { this.startBackground(); }
@@ -678,11 +722,13 @@ export class PlayController {
     if (!this.background || this.disposed || !this.visible || this.engine === undefined ||
       !this.state.loaded || this.state.audioOnly) { return; }
     try {
+      this.commitPosition(); this.invalidateSnapshot();
       this.clearRestore(); this.engine.video(false); this.state.audioOnly = true; this.emit();
       console.info('[PiliMini-mpv] audio-only paused=' + (!this.state.wanted).toString());
     } catch (error) { console.warn('[PiliMini-mpv] audio-only unavailable'); }
   }
   private onForeground(): void {
+    this.commitPosition(); this.invalidateSnapshot();
     this.background = false; this.state.background = false; this.clearBackgroundTimer(); BgAudio.stop(this.owner);
     if (this.disposed || !this.visible) { return; }
     this.readSystemVolume();
@@ -719,7 +765,7 @@ export class PlayController {
 
   suspend(): Promise<void> {
     if (this.disposed || !this.visible) { return this.nativeQueue; }
-    this.state.position = this.position(); this.savePosition(true);
+    this.commitPosition(); this.savePosition(true);
     if (this.history !== undefined) { this.history.flush(); }
     this.clearFocusResume();
     this.visible = false; this.generation++; this.surface = '';
@@ -738,7 +784,7 @@ export class PlayController {
 
   dispose(): Promise<void> {
     if (this.disposed) { return this.nativeQueue; }
-    this.state.position = this.position(); this.savePosition(true);
+    this.commitPosition(); this.savePosition(true);
     if (this.history !== undefined) { this.history.flush(); this.history = undefined; }
     this.clearFocusResume();
     this.disposed = true; this.generation++;

@@ -8,7 +8,8 @@ import { openMember } from '../../common/member_route';
 import { AsyncImage } from '../AsyncImage';
 import { GalleryThumbnail, nextGalleryId } from '../GalleryThumbnail';
 import { formatPlayCount } from '../VideoCard';
-import { DynItem, DynAuthor, DynArchive, DynPic, DynamicService } from '../../service/dynamic_service';
+import { DynItem, DynAuthor, DynPic, DynamicService } from '../../service/dynamic_service';
+import { DynamicVideoCard } from './DynamicVideoCard';
 
 function two(n: number): string {
   const s: string = n.toString();
@@ -83,93 +84,16 @@ export struct DynamicCard {
     }
   }
 
-  // ===== 视频卡（Nara video_panel：16:9 + 70 渐变底 + 时长chip + Play 50） =====
-  @Builder
-  AvBlock(ar: DynArchive, inset: boolean) {
-    Column({ space: 6 }) {
-      Stack({ alignContent: Alignment.Bottom }) {
-        Column() {
-          AsyncImage({ src: ar.cover, w: 640, h: 360 })
-        }
-        .width('100%')
-        .aspectRatio(16 / 9)
-        .borderRadius(6)
-        .clip(true)
-        .backgroundColor($r('app.color.btn_soft_bg'))
-
-        Row({ space: 6 }) {
-          Text(ar.durationText)
-            .fontSize(11)
-            .fontColor('#FFFFFF')
-            .backgroundColor('#73000000')
-            .borderRadius(4)
-            .padding({ left: 4, right: 4, top: 1, bottom: 1 })
-          Text(formatPlayCount(ar.play) + '播放')
-            .fontSize(11)
-            .fontColor('#FFFFFF')
-          Text(formatPlayCount(ar.danmaku) + '弹幕')
-            .fontSize(11)
-            .fontColor('#FFFFFF')
-          Blank()
-          Column() {
-            Image($r('app.media.icon_play'))
-              .width(24)
-              .height(24)
-              .fillColor('#FFFFFF')
-          }
-          .width(50)
-          .height(50)
-          .borderRadius(25)
-          .backgroundColor('#59000000')
-          .justifyContent(FlexAlign.Center)
-        }
-        .width('100%')
-        .height(70)
-        .padding({ left: 10, right: 8, bottom: 8 })
-        .alignItems(VerticalAlign.Bottom)
-        .linearGradient({
-          angle: 180,
-          colors: [['#00000000', 0.0], ['#8A000000', 1.0]]
-        })
-      }
-      .width('100%')
-
-      Text(ar.title)
-        .fontSize(14)
-        .fontWeight(FontWeight.Bold)
-        .fontColor($r('app.color.text_primary'))
-        .maxLines(1)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-        .width('100%')
-    }
-    .width('100%')
-    .padding({ left: inset ? 12 : 0, right: inset ? 12 : 0 })
-    .alignItems(HorizontalAlign.Start)
-  }
-
-  /** 卡片点击目标：视频（自身/转发内嵌）→ 视频详情；图文等 → 动态详情页 */
-  private navBvid(): string {
-    if (this.model.kind === 'av' && this.model.archive !== undefined && this.model.archive.bvid.length > 0) {
-      return this.model.archive.bvid;
-    }
-    if (this.model.kind === 'forward' && this.model.orig !== undefined
-      && this.model.orig.kind === 'av' && this.model.orig.archive !== undefined
-      && this.model.orig.archive.bvid.length > 0) {
-      return this.model.orig.archive.bvid;
-    }
-    return '';
-  }
-
-  private onCardTap(): void {
-    const bvid: string = this.navBvid();
-    if (bvid.length > 0) {
-      const params: Record<string, string> = { 'bvid': bvid };
+  /** Nara pushDynDetail：转发外层与引用块各自按自己的类型分流。 */
+  private openItem(item: DynItem, viewComment: boolean = false): void {
+    if (!viewComment && item.kind === 'av' && item.archive !== undefined && item.archive.bvid.length > 0) {
+      const params: Record<string, string> = { 'bvid': item.archive.bvid };
       router.pushUrl({ url: 'pages/video/VideoDetailPage', params: params });
       return;
     }
-    // 图文/纯文本/转发（非视频）：动态详情页（Nara 同构）
-    DynamicService.putDetail(this.model);
-    const dp: Record<string, string> = { 'id': this.model.id };
+    DynamicService.putDetail(item);
+    const dp: Record<string, string> = { 'id': item.id };
+    if (viewComment) { dp['viewComment'] = '1'; }
     router.pushUrl({ url: 'pages/dynamic/DynDetailPage', params: dp });
   }
 
@@ -289,6 +213,7 @@ export struct DynamicCard {
         .fontSize(14)
         .fontWeight(FontWeight.Medium)
         .fontColor($r('app.color.text_primary'))
+        .onClick(() => { openMember(orig.author.mid); })
       if (orig.text.length > 0) {
         Text(orig.text)
           .fontSize(14)
@@ -297,7 +222,7 @@ export struct DynamicCard {
           .width('100%')
       }
       if (orig.kind === 'av' && orig.archive !== undefined) {
-        this.AvBlock(orig.archive, false)
+        DynamicVideoCard({ archive: orig.archive })
       } else if (orig.kind === 'draw' && orig.pics !== undefined && orig.pics.length > 0) {
         this.PicsGrid(orig.pics, false)
       }
@@ -306,6 +231,7 @@ export struct DynamicCard {
     .padding({ left: 15, right: 15, top: 8, bottom: 8 })
     .backgroundColor('#0D000000')
     .alignItems(HorizontalAlign.Start)
+    .onClick(() => { this.openItem(orig); })
   }
 
   // ===== 互动提示行（Nara interaction：左侧 1.5px 竖线 + 13sp） =====
@@ -324,9 +250,9 @@ export struct DynamicCard {
       .margin({ left: 12, right: 12, top: 6 })
   }
 
-  // ===== 行动栏（展示用：图标 16 + 数字） =====
+  // ===== 行动栏：每个入口独立命中，评论强制进入当前动态并定位评论 =====
   @Builder
-  ActBtn(icon: Resource, label: string) {
+  ActBtn(icon: Resource, label: string, comment: boolean) {
     Row({ space: 4 }) {
       Image(icon)
         .width(16)
@@ -336,14 +262,18 @@ export struct DynamicCard {
         .fontSize(12)
         .fontColor($r('app.color.text_secondary'))
     }
+    .layoutWeight(1)
+    .height(36)
+    .justifyContent(FlexAlign.Center)
+    .onClick(() => { if (comment) { this.openItem(this.model, true); } })
   }
 
   @Builder
   Actions(item: DynItem) {
     Row() {
-      this.ActBtn($r('app.media.icon_forward'), item.forwardCount > 0 ? formatPlayCount(item.forwardCount) : '转发')
-      this.ActBtn($r('app.media.icon_comment'), item.commentCount > 0 ? formatPlayCount(item.commentCount) : '评论')
-      this.ActBtn($r('app.media.icon_thumbup'), item.likeCount > 0 ? formatPlayCount(item.likeCount) : '赞')
+      this.ActBtn($r('app.media.icon_forward'), item.forwardCount > 0 ? formatPlayCount(item.forwardCount) : '转发', false)
+      this.ActBtn($r('app.media.icon_comment'), item.commentCount > 0 ? formatPlayCount(item.commentCount) : '评论', true)
+      this.ActBtn($r('app.media.icon_thumbup'), item.likeCount > 0 ? formatPlayCount(item.likeCount) : '赞', false)
     }
     .width('100%')
     .justifyContent(FlexAlign.SpaceAround)
@@ -362,7 +292,7 @@ export struct DynamicCard {
         this.DescBlock(this.model)
 
         if (this.model.kind === 'av' && this.model.archive !== undefined) {
-          this.AvBlock(this.model.archive, true)
+          DynamicVideoCard({ archive: this.model.archive })
         } else if (this.model.kind === 'draw' && this.model.pics !== undefined && this.model.pics.length > 0) {
           this.PicsGrid(this.model.pics, true)
         } else if (this.model.kind === 'forward' && this.model.orig !== undefined) {
@@ -393,6 +323,7 @@ export struct DynamicCard {
       .width('100%')
       .padding({ left: 12, right: 12, bottom: 6 })
       .alignItems(HorizontalAlign.Start)
+      .onClick(() => { this.openItem(this.model); })
 
       if (this.model.interactText.length > 0) {
         this.InteractRow(this.model.interactText)
@@ -402,8 +333,5 @@ export struct DynamicCard {
     }
     .width('100%')
     .alignItems(HorizontalAlign.Start)
-    .onClick(() => {
-      this.onCardTap();
-    })
   }
 }

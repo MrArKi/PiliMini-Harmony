@@ -10,7 +10,9 @@ import { AuthService, UserInfo, RelStat } from '../../service/auth_service';
 import { HistoryService, HistoryItem, HistoryPage } from '../../service/history_service';
 import { FavService, FavFolder, FavFolderPage } from '../../service/fav_service';
 import { FavFolderCard } from '../../components/FavFolderCard';
-import { onAuthLogout, onHistoryChanged } from '../../infra/event/app_events';
+import { onAuthLogout, onHistoryChanged, onFollowChanged, FollowChanged } from '../../infra/event/app_events';
+import { getJson, parseEnvelope, ensureOk } from '../../infra/http/http';
+import { API_BASE } from '../../config/constants';
 import { formatPlayCount, formatDuration } from '../../components/VideoCard';
 import { thumbUrl } from '../../infra/image/bili_image';
 import { prefsGet, prefsDelete } from '../../infra/storage/prefs';
@@ -22,6 +24,7 @@ interface MineEntry {
   icon: Resource;
   url: string;
 }
+interface RelationCountData { following?: number; follower?: number; }
 
 @Component
 export struct MineTab {
@@ -41,6 +44,9 @@ export struct MineTab {
   @StorageProp('statusBarHeight') statusBarH: number = 0;
   private offAuth: (() => void) | undefined = undefined;
   private offHistory: (() => void) | undefined = undefined;
+  private offFollow: (() => void) | undefined = undefined;
+  private statDirty: boolean = false;
+  private statRequest: number = 0;
   private historyDirty: boolean = false;
   private historyRequest: number = 0;
   private destroyed: boolean = false;
@@ -71,16 +77,22 @@ export struct MineTab {
       this.historyDirty = true;
       if (this.active) { this.loadHistory(); }
     });
+    this.offFollow = onFollowChanged((change: FollowChanged): void => {
+      if (change.revision !== CookieStore.sessionRevision()) { return; }
+      this.statDirty = true;
+      if (this.active && this.loadedMid > 0) { this.loadStat(this.loadedMid); }
+    });
   }
 
   aboutToDisappear(): void {
     this.destroyed = true;
-    this.accountRequest++; this.historyRequest++; this.folderRequest++;
+    this.accountRequest++; this.historyRequest++; this.folderRequest++; this.statRequest++;
     if (this.offAuth !== undefined) {
       this.offAuth();
       this.offAuth = undefined;
     }
     if (this.offHistory !== undefined) { this.offHistory(); this.offHistory = undefined; }
+    if (this.offFollow !== undefined) { this.offFollow(); this.offFollow = undefined; }
   }
 
   /** 主壳从其它页面返回（登录态可能变化） */
@@ -93,6 +105,7 @@ export struct MineTab {
     if (this.destroyed) { return; }
     if (this.user !== null && mid === this.loadedMid.toString()) {
       if (this.historyDirty) { this.loadHistory(); }
+      if (this.active && this.statDirty) { this.loadStat(this.loadedMid); }
       return;
     }
     this.refresh();
@@ -100,6 +113,7 @@ export struct MineTab {
 
   onActive(): void {
     if (this.active && this.historyDirty) { this.loadHistory(); }
+    if (this.active && this.statDirty && this.loadedMid > 0) { this.loadStat(this.loadedMid); }
   }
 
   private async refresh(): Promise<void> {
@@ -115,6 +129,7 @@ export struct MineTab {
       if (u === null) {
         this.historyRequest++; this.folderRequest++;
         this.loadedMid = 0;
+        this.statRequest++; this.statDirty = false;
         this.rel = { following: 0, follower: 0 };
         this.history = []; this.folders = [];
         this.historyDs.reload([]); this.folderDs.reload([]);
@@ -126,9 +141,11 @@ export struct MineTab {
       // 同账号普通路由返回不重拉/重建卡片；真实观看事件已单独标脏。
       if (this.loadedMid === u.mid) {
         if (this.historyDirty) { this.loadHistory(); }
+        if (this.active && this.statDirty) { this.loadStat(u.mid); }
         return;
       }
       this.historyRequest++; this.folderRequest++;
+      this.statRequest++; this.statDirty = true;
       this.rel = { following: 0, follower: 0 };
       this.history = []; this.folders = []; this.folderTotal = 0;
       this.historyDs.reload([]); this.folderDs.reload([]);
@@ -147,10 +164,33 @@ export struct MineTab {
   }
 
   private async loadStat(mid: number): Promise<void> {
-    const s: RelStat = await AuthService.relationStat(mid);
-    if (!this.destroyed && mid === this.loadedMid) {
-      this.rel = s;
+    if (mid <= 0) { return; }
+    const request: number = ++this.statRequest;
+    this.statDirty = false;
+    const revision: number = CookieStore.sessionRevision();
+    try {
+      const cookie: string = await CookieStore.getRaw();
+      if (this.destroyed || request !== this.statRequest || revision !== CookieStore.sessionRevision()) { return; }
+      const owner: RegExpMatchArray | null = cookie.match(/(?:^|;\s*)DedeUserID=(\d+)(?:;|$)/);
+      if (!owner || Number(owner[1]) !== mid) { this.statDirty = true; return; }
+      const raw: string = await getJson(API_BASE + '/x/relation/stat?vmid=' + mid.toString(), { 'Cookie': cookie });
+      if (this.destroyed || request !== this.statRequest || revision !== CookieStore.sessionRevision()
+        || mid !== this.loadedMid) { return; }
+      const response = parseEnvelope<RelationCountData>(raw); ensureOk(response);
+      if (!response.data || response.data.following === undefined || response.data.follower === undefined) {
+        throw new Error('关注数量未返回');
+      }
+      this.rel = { following: response.data.following, follower: response.data.follower };
+      this.statDirty = false;
+    } catch (_) {
+      if (!this.destroyed && request === this.statRequest && revision === CookieStore.sessionRevision()
+        && mid === this.loadedMid) { this.statDirty = true; }
     }
+  }
+
+  private openFollow(): void {
+    if (!this.user || this.loadedMid <= 0) { router.pushUrl({ url: 'pages/login/LoginPage' }); return; }
+    router.pushUrl({ url: 'pages/follow/FollowPage' });
   }
 
   private async loadHistory(): Promise<void> {
@@ -355,6 +395,11 @@ export struct MineTab {
               .fontColor($r('app.color.text_secondary'))
           }
           .layoutWeight(1)
+          .height('100%')
+          .justifyContent(FlexAlign.Center)
+          .id('mine_follow_entry')
+          .accessibilityText('我的关注')
+          .onClick(() => { this.openFollow(); })
 
           Column({ space: 3 }) {
             Text(formatPlayCount(this.rel.follower))

@@ -9,6 +9,8 @@ import { thumbUrl } from '../../infra/image/bili_image';
 import { BasicDataSource } from '../../common/list_data_source';
 import { Pager, PageData } from '../../common/paged_feed';
 import { VideoCardGrid } from '../../components/VideoCardGrid';
+import { FeedFilterDialog } from '../../components/FeedFilterDialog';
+import { FeedFilterService } from '../../service/feed_filter_service';
 import { LoadingFooter, ErrorRetry, EmptyState } from '../../components/StateViews';
 import { AsyncImage } from '../../components/AsyncImage';
 import { FeedCategoryBar } from '../../components/FeedCategoryBar';
@@ -26,6 +28,7 @@ struct FeedList {
   /** 上滑收起顶栏（首行进入视口即收起，与 Nara 一致） */
   onCollapse: (collapsed: boolean) => void = () => {
   };
+  onFeedback: (mode: string, item: VideoItem) => void = () => {};
   /** 自增即滚回顶部（系统返回键回首页时用） */
   @Prop @Watch('onTopTick') topTick: number = 0;
   @Prop @Watch('onNavRequest') navRequest: FeedNavRequest = new FeedNavRequest();
@@ -38,6 +41,16 @@ struct FeedList {
   private collapsedLocal: boolean = false;
   private destroyed: boolean = false;
   private refreshRunning: boolean = false;
+  private rawItems: VideoItem[] = [];
+  private fetchGeneration: number = 0;
+  @State hiddenPageCount: number = 0;
+  @State visibleCount: number = 0;
+  private filtersChanged: () => void = (): void => {
+    if (!this.destroyed) {
+      const items: VideoItem[] = this.rawItems.filter((item: VideoItem): boolean => !FeedFilterService.matches(item));
+      this.visibleCount = items.length; this.ds.reload(items);
+    }
+  };
 
   private onNavRequest(): void {
     if (!this.selected || this.destroyed || this.pager.loading || this.refreshRunning) { return; }
@@ -60,26 +73,48 @@ struct FeedList {
   }
 
   aboutToAppear(): void {
+    FeedFilterService.subscribe(this.filtersChanged);
     this.reload();
   }
 
-  aboutToDisappear(): void { this.destroyed = true; this.pager.cancel(); }
+  aboutToDisappear(): void {
+    this.destroyed = true; this.fetchGeneration++; this.pager.cancel(); FeedFilterService.unsubscribe(this.filtersChanged);
+    this.rawItems = [];
+  }
 
-  private async fetchPage(cursor: string): Promise<PageData<VideoItem>> {
+  private async fetchPage(cursor: string, generation: number): Promise<PageData<VideoItem>> {
+    await FeedFilterService.ready();
     const pn: number = parseInt(cursor, 10);
     const r: PageResult = this.source === 'hot'
       ? await VideoService.hot(pn, 20)
       : await VideoService.rcmd(pn, 20);
+    const firstPage: boolean = cursor === this.pager.initialCursor;
+    const seen: Set<string> = new Set<string>();
+    if (!firstPage) { this.rawItems.forEach((item: VideoItem): void => { seen.add(item.bvid); }); }
+    const added: VideoItem[] = [];
+    for (let i: number = 0; i < r.items.length; i++) {
+      const item: VideoItem = r.items[i];
+      if (item.bvid.length > 0 && !seen.has(item.bvid)) { seen.add(item.bvid); added.push(item); }
+    }
+    const visible: VideoItem[] = added.filter((item: VideoItem): boolean => !FeedFilterService.matches(item));
+    if (!this.destroyed && generation === this.fetchGeneration) {
+      this.rawItems = firstPage ? added : this.rawItems.concat(added);
+      this.hiddenPageCount = visible.length === 0 ? this.hiddenPageCount + 1 : 0;
+      this.visibleCount = this.rawItems.filter((item: VideoItem): boolean => !FeedFilterService.matches(item)).length;
+    }
     const out: PageData<VideoItem> = {
-      items: r.items,
-      hasMore: r.hasMore,
+      items: visible,
+      hasMore: r.hasMore && r.nextCursor.toString() !== cursor,
       nextCursor: r.nextCursor.toString()
     };
     return out;
   }
 
   private async reload(): Promise<void> {
-    await this.pager.reload(this.ds, (cursor: string): Promise<PageData<VideoItem>> => this.fetchPage(cursor));
+    if (this.destroyed || this.pager.loading) { return; }
+    this.hiddenPageCount = 0;
+    const generation: number = ++this.fetchGeneration;
+    await this.pager.reload(this.ds, (cursor: string): Promise<PageData<VideoItem>> => this.fetchPage(cursor, generation));
   }
 
   private async refresh(): Promise<void> {
@@ -94,9 +129,10 @@ struct FeedList {
     }
   }
 
-  private async loadMore(): Promise<void> {
-    if (this.destroyed) { return; }
-    await this.pager.loadMore(this.ds, (cursor: string): Promise<PageData<VideoItem>> => this.fetchPage(cursor));
+  private async loadMore(automatic: boolean = false): Promise<void> {
+    if (this.destroyed || (automatic && this.hiddenPageCount >= 3)) { return; }
+    const generation: number = this.fetchGeneration;
+    await this.pager.loadMore(this.ds, (cursor: string): Promise<PageData<VideoItem>> => this.fetchPage(cursor, generation));
   }
 
   @Builder
@@ -152,13 +188,23 @@ struct FeedList {
 
             LazyForEach(this.ds, (item: VideoItem) => {
               GridItem() {
-                VideoCardGrid({ model: item, horizontal: this.source === 'hot' })
+                VideoCardGrid({ model: item, horizontal: this.source === 'hot', onFeedback: this.onFeedback })
               }
               .width('100%')
             }, (item: VideoItem) => item.key)
 
             GridItem() {
               Column() {
+                if (this.visibleCount === 0 && !this.pager.loadingMore) {
+                  Text('暂无可展示内容，可在屏蔽管理中解除规则')
+                    .fontSize(12).fontColor($r('app.color.text_secondary')).margin({ bottom: 12 })
+                }
+                if ((this.visibleCount === 0 || this.hiddenPageCount >= 3) && this.pager.hasMore &&
+                  !this.pager.loading && !this.pager.loadingMore) {
+                  Button('继续加载', { type: ButtonType.Normal }).fontSize(13)
+                    .fontColor($r('app.color.brand_pink')).backgroundColor(Color.Transparent)
+                    .height(40).onClick(() => { this.hiddenPageCount = 0; this.loadMore(); })
+                }
                 if (this.pager.footerText.length > 0) {
                   Text(this.pager.footerText)
                     .fontSize(12)
@@ -192,7 +238,7 @@ struct FeedList {
               this.onCollapse(collapsed);
             }
             if (last >= this.ds.totalCount() - 4) {
-              this.loadMore();
+              this.loadMore(true);
             }
           })
         }
@@ -233,6 +279,17 @@ export struct HomeTab {
   onGoMine: () => void = () => {
   };
   private destroyed: boolean = false;
+  private feedbackDialog: CustomDialogController | undefined = undefined;
+
+  private openFeedback(mode: string, item: VideoItem | undefined = undefined): void {
+    if (this.destroyed) { return; }
+    if (this.feedbackDialog !== undefined) { this.feedbackDialog.close(); }
+    this.feedbackDialog = new CustomDialogController({
+      builder: FeedFilterDialog({ mode: mode, model: item }), customStyle: true,
+      alignment: DialogAlignment.Center, autoCancel: true
+    });
+    this.feedbackDialog.open();
+  }
 
   private onNavRequest(): void {
     const requests: FeedNavRequest[] = this.feedNavRequests.slice();
@@ -242,15 +299,18 @@ export struct HomeTab {
 
   aboutToAppear(): void {
     this.loadUser();
+    FeedFilterService.refreshSessionBlocks().catch((): void => {});
   }
 
   aboutToDisappear(): void {
     this.destroyed = true;
+    if (this.feedbackDialog !== undefined) { this.feedbackDialog.close(); this.feedbackDialog = undefined; }
   }
 
   /** 主壳从其它页面返回（登录态/材质等级可能变化） */
   onShown(): void {
     this.loadUser();
+    FeedFilterService.refreshSessionBlocks().catch((): void => {});
   }
 
   private async loadUser(): Promise<void> {
@@ -418,6 +478,7 @@ export struct HomeTab {
         TabContent() {
           FeedList({
             source: 'rcmd',
+            onFeedback: (mode: string, item: VideoItem): void => { this.openFeedback(mode, item); },
             selected: this.mode === 0,
             navRequest: this.feedNavRequests[0],
             topInset: this.feedTopInset(),
@@ -431,6 +492,7 @@ export struct HomeTab {
         TabContent() {
           FeedList({
             source: 'hot',
+            onFeedback: (mode: string, item: VideoItem): void => { this.openFeedback(mode, item); },
             selected: this.mode === 1,
             navRequest: this.feedNavRequests[1],
             topInset: this.feedTopInset(),

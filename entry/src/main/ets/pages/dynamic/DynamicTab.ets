@@ -15,21 +15,25 @@ import { DynamicService, DynItem, DynPageResult } from '../../service/dynamic_se
 import { CookieStore } from '../../infra/cookie/cookie_store';
 import { AppError } from '../../infra/error/app_error';
 import { FeedNavigation, FeedNavRequest } from '../../common/feed_navigation';
+import { DynamicUnread } from '../../infra/event/dynamic_unread';
 
 @Component
 struct DynFeedList {
   @Prop dynType: string = 'all';
   @Prop filterKind: string = ''; // 客户端过滤：如 'draw'（图文 chip 用）
-  @Prop selected: boolean = false;
+  @Prop @Watch('onSelected') selected: boolean = false;
   @Prop @Watch('onNavRequest') navRequest: FeedNavRequest = new FeedNavRequest();
   private navigation: FeedNavigation = new FeedNavigation();
   private destroyed: boolean = false;
   private reloading: boolean = false;
   private refreshRunning: boolean = false;
+  private firstPageBaseline: string = '';
+  private firstPageCookieRevision: number = -1;
   private ds: BasicDataSource<DynItem> = new BasicDataSource<DynItem>();
   @State pager: Pager<DynItem> = new Pager<DynItem>();
   @State needLogin: boolean = false;
   @State refreshing: boolean = false;
+  @State refreshPullOffset: number = 0;
 
   aboutToAppear(): void {
     this.pager.initialCursor = ''; // 动态流首页 offset 为空串
@@ -38,6 +42,13 @@ struct DynFeedList {
 
   aboutToDisappear(): void { this.destroyed = true; this.pager.cancel(); }
 
+  private onSelected(): void {
+    // Nara setIndex：跨底栏只切页；保活列表不因未读、前台恢复或详情返回刷新/归顶。
+    if (this.selected && !this.destroyed && !this.pager.firstLoaded && !this.reloading) {
+      this.reload();
+    }
+  }
+
   private onNavRequest(): void {
     if (!this.selected || this.destroyed || this.reloading || this.refreshRunning) { return; }
     if (this.navigation.shouldRefresh(this.navRequest, this.pager.firstLoaded && !this.needLogin)) { this.refresh(); }
@@ -45,7 +56,12 @@ struct DynFeedList {
 
   private async fetchFeed(cursor: string): Promise<PageData<DynItem>> {
     try {
+      const cookieRevision: number = CookieStore.sessionRevision();
       const r: DynPageResult = await DynamicService.feed(this.dynType, cursor);
+      if (cursor.length === 0) {
+        this.firstPageBaseline = r.updateBaseline || '';
+        this.firstPageCookieRevision = cookieRevision;
+      }
       let items: DynItem[] = r.items;
       if (this.filterKind.length > 0) {
         items = items.filter((it: DynItem) => it.kind === this.filterKind);
@@ -78,9 +94,16 @@ struct DynFeedList {
         this.needLogin = true;
         return;
       }
+      const previousCursor: string = this.pager.cursor;
       const loaded: boolean = await this.pager.reload(this.ds,
         (cursor: string): Promise<PageData<DynItem>> => this.fetchFeed(cursor));
-      if (!loaded) { return; }
+      if (!loaded) {
+        if (!this.destroyed && this.pager.firstLoaded) { this.pager.cursor = previousCursor; }
+        return;
+      }
+      if (!this.destroyed && this.selected) {
+        DynamicUnread.markRead(this.firstPageBaseline, this.firstPageCookieRevision).catch(() => {});
+      }
       // 客户端过滤后首页可能为空：仅成功的空页续拉，失败立即停止。
       let guard: number = 0;
       while (!this.destroyed && this.ds.size() === 0 && this.pager.hasMore && guard < 10) {
@@ -107,6 +130,26 @@ struct DynFeedList {
       this.refreshRunning = false;
       if (!this.destroyed) { this.refreshing = false; }
     }
+  }
+
+  @Builder
+  EmptyRefreshIndicator() { Row().width('100%').height(0) }
+
+  /** 与首页一致：原生Refresh推动内容，圆环在新增下拉空白中居中并随位移缩放。 */
+  @Builder
+  FeedRefreshIndicator() {
+    Row() {
+      LoadingProgress().width(28).height(28).color($r('app.color.brand_pink'))
+    }
+    .width(49).height(49).justifyContent(FlexAlign.Center)
+    .backgroundColor($r('app.color.card_bg')).borderRadius(24.5)
+    .shadow({ radius: 2, color: '#33000000', offsetY: 2 })
+    .position({ x: '50%', y: this.refreshPullOffset / 2 - 24.5 })
+    .translate({ x: -24.5 })
+    .scale({ x: Math.min(1, this.refreshPullOffset / 64),
+      y: Math.min(1, this.refreshPullOffset / 64) })
+    .hitTestBehavior(HitTestMode.None)
+    .accessibilityText('正在刷新')
   }
 
   // ===== 未登录引导（spec-08 验收 6） =====
@@ -168,7 +211,8 @@ struct DynFeedList {
           .layoutWeight(1)
           .justifyContent(FlexAlign.Center)
         } else {
-          Refresh({ refreshing: $$this.refreshing }) {
+          Stack({ alignContent: Alignment.Top }) {
+          Refresh({ refreshing: $$this.refreshing, builder: this.EmptyRefreshIndicator() }) {
             List({ scroller: this.navigation.scroller }) {
               LazyForEach(this.ds, (item: DynItem) => {
                 ListItem() {
@@ -204,11 +248,15 @@ struct DynFeedList {
               this.loadMore();
             })
           }
+          .refreshOffset(64)
+          .onOffsetChange((offset: number): void => { this.refreshPullOffset = Math.max(0, offset); })
           .onRefreshing(() => {
             this.refresh();
           })
-          .layoutWeight(1)
+          .height('100%')
           .width('100%')
+          if (this.refreshPullOffset > 0) { this.FeedRefreshIndicator() }
+          }.layoutWeight(1).width('100%')
         }
       }
       .width('100%')
@@ -258,9 +306,9 @@ export struct DynamicTab {
 
       if (this.visited) {
         Tabs({ index: this.mode, controller: this.feedTabs }) {
-          TabContent() { DynFeedList({ dynType: 'all', filterKind: '', selected: this.mode === 0, navRequest: this.feedNavRequests[0] }) }
-          TabContent() { DynFeedList({ dynType: 'video', filterKind: '', selected: this.mode === 1, navRequest: this.feedNavRequests[1] }) }
-          TabContent() { DynFeedList({ dynType: 'all', filterKind: 'draw', selected: this.mode === 2, navRequest: this.feedNavRequests[2] }) }
+          TabContent() { DynFeedList({ dynType: 'all', filterKind: '', selected: this.active && this.mode === 0, navRequest: this.feedNavRequests[0] }) }
+          TabContent() { DynFeedList({ dynType: 'video', filterKind: '', selected: this.active && this.mode === 1, navRequest: this.feedNavRequests[1] }) }
+          TabContent() { DynFeedList({ dynType: 'all', filterKind: 'draw', selected: this.active && this.mode === 2, navRequest: this.feedNavRequests[2] }) }
         }
         .barHeight(0).layoutWeight(1).width('100%').animationDuration(300)
         .onContentDidScroll((_selected: number, index: number, position: number): void => {

@@ -5,6 +5,7 @@
 #include <atomic>
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -18,6 +19,14 @@ namespace {
 constexpr unsigned DOMAIN = 0x3200;
 std::atomic<int> eventThreads{0};
 struct Event { std::string type; int code; };
+struct SnapshotData {
+    double position = 0, duration = 0, buffered = 0, width = 0, height = 0;
+    double avSyncMs = 0, cacheBytes = 0;
+    bool paused = false, buffering = false, seeking = false, ended = false, audioReady = false;
+    bool videoEnabled = false, outputReady = false, syncValid = false;
+    std::string decoder, videoCodec;
+    std::chrono::steady_clock::time_point sampledAt;
+};
 
 napi_value Text(napi_env env, const std::string &text) {
     napi_value value; napi_create_string_utf8(env, text.c_str(), text.size(), &value); return value;
@@ -75,6 +84,8 @@ public:
     napi_threadsafe_function callback = nullptr;
     std::atomic<bool> closing{false};
     std::thread events;
+    std::mutex snapshotMutex;
+    std::once_flag closeOnce;
 
     ~Engine() { Close(); }
     void Option(const char *key, const std::string &value) {
@@ -136,11 +147,15 @@ public:
         });
     }
     void Close() {
-        if (closing.exchange(true)) return;
-        if (mpv) mpv_wakeup(mpv);
-        if (events.joinable()) events.join();
-        else if (callback) { napi_release_threadsafe_function(callback, napi_tsfn_abort); callback = nullptr; }
-        if (mpv) { mpv_terminate_destroy(mpv); mpv = nullptr; }
+        // 并发Close都等待同一次实际关闭；不持读取锁join事件线程。
+        std::call_once(closeOnce, [this]() {
+            closing.store(true);
+            if (mpv) mpv_wakeup(mpv);
+            if (events.joinable()) events.join();
+            else if (callback) { napi_release_threadsafe_function(callback, napi_tsfn_abort); callback = nullptr; }
+            std::lock_guard<std::mutex> lock(snapshotMutex);
+            if (mpv) { mpv_terminate_destroy(mpv); mpv = nullptr; }
+        });
     }
     void Command(const std::vector<std::string> &args) {
         std::vector<const char *> values;
@@ -171,6 +186,29 @@ public:
     std::string TextValue(const char *key) {
         char *value = mpv_get_property_string(mpv, key);
         std::string result = value ? value : ""; mpv_free(value); return result;
+    }
+    SnapshotData ReadSnapshot(bool diagnostics) {
+        std::lock_guard<std::mutex> lock(snapshotMutex);
+        if (closing.load() || !mpv) throw std::runtime_error("Player released");
+        SnapshotData value;
+        value.position = Value("time-pos") * 1000;
+        value.sampledAt = std::chrono::steady_clock::now();
+        value.duration = Value("duration") * 1000;
+        value.buffered = Value("demuxer-cache-time") * 1000;
+        value.width = Value("video-params/dw"); value.height = Value("video-params/dh");
+        if (diagnostics) {
+            value.decoder = TextValue("hwdec-current"); value.videoCodec = TextValue("video-codec");
+            double avSync = 0;
+            value.syncValid = mpv_get_property(mpv, "avsync", MPV_FORMAT_DOUBLE, &avSync) >= 0 && std::isfinite(avSync);
+            value.avSyncMs = value.syncValid ? avSync * 1000 : 0;
+            value.cacheBytes = CacheBytes();
+        }
+        value.paused = FlagValue("pause"); value.buffering = FlagValue("paused-for-cache");
+        value.seeking = FlagValue("seeking"); value.ended = FlagValue("eof-reached");
+        value.audioReady = Value("audio-params/samplerate") > 0;
+        value.videoEnabled = TextValue("vid") != "no";
+        value.outputReady = FlagValue("vo-configured") && Value("video-out-params/w") > 0 && Value("video-out-params/h") > 0;
+        return value;
     }
 };
 
@@ -383,43 +421,91 @@ napi_value Set(napi_env env, napi_callback_info info) {
     } catch (const std::exception &error) { napi_throw_error(env, nullptr, error.what()); return nullptr; }
 }
 
-napi_value Snapshot(napi_env env, napi_callback_info info) {
+napi_value SnapshotValue(napi_env env, const SnapshotData &data) {
+    napi_value value; napi_create_object(env, &value);
+    napi_set_named_property(env, value, "position", Number(env, data.position));
+    napi_set_named_property(env, value, "duration", Number(env, data.duration));
+    napi_set_named_property(env, value, "buffered", Number(env, data.buffered));
+    napi_set_named_property(env, value, "width", Number(env, data.width));
+    napi_set_named_property(env, value, "height", Number(env, data.height));
+    napi_set_named_property(env, value, "decoder", Text(env, data.decoder));
+    napi_set_named_property(env, value, "videoCodec", Text(env, data.videoCodec));
+    napi_set_named_property(env, value, "avSyncMs", Number(env, data.avSyncMs));
+    napi_set_named_property(env, value, "cacheBytes", Number(env, data.cacheBytes));
+    const double age = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - data.sampledAt).count();
+    napi_set_named_property(env, value, "sampleAgeMs", Number(env, std::max(0.0, age)));
+    Bool(env, value, "syncValid", data.syncValid); Bool(env, value, "paused", data.paused);
+    Bool(env, value, "buffering", data.buffering); Bool(env, value, "seeking", data.seeking);
+    Bool(env, value, "ended", data.ended); Bool(env, value, "audioReady", data.audioReady);
+    Bool(env, value, "videoEnabled", data.videoEnabled); Bool(env, value, "outputReady", data.outputReady);
+    return value;
+}
+
+struct SnapshotJob {
+    napi_async_work work = nullptr;
+    napi_deferred result = nullptr;
+    napi_async_cleanup_hook_handle cleanup = nullptr;
+    napi_env owner = nullptr;
+    std::shared_ptr<Engine> engine;
+    SnapshotData value;
+    std::string error;
+    std::atomic<bool> abandoned{false};
+    bool diagnostics = false;
+};
+
+napi_value SnapshotAsync(napi_env env, napi_callback_info info) {
     try {
         size_t argc = 2; napi_value args[2]; napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
         if (argc < 1) throw std::runtime_error("Invalid snapshot arguments");
-        auto engine = Get(env, args[0]);
-        const bool diagnostics = argc > 1 && Flag(env, args[1]);
-        napi_value value; napi_create_object(env, &value);
-        napi_set_named_property(env, value, "position", Number(env, engine->Value("time-pos") * 1000));
-        napi_set_named_property(env, value, "duration", Number(env, engine->Value("duration") * 1000));
-        napi_set_named_property(env, value, "buffered", Number(env, engine->Value("demuxer-cache-time") * 1000));
-        napi_set_named_property(env, value, "width", Number(env, engine->Value("video-params/dw")));
-        napi_set_named_property(env, value, "height", Number(env, engine->Value("video-params/dh")));
-        napi_set_named_property(env, value, "decoder", Text(env, diagnostics ? engine->TextValue("hwdec-current") : ""));
-        napi_set_named_property(env, value, "videoCodec", Text(env, diagnostics ? engine->TextValue("video-codec") : ""));
-        double avSync = 0;
-        const bool syncValid = diagnostics && mpv_get_property(engine->mpv, "avsync", MPV_FORMAT_DOUBLE, &avSync) >= 0 && std::isfinite(avSync);
-        napi_set_named_property(env, value, "avSyncMs", Number(env, syncValid ? avSync * 1000 : 0));
-        napi_set_named_property(env, value, "cacheBytes", Number(env, diagnostics ? engine->CacheBytes() : 0));
-        Bool(env, value, "syncValid", syncValid);
-        Bool(env, value, "paused", engine->FlagValue("pause"));
-        Bool(env, value, "buffering", engine->FlagValue("paused-for-cache"));
-        Bool(env, value, "seeking", engine->FlagValue("seeking"));
-        Bool(env, value, "ended", engine->FlagValue("eof-reached"));
-        Bool(env, value, "audioReady", engine->Value("audio-params/samplerate") > 0);
-        Bool(env, value, "videoEnabled", engine->TextValue("vid") != "no");
-        Bool(env, value, "outputReady", engine->FlagValue("vo-configured") &&
-            engine->Value("video-out-params/w") > 0 && engine->Value("video-out-params/h") > 0);
-        return value;
+        auto snapshot = std::make_unique<SnapshotJob>();
+        snapshot->owner = env; snapshot->engine = Get(env, args[0]);
+        snapshot->diagnostics = argc > 1 && Flag(env, args[1]);
+        napi_value promise;
+        if (napi_create_promise(env, &snapshot->result, &promise) != napi_ok)
+            throw std::runtime_error("Cannot create snapshot promise");
+        const napi_status created = napi_create_async_work(env, nullptr, Text(env, "read libmpv snapshot"),
+            [](napi_env, void *data) {
+                auto *job = static_cast<SnapshotJob *>(data);
+                try { if (!job->abandoned.load()) job->value = job->engine->ReadSnapshot(job->diagnostics); }
+                catch (const std::exception &error) { job->error = error.what(); }
+                catch (...) { job->error = "Cannot read player snapshot"; }
+            },
+            [](napi_env env, napi_status status, void *data) {
+                std::unique_ptr<SnapshotJob> job(static_cast<SnapshotJob *>(data));
+                if (!job->abandoned.load()) {
+                    if (status != napi_ok || !job->error.empty())
+                        RejectCreation(env, job->result, job->error.empty() ? "Player snapshot cancelled" : job->error);
+                    else napi_resolve_deferred(env, job->result, SnapshotValue(env, job->value));
+                }
+                napi_delete_async_work(env, job->work);
+                if (job->cleanup) napi_remove_async_cleanup_hook(job->cleanup);
+            }, snapshot.get(), &snapshot->work);
+        const napi_status guarded = created == napi_ok ? napi_add_async_cleanup_hook(env,
+            [](napi_async_cleanup_hook_handle, void *data) {
+                auto *job = static_cast<SnapshotJob *>(data);
+                job->abandoned.store(true); napi_cancel_async_work(job->owner, job->work);
+            }, snapshot.get(), &snapshot->cleanup) : napi_generic_failure;
+        if (created != napi_ok || guarded != napi_ok || napi_queue_async_work(env, snapshot->work) != napi_ok) {
+            if (created == napi_ok) napi_delete_async_work(env, snapshot->work);
+            if (snapshot->cleanup) napi_remove_async_cleanup_hook(snapshot->cleanup);
+            RejectCreation(env, snapshot->result, "Cannot queue player snapshot");
+        } else snapshot.release();
+        return promise;
     } catch (const std::exception &error) { napi_throw_error(env, nullptr, error.what()); return nullptr; }
 }
 
-struct Disposal { napi_async_work work; napi_deferred result; std::shared_ptr<Engine> engine; uint32_t id; };
+struct Disposal {
+    napi_async_work work = nullptr; napi_deferred result = nullptr;
+    napi_async_cleanup_hook_handle cleanup = nullptr; napi_env owner = nullptr;
+    std::shared_ptr<Engine> engine; uint32_t id = 0;
+    std::atomic<bool> abandoned{false};
+};
 napi_value Dispose(napi_env env, napi_callback_info info) {
   try {
     size_t argc = 1; napi_value arg; napi_get_cb_info(env, info, &argc, &arg, nullptr, nullptr);
     if (argc != 1) throw std::runtime_error("Invalid dispose arguments");
     auto disposal = std::make_unique<Disposal>();
+    disposal->owner = env;
     disposal->id = Handle(env, arg);
     { std::lock_guard<std::mutex> lock(registryMutex);
       auto found = registry.find(disposal->id);
@@ -433,11 +519,21 @@ napi_value Dispose(napi_env env, napi_callback_info info) {
         [](napi_env, void *data) { auto *job = static_cast<Disposal *>(data); if (job->engine) job->engine->Close(); },
         [](napi_env env, napi_status, void *data) {
             std::unique_ptr<Disposal> job(static_cast<Disposal *>(data));
+            // cleanup取消了未执行的work时，仍必须关闭已从registry移出的实例。
+            if (job->engine) job->engine->Close();
             OH_LOG_Print(LOG_APP, LOG_INFO, DOMAIN, "PiliMini-mpv", "released handle=%{public}u", job->id);
-            napi_resolve_deferred(env, job->result, Undefined(env)); napi_delete_async_work(env, job->work);
+            if (!job->abandoned.load()) napi_resolve_deferred(env, job->result, Undefined(env));
+            napi_delete_async_work(env, job->work);
+            if (job->cleanup) napi_remove_async_cleanup_hook(job->cleanup);
         }, disposal.get(), &disposal->work);
-    if (created != napi_ok || napi_queue_async_work(env, disposal->work) != napi_ok) {
+    const napi_status guarded = created == napi_ok ? napi_add_async_cleanup_hook(env,
+        [](napi_async_cleanup_hook_handle, void *data) {
+            auto *job = static_cast<Disposal *>(data);
+            job->abandoned.store(true); napi_cancel_async_work(job->owner, job->work);
+        }, disposal.get(), &disposal->cleanup) : napi_generic_failure;
+    if (created != napi_ok || guarded != napi_ok || napi_queue_async_work(env, disposal->work) != napi_ok) {
         if (created == napi_ok) napi_delete_async_work(env, disposal->work);
+        if (disposal->cleanup) napi_remove_async_cleanup_hook(disposal->cleanup);
         // 任务创建失败时也必须释放句柄，不能丢失registry之外的原生对象。
         if (disposal->engine) disposal->engine->Close();
         napi_reject_deferred(env, disposal->result, Text(env, "Cannot queue player disposal"));
@@ -471,7 +567,7 @@ napi_value Init(napi_env env, napi_value exports) {
         {"load", nullptr, Load, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"command", nullptr, Command, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"set", nullptr, Set, nullptr, nullptr, nullptr, napi_default, nullptr},
-        {"snapshot", nullptr, Snapshot, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"snapshotAsync", nullptr, SnapshotAsync, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"dispose", nullptr, Dispose, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"stats", nullptr, Stats, nullptr, nullptr, nullptr, napi_default, nullptr}
     };

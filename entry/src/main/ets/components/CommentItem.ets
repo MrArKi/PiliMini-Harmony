@@ -1,9 +1,9 @@
 /**
- * 评论条目组件（spec-05 返工 R1~R9，1:1 对齐 PiliNara reply_item_grpc.dart）
+ * 评论条目组件（spec-05，Nara基准＋用户选定的只读点赞方案A）
  *  卡片 padding LTRB(12,14,8,5)｜头像 34（间距 12）｜名字 13sp + UP/TOP 徽章
- *  名字13/时间11头部后10｜正文14sp行高24.5｜操作前4（带图额外4）
+ *  名字13/时间11头部后10｜正文14sp行高24.5｜点赞移至头部右侧居中
  *  评论图片网格（R9）｜子回复浅灰容器radius6，外top5/bottom12（R1/R2）
- *  「共N条回复」→ 楼中楼面板（R3）｜操作行高 32，右侧点赞 icon16+数字（R4）
+ *  「共N条回复」→ 楼中楼面板（R3）｜只读点赞icon16+数字11，无独立操作行
  */
 import { AsyncImage } from './AsyncImage';
 import { openMember } from '../common/member_route';
@@ -148,7 +148,7 @@ export struct CommentItemView {
 
   build() {
     Column() {
-      // Nara头部是独立的34头像＋名字/时间列；不能把头像与整段正文并排。
+      // 方案A：头像＋可收缩的名字/时间列＋只读点赞，后两者与头像垂直居中。
       Row({ space: 12 }) {
         Column() {
           AsyncImage({ src: thumbUrl(this.item.avatar, 96, 96), w: 96, h: 96 })
@@ -167,7 +167,7 @@ export struct CommentItemView {
               .fontColor($r('app.color.text_secondary'))
               .maxLines(1)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
-              .constraintSize({ maxWidth: '60%' })
+              .flexShrink(1)
               .onClick(() => { openMember(this.item.mid); })
             if (this.upMid > 0 && this.item.mid === this.upMid) {
               Text('UP')
@@ -176,6 +176,7 @@ export struct CommentItemView {
                 .backgroundColor($r('app.color.brand_pink'))
                 .borderRadius(3)
                 .padding({ left: 3, right: 3, top: 1, bottom: 1 })
+                .flexShrink(0)
             }
             if (this.item.isUpTop) {
               Text('TOP')
@@ -184,6 +185,7 @@ export struct CommentItemView {
                 .backgroundColor('#FF6699')
                 .borderRadius(3)
                 .padding({ left: 3, right: 3, top: 1, bottom: 1 })
+                .flexShrink(0)
             }
           }
           .width('100%')
@@ -191,15 +193,28 @@ export struct CommentItemView {
             .fontSize(11)
             .fontColor($r('app.color.text_secondary'))
             .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
             .width('100%')
         }
         .layoutWeight(1)
         .alignItems(HorizontalAlign.Start)
+
+        Row({ space: 4 }) {
+          Image($r('app.media.icon_thumbup'))
+            .width(16).height(16).fillColor($r('app.color.text_secondary'))
+            .flexShrink(0)
+          Text(formatPlayCount(this.item.like))
+            .fontSize(11).fontColor($r('app.color.text_secondary'))
+            .maxLines(1)
+            .flexShrink(0)
+        }
+        .flexShrink(0)
+        .margin({ right: 5 })
       }
       .width('100%')
       .alignItems(VerticalAlign.Center)
 
-      // 正文/图片只应用Nara规定的段间距，不用Column(space:10)扩散到操作行。
+      // 正文与图片保留分段间距，正文后直接接灰底回复，不再放空操作行。
       Column() {
         if (this.item.message.length > 0) {
           Text(this.item.message)
@@ -217,17 +232,6 @@ export struct CommentItemView {
       .padding({ left: 45, right: 6 })
       .margin({ top: 10 })
       .alignItems(HorizontalAlign.Start)
-
-      Row() {
-        Blank()
-        Row({ space: 4 }) {
-          Image($r('app.media.icon_thumbup'))
-            .width(16).height(16).fillColor($r('app.color.text_secondary'))
-          Text(formatPlayCount(this.item.like))
-            .fontSize(11).fontColor($r('app.color.text_secondary'))
-        }
-      }
-      .width('100%').height(32).padding({ right: 5 }).margin({ top: 4 })
 
       // ===== 子回复容器（R1/R2）=====
       // hideSubEntry：楼中楼页面里的「主评论」不再显示「共N条回复」入口（用户指正 2026-10-12）
@@ -272,6 +276,8 @@ export struct CommentItemView {
         .id('comment_replies_' + this.item.rpid.toString())
         .alignItems(HorizontalAlign.Start)
         .margin({ left: 42, right: 4, top: 5, bottom: 12 })
+      } else {
+        Column().height(8)
       }
     }
     .width('100%')

@@ -12,6 +12,24 @@ export const EVENT_APP_BACKGROUND: number = 1002;
 export const EVENT_APP_FOREGROUND: number = 1003;
 /** 云端播放心跳成功；仅通知历史列表刷新，不携带账号或观看内容。 */
 export const EVENT_HISTORY_CHANGED: number = 1004;
+/** 关注/取关/拉黑成功；仅携带目标UP与当前进程会话版本。 */
+export const EVENT_FOLLOW_CHANGED: number = 1005;
+
+export interface FollowChanged { mid: number; followed: boolean; revision: number; }
+
+export function emitFollowChanged(mid: number, followed: boolean, revision: number): void {
+  emitter.emit({ eventId: EVENT_FOLLOW_CHANGED }, { data: { mid: mid, followed: followed, revision: revision } });
+}
+
+export function onFollowChanged(cb: (change: FollowChanged) => void): () => void {
+  const listener = (event: emitter.EventData): void => {
+    const change: FollowChanged = event.data as FollowChanged;
+    if (change && Number.isFinite(change.mid) && change.mid > 0 && typeof change.followed === 'boolean'
+      && Number.isFinite(change.revision)) { cb(change); }
+  };
+  emitter.on({ eventId: EVENT_FOLLOW_CHANGED }, listener);
+  return (): void => { emitter.off(EVENT_FOLLOW_CHANGED, listener); };
+}
 
 export function emitHistoryChanged(): void {
   emitter.emit({ eventId: EVENT_HISTORY_CHANGED });

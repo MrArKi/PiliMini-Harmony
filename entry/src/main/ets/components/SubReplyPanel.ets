@@ -339,6 +339,13 @@ export struct SubReplyPanel {
       .width('100%')
       .layoutWeight(1)
       .id('sub_reply_list')
+      // Nara楼中楼复用ExtendedNestedScrollController；嵌入视频页时接回同一头部滚动链。
+      .edgeEffect(EdgeEffect.None, { alwaysEnabled: true })
+      .friction(-Math.log(0.135) / 4.2)
+      .nestedScroll({
+        scrollForward: this.embedded ? NestedScrollMode.PARENT_FIRST : NestedScrollMode.SELF_ONLY,
+        scrollBackward: this.embedded ? NestedScrollMode.SELF_FIRST : NestedScrollMode.SELF_ONLY
+      })
       .onAreaChange((_old: Area, area: Area) => { this.listHeight = Number(area.height); })
       .onScrollIndex((start: number) => { this.firstVisible = start; })
       .divider({ strokeWidth: 0.3, color: '#14000000', startMargin: 55, endMargin: 15 })

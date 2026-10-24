@@ -22,6 +22,7 @@ export struct VideoCardGrid {
   @Prop horizontal: boolean = false;
   @State moreShown: boolean = false;
   @State addingLater: boolean = false;
+  onFeedback: (mode: string, item: VideoItem) => void = () => {};
   private destroyed: boolean = false;
 
   aboutToDisappear(): void {
@@ -121,6 +122,18 @@ export struct VideoCardGrid {
         MenuItem(this.MenuRow($r('app.media.icon_person'), '访问UP主'))
           .onClick(() => { this.moreShown = false; openMember(this.ownerMid()); })
       }
+      MenuItem(this.MenuRow($r('app.media.icon_feed_block'), '本地屏蔽'))
+        .onClick(() => { this.moreShown = false; this.onFeedback('block', this.model); })
+      if (this.model.bvid.length > 0) {
+        MenuItem(this.MenuRow($r('app.media.icon_feed_dislike'), '不感兴趣'))
+          .onClick(() => { this.moreShown = false; this.onFeedback('dislike', this.model); })
+      }
+      if (this.ownerMid() > 0) {
+        MenuItem(this.MenuRow($r('app.media.icon_feed_black'), '拉黑：' + this.model.upName))
+          .onClick(() => { this.moreShown = false; this.onFeedback('black', this.model); })
+      }
+      MenuItem(this.MenuRow($r('app.media.icon_settings'), '屏蔽管理'))
+        .onClick(() => { this.moreShown = false; this.onFeedback('manage', this.model); })
       if (this.model.bvid.length > 0) {
         MenuItem(this.MenuRow($r('app.media.icon_link'), '复制链接'))
           .onClick(() => { this.moreShown = false; this.copyVideo(true); })

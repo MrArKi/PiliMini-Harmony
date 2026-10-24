@@ -1,11 +1,11 @@
 /**
  * 视频接口服务（spec-04/05）：推荐流 / 热门 / 搜索 / 详情 / 评论
  */
-import { getJson, postForm, buildQuery, parseEnvelope, ensureOk } from '../infra/http/http';
+import { getJson, buildQuery, parseEnvelope, ensureOk } from '../infra/http/http';
 import { wbiSign } from '../infra/sign/wbi';
 import { API_BASE } from '../config/constants';
 import { AppError } from '../infra/error/app_error';
-import { CookieStore } from '../infra/cookie/cookie_store';
+import { MemberService } from './member_service';
 import { VideoItem } from '../model/video_item';
 import { VideoQuality } from '../model/video_quality';
 
@@ -31,6 +31,7 @@ interface RcmdItem {
   pic: string;
   duration: number;
   pubdate?: number;
+  tname?: string;
   owner: OwnerInfo;
   stat: StatInfo;
 }
@@ -48,6 +49,7 @@ interface PopItem {
   pic: string;
   duration: number;
   pubdate?: number;
+  tname?: string;
   owner: OwnerInfo;
   stat: StatInfo;
 }
@@ -539,15 +541,7 @@ export class VideoService {
 
   /** 关注 / 取关 UP（写操作，需登录） */
   static async relationModify(mid: number, follow: boolean): Promise<void> {
-    const token: string = await CookieStore.get('bili_jct');
-    const raw: string = await postForm(API_BASE + '/x/relation/modify', {
-      'fid': mid.toString(),
-      'act': follow ? '1' : '2',
-      're_src': '11',
-      'csrf': token
-    });
-    const resp = parseEnvelope<object>(raw);
-    ensureOk(resp);
+    await MemberService.modifyRelation(mid, follow ? 1 : 2);
   }
 
   /** 首页推荐流（wbi 签名） */
@@ -597,10 +591,12 @@ export class VideoService {
         danmaku: it.stat.danmaku !== undefined ? it.stat.danmaku : 0,
         pubdate: it.pubdate !== undefined ? it.pubdate : 0,
         duration: it.duration,
-        aid: it.aid !== undefined ? it.aid : (it.id !== undefined ? it.id : 0)
+        aid: it.aid !== undefined ? it.aid : (it.id !== undefined ? it.id : 0),
+        zoneName: it.tname || ''
       });
     }
-    return { items: items, hasMore: true, nextCursor: data.fresh_idx > 0 ? data.fresh_idx : freshIdx + 1 };
+    // Nara RcmdController由列表基类page++推进；响应fresh_idx不是下一页游标。
+    return { items: items, hasMore: true, nextCursor: freshIdx + 1 };
   }
 
   /** 热门列表（无需签名） */
@@ -628,7 +624,8 @@ export class VideoService {
         danmaku: it.stat.danmaku !== undefined ? it.stat.danmaku : 0,
         pubdate: it.pubdate !== undefined ? it.pubdate : 0,
         duration: it.duration,
-        aid: it.aid !== undefined ? it.aid : 0
+        aid: it.aid !== undefined ? it.aid : 0,
+        zoneName: it.tname || ''
       });
     }
     return { items: items, hasMore: !data.no_more, nextCursor: pn + 1 };

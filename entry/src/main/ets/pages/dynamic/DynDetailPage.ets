@@ -8,8 +8,10 @@ import { NARA_ROUTE_DURATION, NARA_ROUTE_CURVE } from '../../common/nara_motion'
 import { openMember } from '../../common/member_route';
 import { common } from '@kit.AbilityKit';
 import { router, display, promptAction } from '@kit.ArkUI';
+import { FrameCallback } from '@ohos.arkui.UIContext';
 import { AsyncImage } from '../../components/AsyncImage';
 import { GalleryThumbnail, nextGalleryId } from '../../components/GalleryThumbnail';
+import { DynamicVideoCard } from '../../components/dynamic/DynamicVideoCard';
 import { CommentItemView, CommentSkeleton } from '../../components/CommentItem';
 import { SubReplyArgs } from '../../service/sub_reply_ctx';
 import { BasicDataSource } from '../../common/list_data_source';
@@ -19,6 +21,12 @@ import { VideoService, CommentItem, ReplyPage, SubReplyPage } from '../../servic
 
 const GRID_SPACE: number = 5;
 const IMG_MAX_RATIO: number = 2.6;
+
+class DynamicCommentLayoutCallback extends FrameCallback {
+  private action: () => void;
+  constructor(action: () => void) { super(); this.action = action; }
+  onFrame(_time: number): void { this.action(); this.action = () => {}; }
+}
 
 function two(n: number): string {
   const s: string = n.toString();
@@ -57,6 +65,11 @@ struct DynDetailPage {
   private loadingMore: boolean = false;
   private destroyed: boolean = false;
   private commentGeneration: number = 0;
+  private commentScroller: Scroller = new Scroller();
+  private viewCommentRequested: boolean = false;
+  private commentLocated: boolean = false;
+  private commentAnchorPending: boolean = false;
+  @State detailViewportHeight: number = 0;
 
   aboutToAppear(): void {
     try {
@@ -71,9 +84,24 @@ struct DynDetailPage {
       if (id !== undefined) {
         this.dynId = id;
         this.opusOnly = pm['opus'] === '1';
+        this.viewCommentRequested = pm['viewComment'] === '1';
         this.loadDetail();
       }
     }
+  }
+
+  private locateComment(): void {
+    if (!this.viewCommentRequested || this.commentLocated || this.commentAnchorPending || this.destroyed) { return; }
+    this.commentAnchorPending = true;
+    // 列表布局完成后再定位；不测量长正文高度，也不依赖评论网络返回时机。
+    this.getUIContext().postFrameCallback(new DynamicCommentLayoutCallback(() => {
+      this.commentAnchorPending = false;
+      if (this.destroyed || this.commentLocated) { return; }
+      try {
+        this.commentScroller.scrollToIndex(1, false, ScrollAlign.START);
+        this.commentLocated = true;
+      } catch (_) {}
+    }));
   }
 
   aboutToDisappear(): void {
@@ -220,6 +248,11 @@ struct DynDetailPage {
 
   private toast(msg: string): void {
     promptAction.showToast({ message: msg });
+  }
+
+  private openVideo(bvid: string): void {
+    if (bvid.length === 0) { this.toast('视频暂不可用'); return; }
+    router.pushUrl({ url: 'pages/video/VideoDetailPage', params: { 'bvid': bvid } });
   }
 
   private galleryId: string = nextGalleryId();
@@ -403,23 +436,12 @@ struct DynDetailPage {
           .width('100%')
       }
       if (orig.kind === 'av' && orig.archive !== undefined) {
-        Row() {
-          Text(orig.archive.title)
-            .fontSize(14)
-            .fontColor($r('app.color.text_primary'))
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .layoutWeight(1)
-          Text('视频 >')
-            .fontSize(12)
-            .fontColor($r('app.color.brand_pink'))
+        Column() {
+          DynamicVideoCard({ archive: orig.archive, detail: true })
         }
-        .width('100%')
+        .width('100%').id('dynamic_detail_forward_video')
         .onClick(() => {
-          if (orig.archive !== undefined) {
-            const params: Record<string, string> = { 'bvid': orig.archive.bvid };
-            router.pushUrl({ url: 'pages/video/VideoDetailPage', params: params });
-          }
+          if (orig.archive !== undefined) { this.openVideo(orig.archive.bvid); }
         })
       } else if (orig.pics !== undefined && orig.pics.length > 0) {
         this.PicsGrid(orig.pics)
@@ -473,7 +495,7 @@ struct DynDetailPage {
             Button('重试').onClick(() => { this.loadDetail(); })
           }.width('100%').layoutWeight(1).justifyContent(FlexAlign.Center)
         } else if (this.item !== undefined) {
-          List() {
+          List({ scroller: this.commentScroller }) {
             ListItem() {
               Column({ space: 10 }) {
                 // 作者行
@@ -517,25 +539,13 @@ struct DynDetailPage {
                 if (this.item.paragraphs) {
                   this.Paragraphs(this.item.paragraphs)
                 } else if (this.item.kind === 'av' && this.item.archive !== undefined) {
-                  Row() {
-                    Text(this.item.archive.title)
-                      .fontSize(15)
-                      .fontColor($r('app.color.text_primary'))
-                      .maxLines(2)
-                      .textOverflow({ overflow: TextOverflow.Ellipsis })
-                      .layoutWeight(1)
-                    Text('视频 >')
-                      .fontSize(12)
-                      .fontColor($r('app.color.brand_pink'))
+                  Column() {
+                    DynamicVideoCard({ archive: this.item.archive, detail: true })
                   }
-                  .width('100%')
-                  .padding(12)
-                  .backgroundColor($r('app.color.btn_soft_bg'))
-                  .borderRadius(6)
+                  .width('100%').id('dynamic_detail_video')
                   .onClick(() => {
                     if (this.item !== undefined && this.item.archive !== undefined) {
-                      const params: Record<string, string> = { 'bvid': this.item.archive.bvid };
-                      router.pushUrl({ url: 'pages/video/VideoDetailPage', params: params });
+                      this.openVideo(this.item.archive.bvid);
                     }
                   })
                 } else if (this.item.pics !== undefined && this.item.pics.length > 0) {
@@ -552,14 +562,19 @@ struct DynDetailPage {
                     .width('100%')
                 }
 
-                // 分段条（转发 / 评论 / 赞，评论可用）
-                this.SegmentBar(this.item)
               }
               .width('100%')
               .padding({ left: 12, right: 12, top: 12, bottom: 0 })
               .alignItems(HorizontalAlign.Start)
             }
             .width('100%')
+
+            ListItem() {
+              this.SegmentBar(this.item)
+            }
+            .width('100%')
+            .padding({ left: 12, right: 12 })
+            .onAreaChange(() => { this.locateComment(); })
 
             ListItem() {
               this.SortHeader()
@@ -639,7 +654,7 @@ struct DynDetailPage {
                 }
               }
               .width('100%')
-              .height(110)
+              .height(this.viewCommentRequested ? Math.max(110, this.detailViewportHeight - 46) : 110)
               .justifyContent(FlexAlign.Center)
             }
             .width('100%')
@@ -647,6 +662,10 @@ struct DynDetailPage {
           .cachedCount(3)
           .layoutWeight(1)
           .width('100%')
+          .onAreaChange((_old: Area, area: Area) => {
+            this.detailViewportHeight = Number(area.height);
+            this.locateComment();
+          })
           .divider({ strokeWidth: 0.3, color: '#14000000', startMargin: 55, endMargin: 15 })
           .onReachEnd(() => {
             this.loadComments(false);

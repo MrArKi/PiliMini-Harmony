@@ -47,7 +47,7 @@ class AssetCookie {
     }
   }
 
-  static async get(): Promise<string> {
+  static async get(): Promise<string | undefined> {
     try {
       const query: asset.AssetMap = new Map<asset.Tag, asset.Value>();
       query.set(asset.Tag.ALIAS, aliasU8());
@@ -62,7 +62,8 @@ class AssetCookie {
       }
       return u8ToStr(secret);
     } catch (e) {
-      return '';
+      // 查询失败仍沿用prefs回退；不能把临时系统错误永久缓存成未登录。
+      return (e as BusinessError).code === 11000018 ? '' : undefined;
     }
   }
 
@@ -73,23 +74,79 @@ class AssetCookie {
   }
 }
 
+interface StoredCookie {
+  raw: string;
+  cacheable: boolean;
+}
+
 export class CookieStore {
-  /** 保存整串 Cookie（asset 优先，失败回退 prefs） */
-  static async save(raw: string): Promise<void> {
-    const ok: boolean = await AssetCookie.put(raw);
-    if (ok) {
-      // 成功入 asset 后清除旧明文
-      await prefsDelete(KEY_COOKIE);
-      return;
-    }
-    await prefsPut(KEY_COOKIE, raw);
+  // 只在当前进程保留一份；首批并发请求共用读取，避免逐接口反复查询安全资产。
+  private static cached: string | undefined = undefined;
+  private static reading: Promise<string> | undefined = undefined;
+  private static storageQueue: Promise<void> = Promise.resolve();
+  private static revision: number = 0;
+  private static mutations: number = 0;
+
+  /** 保存/清除开始即递增；异步查询据此丢弃旧会话结果，不暴露凭据。 */
+  static sessionRevision(): number { return CookieStore.revision; }
+
+  /** 读取中的旧迁移、登录保存与退出清除必须遵循同一持久化顺序。 */
+  private static mutate(work: () => Promise<void>, value: string): Promise<void> {
+    const revision: number = ++CookieStore.revision;
+    CookieStore.mutations++;
+    // 后来的读取不能复用写入开始前的在途结果。
+    CookieStore.reading = undefined;
+    const operation: Promise<void> = CookieStore.storageQueue.then(async (): Promise<void> => {
+      try {
+        await work();
+        if (revision === CookieStore.revision) { CookieStore.cached = value; }
+      } catch (e) {
+        // 资产删除后写入/回退也可能失败，旧缓存已不能代表持久来源。
+        CookieStore.cached = undefined;
+        throw e as Error;
+      }
+    }).finally((): void => { CookieStore.mutations--; });
+    CookieStore.storageQueue = operation.catch((): void => {});
+    return operation;
   }
 
-  static async getRaw(): Promise<string> {
-    const fromAsset: string = await AssetCookie.get();
-    if (fromAsset.length > 0) {
-      return fromAsset;
+  /** 保存整串 Cookie（asset 优先，失败回退 prefs） */
+  static save(raw: string): Promise<void> {
+    if (raw.length === 0) { return CookieStore.clear(); }
+    return CookieStore.mutate(async (): Promise<void> => {
+      const ok: boolean = await AssetCookie.put(raw);
+      if (ok) {
+        // 成功入 asset 后清除旧明文
+        await prefsDelete(KEY_COOKIE);
+        return;
+      }
+      await prefsPut(KEY_COOKIE, raw);
+    }, raw);
+  }
+
+  static getRaw(): Promise<string> {
+    if (CookieStore.mutations === 0 && CookieStore.cached !== undefined) {
+      return Promise.resolve(CookieStore.cached);
     }
+    if (CookieStore.reading !== undefined) { return CookieStore.reading; }
+    const revision: number = CookieStore.revision;
+    const reading: Promise<string> = CookieStore.storageQueue.then(async (): Promise<string> => {
+      // 等待中的保存/清除已经成功提交，无需再查询一次系统资产。
+      if (revision === CookieStore.revision && CookieStore.cached !== undefined) { return CookieStore.cached; }
+      const stored: StoredCookie = await CookieStore.readStored();
+      if (revision === CookieStore.revision && stored.cacheable) { CookieStore.cached = stored.raw; }
+      return stored.raw;
+    }).finally((): void => {
+      if (CookieStore.reading === reading) { CookieStore.reading = undefined; }
+    });
+    CookieStore.reading = reading;
+    CookieStore.storageQueue = reading.then((): void => {}, (): void => {});
+    return reading;
+  }
+
+  private static async readStored(): Promise<StoredCookie> {
+    const fromAsset: string | undefined = await AssetCookie.get();
+    if (fromAsset !== undefined && fromAsset.length > 0) { return { raw: fromAsset, cacheable: true }; }
     // 旧版明文迁移：首次读到即搬入 asset 并清除
     const legacy: string = await prefsGet(KEY_COOKIE, '');
     if (legacy.length > 0) {
@@ -97,9 +154,9 @@ export class CookieStore {
       if (ok) {
         await prefsDelete(KEY_COOKIE);
       }
-      return legacy;
+      return { raw: legacy, cacheable: ok || fromAsset !== undefined };
     }
-    return '';
+    return { raw: '', cacheable: fromAsset !== undefined };
   }
 
   /** 解析某个 cookie 值 */
@@ -128,17 +185,19 @@ export class CookieStore {
     return sess.length > 0;
   }
 
-  static async clear(): Promise<void> {
-    try {
-      await AssetCookie.remove();
-    } catch (e) {
-      const err: BusinessError = e as BusinessError;
-      // 11000018 = 无匹配记录，属正常
-      if (err.code !== 11000018) {
-        console.warn('[PiliMini-cookie] asset remove failed: ' + err.code.toString());
-        throw new Error('清除登录凭据失败（' + err.code.toString() + '）');
+  static clear(): Promise<void> {
+    return CookieStore.mutate(async (): Promise<void> => {
+      try {
+        await AssetCookie.remove();
+      } catch (e) {
+        const err: BusinessError = e as BusinessError;
+        // 11000018 = 无匹配记录，属正常
+        if (err.code !== 11000018) {
+          console.warn('[PiliMini-cookie] asset remove failed: ' + err.code.toString());
+          throw new Error('清除登录凭据失败（' + err.code.toString() + '）');
+        }
       }
-    }
-    await prefsDelete(KEY_COOKIE);
+      await prefsDelete(KEY_COOKIE);
+    }, '');
   }
 }

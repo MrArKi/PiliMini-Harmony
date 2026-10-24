@@ -96,6 +96,8 @@ export interface DynPageResult {
   offset: string;
   hasMore: boolean;
   total?: number;
+  /** 服务端已读基线；只在当前可见首页成功展示后推进。 */
+  updateBaseline?: string;
 }
 
 // ===== 原始响应类型 =====
@@ -219,6 +221,7 @@ interface RawDynData {
   offset?: string;
   has_more?: boolean;
   update_num?: number;
+  update_baseline?: string;
   total?: number;
   load_next?: boolean;
 }
@@ -356,7 +359,7 @@ function mapItem(raw: RawDynItem): DynItem {
         bvid: a.bvid,
         title: stripTag(a.title),
         cover: fixUrl(a.cover),
-        durationText: a.duration_text,
+        durationText: a.duration_text || '',
         play: a.stat !== undefined && a.stat !== null ? a.stat.play : 0,
         danmaku: a.stat !== undefined && a.stat !== null ? a.stat.danmaku : 0
       };
@@ -546,7 +549,8 @@ export class DynamicService {
     return {
       items: items,
       offset: data.offset !== undefined && data.offset !== null ? data.offset : '',
-      hasMore: data.has_more === true
+      hasMore: data.has_more === true,
+      updateBaseline: data.update_baseline || ''
     };
   }
 }

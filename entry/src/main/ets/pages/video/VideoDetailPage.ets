@@ -9,6 +9,7 @@ import { NARA_ROUTE_DURATION, NARA_ROUTE_CURVE } from '../../common/nara_motion'
 import { openMember } from '../../common/member_route';
 import { router, promptAction, window, display, curves } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
+import { FrameCallback } from '@ohos.arkui.UIContext';
 import { BasicDataSource } from '../../common/list_data_source';
 import { AsyncImage } from '../../components/AsyncImage';
 import { CommentItemView, CommentSkeleton } from '../../components/CommentItem';
@@ -48,6 +49,18 @@ const DETAIL_NESTED_SCROLL: NestedScrollOptions = {
 /** Nara在Harmony上用BouncingScrollPhysicsExt：速度按0.135^t衰减。
  * ArkUI指数系数为-4.2×friction；内外层固定同一阻尼，避免默认慢速模式提前制动。 */
 const DETAIL_SCROLL_FRICTION: number = -Math.log(0.135) / 4.2;
+
+class DetailPlayerLayoutCallback extends FrameCallback {
+  private action: () => void;
+  constructor(action: () => void) { super(); this.action = action; }
+  onFrame(_time: number): void { this.action(); this.action = () => {}; }
+}
+
+class DetailContentIdleCallback extends FrameCallback {
+  private action: () => void;
+  constructor(action: () => void) { super(); this.action = action; }
+  onIdle(_timeLeft: number): void { this.action(); this.action = () => {}; }
+}
 
 @Entry
 @Component
@@ -133,6 +146,13 @@ struct VideoDetailPage {
   private fsFallbackTimer: number = -1;
   @State viewportWidth: number = 0;
   @State viewportHeight: number = 0;
+  @State controlInsetTop: number = 0;
+  @State controlInsetLeft: number = 0;
+  @State controlInsetRight: number = 0;
+  private avoidAreaHandler: (options: window.AvoidAreaOptions) => void = (options: window.AvoidAreaOptions): void => {
+    if (!this.destroyed && (options.type === window.AvoidAreaType.TYPE_SYSTEM ||
+      options.type === window.AvoidAreaType.TYPE_CUTOUT)) { this.updateControlInsets(); }
+  };
   /** 当前窗口是否横屏（进全屏过渡期：竖屏下播放器保持 16:9 不拉伸） */
   @State isLandscape: boolean = false;
   /** 楼中楼面板 */
@@ -141,16 +161,22 @@ struct VideoDetailPage {
   @State tab: number = 0;
   /** 原生Tabs逐帧位移同时驱动标题和单一下划线，覆盖拖动/回弹/点击动画。 */
   @State tabProgress: number = 0;
-  @State tabBarWidth: number = 360;
+  @State tabBarWidth: number = 192;
   @State introLabelWidth: number = 26;
   @State replyLabelWidth: number = 26;
   private tabsCtrl: TabsController = new TabsController();
   @State relatedCount: number = 0;
   private relatedDs: BasicDataSource<VideoItem> = new BasicDataSource<VideoItem>();
   private routeSettled: boolean = false;
+  @State playbackMountReady: boolean = false;
+  private firstPlayerFrameShown: boolean = false;
+  private initialBodyReady: boolean = false;
   private tabMoving: boolean = false;
   private tabAnimating: boolean = false;
   private contentWaiters: (() => void)[] = [];
+  private contentFramePending: boolean = false;
+  private tabsGeneration: number = 0;
+  private tabsMounted: boolean = false;
   private settleTimer: number = -1;
   @State followed: boolean = false;
   @State followBusy: boolean = false;
@@ -187,9 +213,7 @@ struct VideoDetailPage {
       if (!this.destroyed) { this.danmakuReady = true; promptAction.showToast({ message: '弹幕偏好读取失败，使用默认设置' }); }
     });
     this.settleTimer = setTimeout((): void => {
-      this.settleTimer = -1;
-      this.routeSettled = true;
-      this.flushContentWaiters();
+      this.finishRouteEntry();
     }, NARA_ROUTE_DURATION + 32);
     DownloadService.init(getContext(this) as common.Context);
     DownloadService.onChange(this.downloadChange);
@@ -211,6 +235,7 @@ struct VideoDetailPage {
       }
       this.mainWin = win;
       win.on('windowSizeChange', this.windowSizeHandler);
+      win.on('avoidAreaChange', this.avoidAreaHandler);
       const rect: window.Rect = win.getWindowProperties().windowRect;
       this.onWindowSize({ width: rect.width, height: rect.height });
     }).catch(() => {
@@ -258,6 +283,7 @@ struct VideoDetailPage {
     }
     if (this.mainWin !== undefined) {
       this.mainWin.off('windowSizeChange', this.windowSizeHandler);
+      this.mainWin.off('avoidAreaChange', this.avoidAreaHandler);
       this.mainWin = undefined;
     }
     // 全屏态直接返回（系统返回键）时恢复竖屏，否则主壳留在横屏；
@@ -301,7 +327,22 @@ struct VideoDetailPage {
   /** 当前分P 的 cid */
   private syncFullscreenBars(): void {
     AppStorage.setOrCreate<boolean>('playerFullscreen', (this.fullscreenTarget ?? this.isFullscreen) && !this.destroyed);
+    this.updateControlInsets();
     refreshSystemBars(getContext(this) as common.UIAbilityContext);
+  }
+
+  /** 仅控制区避让，视频Surface仍铺满；竖全屏保留系统栏隐藏前的顶部安全区。 */
+  private updateControlInsets(): void {
+    const win: window.Window | undefined = this.mainWin;
+    if (!win || this.destroyed) { return; }
+    try {
+      const system: window.AvoidArea = win.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM);
+      const cutout: window.AvoidArea = win.getWindowAvoidArea(window.AvoidAreaType.TYPE_CUTOUT);
+      this.controlInsetTop = Math.max(px2vp(system.topRect.height), px2vp(cutout.topRect.height),
+        this.isLandscape ? 0 : this.statusBarH);
+      this.controlInsetLeft = px2vp(Math.max(system.leftRect.width, cutout.leftRect.width));
+      this.controlInsetRight = px2vp(Math.max(system.rightRect.width, cutout.rightRect.width));
+    } catch (_) { this.controlInsetTop = this.isLandscape ? 0 : this.statusBarH; }
   }
 
   /** 当前分P 的 cid */
@@ -533,6 +574,8 @@ struct VideoDetailPage {
     this.error = '';
     try {
       const d: VideoDetail = await VideoService.viewDetail(this.bvid);
+      // 网络立即请求，播放器与详情树在转场结束后挂载，避免加载抢占滑入动画。
+      await this.waitForContentIdle();
       if (this.destroyed) {
         return;
       }
@@ -541,7 +584,7 @@ struct VideoDetailPage {
       this.applyOnlineDetail(d, Math.max(0, initialPage));
       this.loggedIn = await AuthService.isLogin();
       if (this.destroyed) { return; }
-      this.loading = false;
+      this.showLoadedBody();
       this.loadOnlineExtras(d);
     } catch (e) {
       if (this.destroyed) {
@@ -553,17 +596,75 @@ struct VideoDetailPage {
     }
   }
 
+  /** 先完成播放器首次布局，再在下一帧构建简介，避免两棵树挤在同一帧。 */
+  private onPlayerInitialLayout(): void {
+    this.getUIContext().postFrameCallback(new DetailPlayerLayoutCallback((): void => {
+      if (this.destroyed) { return; }
+      this.firstPlayerFrameShown = true;
+      if (this.initialBodyReady) { this.loading = false; }
+    }));
+  }
+
+  private showLoadedBody(): void {
+    this.initialBodyReady = true;
+    if (this.firstPlayerFrameShown) { this.loading = false; }
+  }
+
   /** 网络继续并发，列表提交避开路由/横滑关键帧；无轮询，退页解开所有等待。 */
+  private finishRouteEntry(): void {
+    if (this.settleTimer !== -1) { clearTimeout(this.settleTimer); this.settleTimer = -1; }
+    if (this.destroyed || this.routeSettled) { return; }
+    this.routeSettled = true;
+    this.playbackMountReady = true;
+    this.flushContentWaiters();
+  }
+
+  private onRouteEntryProgress(progress: number): void {
+    if (progress < 1 || this.routeSettled || this.destroyed) { return; }
+    if (this.settleTimer !== -1) { clearTimeout(this.settleTimer); }
+    // 离开转场回调后再提交新树；无动画/未回调时仍有原有时长兜底。
+    this.settleTimer = setTimeout((): void => { this.finishRouteEntry(); }, 0);
+  }
+
   private waitForContentIdle(): Promise<void> {
-    if (this.destroyed || (this.routeSettled && !this.tabMoving && !this.tabAnimating)) { return Promise.resolve(); }
-    return new Promise<void>((resolve: () => void): void => { this.contentWaiters.push(resolve); });
+    if (this.destroyed) { return Promise.resolve(); }
+    return new Promise<void>((resolve: () => void): void => {
+      this.contentWaiters.push(resolve);
+      this.flushContentWaiters();
+    });
   }
 
   private flushContentWaiters(): void {
-    if (!this.destroyed && (!this.routeSettled || this.tabMoving || this.tabAnimating)) { return; }
-    const pending: (() => void)[] = this.contentWaiters;
-    this.contentWaiters = [];
-    pending.forEach((resolve: () => void): void => { resolve(); });
+    if (this.destroyed) {
+      const pending: (() => void)[] = this.contentWaiters;
+      this.contentWaiters = [];
+      pending.forEach((resolve: () => void): void => { resolve(); });
+      return;
+    }
+    if (!this.routeSettled || this.tabMoving || this.tabAnimating ||
+      this.contentFramePending || this.contentWaiters.length === 0) { return; }
+    // 同时到达的详情/评论/推荐不再于一个微任务批次全部建树；每帧只放行一个提交。
+    this.contentFramePending = true;
+    this.getUIContext().postFrameCallback(new DetailContentIdleCallback((): void => {
+      this.contentFramePending = false;
+      if (this.destroyed || !this.routeSettled || this.tabMoving || this.tabAnimating) {
+        if (this.destroyed) { this.flushContentWaiters(); }
+        return;
+      }
+      const resolve: (() => void) | undefined = this.contentWaiters.shift();
+      if (resolve !== undefined) { resolve(); }
+      this.flushContentWaiters();
+    }));
+  }
+
+  /** 先绘制简介，再在独立空闲帧物化相邻评论页，首个横滑无需临时建整棵树。 */
+  private async preloadCommentTab(): Promise<void> {
+    const generation: number = ++this.tabsGeneration;
+    this.tabsMounted = true;
+    await this.waitForContentIdle();
+    if (this.destroyed || !this.tabsMounted || generation !== this.tabsGeneration || this.tab === 1) { return; }
+    try { await this.tabsCtrl.preloadItems([1]); }
+    catch (_) { /* 预加载失败仍保留原生Tabs按需构建，不阻断切页。 */ }
   }
 
   private async loadComments(reset: boolean): Promise<void> {
@@ -733,6 +834,7 @@ struct VideoDetailPage {
   private onWindowSize(size: window.Size): void {
     this.viewportWidth = size.width; this.viewportHeight = size.height;
     this.isLandscape = size.width > size.height;
+    this.updateControlInsets();
     this.finishFullscreen(size.width, size.height);
   }
 
@@ -992,7 +1094,7 @@ struct VideoDetailPage {
     }
     .width('100%')
     .padding({ left: 12, right: 12, top: 12, bottom: 10 })
-    .alignItems(HorizontalAlign.Start).backgroundColor($r('app.color.card_bg'))
+    .alignItems(HorizontalAlign.Start).backgroundColor($r('app.color.bg_page'))
   }
 
   /** 分段 tab：简介 / 评论(N)（Nara 详情页顶部 tab；弹幕功能未实现故不设「发弹幕」） */
@@ -1050,12 +1152,13 @@ struct VideoDetailPage {
       .width('100%').height('100%')
       Rect().height(3).width(this.indicatorWidth()).radius(1.5)
         .fill($r('app.color.brand_pink'))
-        .position({ x: this.tabBarWidth * (0.25 + this.tabProgress * 0.5) - this.indicatorWidth() / 2, y: 45 })
+        .position({ x: this.tabBarWidth * (0.25 + this.tabProgress * 0.5) - this.indicatorWidth() / 2, y: 42 })
         .hitTestBehavior(HitTestMode.None)
     }
-    .layoutWeight(1)
-    .height(48)
+    .width('calc(100% - 52vp)').constraintSize({ maxWidth: 192 })
+    .height(45)
     .onAreaChange((_old: Area, area: Area): void => { this.tabBarWidth = Number(area.width); })
+    Blank()
     Button({ type: ButtonType.Normal }) {
       Image(this.danmakuPreferences.enabled ? $r('app.media.icon_dm_on') : $r('app.media.icon_dm_off'))
         .width(22).height(22)
@@ -1065,8 +1168,8 @@ struct VideoDetailPage {
       .id('danmaku_inline_toggle')
       .accessibilityText(this.danmakuPreferences.enabled ? '关闭弹幕' : '开启弹幕')
       .onClick((): void => { this.toggleDanmaku(); })
-    }.width('100%').height(48)
-    .backgroundColor($r('app.color.card_bg'))
+    }.width('100%').height(45)
+    .backgroundColor($r('app.color.bg_page'))
   }
 
   private async toggleFollow(): Promise<void> {
@@ -1337,6 +1440,7 @@ struct VideoDetailPage {
   pageTransition() {
     PageTransitionEnter({ type: RouteType.Push, duration: NARA_ROUTE_DURATION, curve: NARA_ROUTE_CURVE })
       .translate({ x: '100%' })
+      .onEnter((_type: RouteType, progress: number): void => { this.onRouteEntryProgress(progress); })
     PageTransitionExit({ type: RouteType.Push, duration: NARA_ROUTE_DURATION, curve: NARA_ROUTE_CURVE })
       .translate({ x: '-33.333333%' })
     PageTransitionEnter({ type: RouteType.Pop, duration: NARA_ROUTE_DURATION, curve: NARA_ROUTE_CURVE })
@@ -1585,9 +1689,11 @@ struct VideoDetailPage {
         }
         .barHeight(0)
         .scrollable(true)
+        .edgeEffect(EdgeEffect.None)
         .layoutWeight(1)
         .width('100%')
         .animationDuration(300)
+        .onAppear((): void => { this.preloadCommentTab(); })
         .onContentDidScroll((_selected: number, index: number, position: number): void => {
           this.tabProgress = Math.max(0, Math.min(1, index - position));
           this.tabMoving = position > -0.999 && position < 0.999 && Math.abs(position) > 0.001;
@@ -1601,6 +1707,8 @@ struct VideoDetailPage {
           this.flushContentWaiters();
         })
         .onDisAppear((): void => {
+          this.tabsMounted = false;
+          this.tabsGeneration++;
           this.tabMoving = false;
           this.tabAnimating = false;
           this.flushContentWaiters();
@@ -1652,17 +1760,18 @@ struct VideoDetailPage {
       }
       .width('100%').height('100%')
       .visibility(this.isFullscreen ? Visibility.None : Visibility.Visible)
-      .pullToRefresh(this.tab === 1 && this.scrollAcc < 0.5)
+      .pullToRefresh(!this.subShown && this.tab === 1 && this.scrollAcc < 0.5)
       .refreshOffset(64)
       .onOffsetChange((offset: number): void => { this.refreshPullOffset = Math.max(0, offset); })
       .onRefreshing(() => { this.refreshing = true; this.loadComments(true); })
       // 内嵌播放器（spec-06a；单一实例，全屏只改尺寸，避免 Surface 重建）
       // 离线播放（localPath 非空）时即使详情未加载完成也先渲染播放器
-      if (this.detail !== undefined || this.localPath.length > 0) {
+      if (this.playbackMountReady && (this.detail !== undefined || this.localPath.length > 0)) {
         Stack({ alignContent: Alignment.Bottom }) {
           Column() {
             Column().width('100%').height(this.isFullscreen ? 0 : this.statusBarH)
             PlayerView({
+              onInitialLayout: (): void => { this.onPlayerInitialLayout(); },
               sourceWidth: this.sourceDimension(true),
               sourceHeight: this.sourceDimension(false),
               onVideoSize: (w: number, h: number): void => { this.nativeWidth = w; this.nativeHeight = h; },
@@ -1679,6 +1788,9 @@ struct VideoDetailPage {
               danmakuReady: this.danmakuReady,
               onDanmakuChange: (value: DanmakuPreferences): void => { this.changeDanmaku(value); },
               isFullscreen: this.isFullscreen,
+              controlInsetTop: this.controlInsetTop,
+              controlInsetLeft: this.controlInsetLeft,
+              controlInsetRight: this.controlInsetRight,
               autoPlay: true,
               localPath: this.localPath,
               localSource: this.localSource,

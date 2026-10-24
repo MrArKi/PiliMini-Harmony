@@ -11,6 +11,7 @@ import { APP_VERSION } from '../../config/constants';
 import { prefsGet, prefsPut } from '../../infra/storage/prefs';
 import { imageCacheSize, clearImageCache, setDiskLimitMB } from '../../infra/image/image_loader';
 import { MATERIAL_LEVEL_KEY } from '../main/MainShell';
+import { FeedFilterDialog } from '../../components/FeedFilterDialog';
 
 /** 图片缓存上限（MB）存储键 */
 const IMG_LIMIT_KEY: string = 'setting_img_cache_mb';
@@ -32,6 +33,7 @@ struct SettingPage {
   @State limitMB: number = 1024;
   @StorageProp('statusBarHeight') statusBarH: number = 0;
   private limitOptions: number[] = [256, 512, 1024, 2048];
+  private filterDialog: CustomDialogController | undefined = undefined;
   private materialOptions: MaterialOption[] = [
     { name: '自适应（跟随系统）', level: 10 },
     { name: '精美', level: 0 },
@@ -41,6 +43,22 @@ struct SettingPage {
 
   aboutToAppear(): void {
     this.init();
+  }
+
+  aboutToDisappear(): void {
+    if (this.filterDialog !== undefined) {
+      this.filterDialog.close();
+      this.filterDialog = undefined;
+    }
+  }
+
+  private openFilterManagement(): void {
+    if (this.filterDialog !== undefined) { this.filterDialog.close(); }
+    this.filterDialog = new CustomDialogController({
+      builder: FeedFilterDialog({ mode: 'manage' }), customStyle: true,
+      alignment: DialogAlignment.Center, autoCancel: true
+    });
+    this.filterDialog.open();
   }
 
   private async init(): Promise<void> {
@@ -220,6 +238,10 @@ struct SettingPage {
       Column() {
         this.Row('音视频设置', (): string => '', (): void => {
           router.pushUrl({ url: 'pages/setting/VideoSettingPage' });
+        })
+        Divider().strokeWidth(0.5).color($r('app.color.divider')).margin({ left: 16 })
+        this.Row('推荐屏蔽管理', (): string => '', (): void => {
+          this.openFilterManagement();
         })
         Divider().strokeWidth(0.5).color($r('app.color.divider')).margin({ left: 16 })
         this.Row('缓存管理', (): string => '已用 ' + formatSizeLocal(DownloadService.totalBytes()), (): void => {

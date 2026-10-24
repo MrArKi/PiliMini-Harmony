@@ -5,6 +5,7 @@ import { CookieStore } from '../infra/cookie/cookie_store';
 import { API_BASE } from '../config/constants';
 import { VideoItem } from '../model/video_item';
 import { DynamicService, DynItem } from './dynamic_service';
+import { emitFollowChanged } from '../infra/event/app_events';
 
 export interface MemberProfile {
   mid: number; name: string; face: string; banner: string; sign: string;
@@ -24,6 +25,8 @@ export interface MemberEntry {
 }
 export interface MemberResult { items: MemberEntry[]; next: string; hasMore: boolean; total: number; }
 export interface MemberRelation { attribute?: number; special?: number; }
+/** 单次关系操作的会话快照，仅在请求期间持有，不持久化或记录日志。 */
+export interface MemberRelationSession { cookie: string; csrf: string; account: string; revision: number; }
 interface Official { title?: string; desc?: string; }
 interface OfficialVerify { desc?: string; type?: number; }
 interface Level { current_level?: number; }
@@ -98,6 +101,45 @@ async function read<T>(path: string, params: Record<string, string>, signed: boo
 }
 
 export class MemberService {
+  static assertRelationSession(session: MemberRelationSession): void {
+    if (session.revision !== CookieStore.sessionRevision()) { throw new Error('登录状态已变化，请重新操作'); }
+  }
+
+  static async captureRelationSession(revision: number = CookieStore.sessionRevision()): Promise<MemberRelationSession> {
+    if (revision !== CookieStore.sessionRevision()) { throw new Error('登录状态已变化，请重新操作'); }
+    const cookie: string = await CookieStore.getRaw();
+    if (revision !== CookieStore.sessionRevision()) { throw new Error('登录状态已变化，请重新操作'); }
+    const values: Record<string, string> = {};
+    const parts: string[] = cookie.split(';');
+    for (let i: number = 0; i < parts.length; i++) {
+      const segment: string = parts[i].trim();
+      const separator: number = segment.indexOf('=');
+      if (separator > 0) { values[segment.substring(0, separator).trim()] = segment.substring(separator + 1).trim(); }
+    }
+    if (!values['SESSDATA'] || !values['bili_jct'] || !values['DedeUserID']) { throw new Error('请先登录'); }
+    return { cookie: cookie, csrf: values['bili_jct'], account: values['DedeUserID'], revision: revision };
+  }
+
+  static async relationForSession(mid: number, session: MemberRelationSession): Promise<MemberRelation> {
+    MemberService.assertRelationSession(session);
+    const raw: string = await getJson(API_BASE + '/x/relation?fid=' + mid.toString(), { 'Cookie': session.cookie });
+    // 旧会话的-101不得登出已经切换的新会话。
+    MemberService.assertRelationSession(session);
+    const response = parseEnvelope<MemberRelation>(raw); ensureOk(response);
+    if (response.data === undefined || response.data === null) { throw new Error('关系状态为空，请重试'); }
+    return response.data;
+  }
+
+  static async modifyRelationForSession(mid: number, act: number, session: MemberRelationSession): Promise<void> {
+    MemberService.assertRelationSession(session);
+    const raw: string = await postForm(API_BASE + '/x/relation/modify', {
+      'fid': mid.toString(), 'act': act.toString(), 're_src': '11', 'csrf': session.csrf
+    }, session.cookie);
+    MemberService.assertRelationSession(session);
+    ensureOk(parseEnvelope<object>(raw));
+    if (act === 1 || act === 2 || act === 5) { emitFollowChanged(mid, act === 1, session.revision); }
+  }
+
   static async recent(mid: number, kind: string): Promise<MemberResult> {
     const data: ArchiveRaw[] = await read<ArchiveRaw[]>('/x/space/' + (kind === 'coin' ? 'coin' : 'like') + '/video',
       { 'vmid': mid.toString(), 'jsonp': 'jsonp' }, false, mid);
@@ -125,12 +167,8 @@ export class MemberService {
     return read<MemberRelation>('/x/relation', { 'fid': mid.toString() });
   }
   static async modifyRelation(mid: number, act: number): Promise<void> {
-    const csrf: string = await CookieStore.get('bili_jct');
-    if (!csrf) { throw new Error('请先登录'); }
-    const raw: string = await postForm(API_BASE + '/x/relation/modify', {
-      'fid': mid.toString(), 'act': act.toString(), 're_src': '11', 'csrf': csrf
-    });
-    ensureOk(parseEnvelope<object>(raw));
+    const session: MemberRelationSession = await MemberService.captureRelationSession();
+    await MemberService.modifyRelationForSession(mid, act, session);
   }
 
   static async videos(mid: number, page: number, order: string, keyword: string = '',
