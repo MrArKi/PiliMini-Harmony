@@ -12,12 +12,14 @@ import { VideoQuality, QualityEntry } from '../../model/video_quality';
 const KEY_HA: string = 'setting_enable_ha';
 const KEY_P1080: string = 'setting_p1080';
 const KEY_QN: string = 'setting_default_qn';
+const KEY_WIFI_ONLY: string = 'setting_wifi_only';
 
 @Entry
 @Component
 struct VideoSettingPage {
   @State haOn: boolean = true;
   @State p1080On: boolean = true;
+  @State wifiOnlyOn: boolean = true;
   @State qnLabel: string = '1080P';
   @State qn: number = 80;
   @State qnSheet: boolean = false;
@@ -36,6 +38,8 @@ struct VideoSettingPage {
       this.haOn = ha !== '0';
       const p1080: string = await prefsGet(KEY_P1080, '1');
       this.p1080On = p1080 !== '0';
+      const wifiOnly: string = await prefsGet(KEY_WIFI_ONLY, '1');
+      this.wifiOnlyOn = wifiOnly !== '0';
       const qnStr: string = await prefsGet(KEY_QN, '80');
       const qn: number = parseInt(qnStr, 10);
       this.qn = isNaN(qn) ? 80 : qn;
@@ -151,6 +155,12 @@ struct VideoSettingPage {
           (v: boolean): void => {
             this.p1080On = v;
             prefsPut(KEY_P1080, v ? '1' : '0');
+          })
+        Divider().strokeWidth(0.5).color($r('app.color.divider')).margin({ left: 16 })
+        this.SwitchRow('仅 Wi-Fi 下载', '移动网络下不开始缓存，避免消耗流量', (): boolean => this.wifiOnlyOn,
+          (v: boolean): void => {
+            this.wifiOnlyOn = v;
+            prefsPut(KEY_WIFI_ONLY, v ? '1' : '0');
           })
       }
       .width('100%')

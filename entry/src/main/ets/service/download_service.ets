@@ -14,6 +14,7 @@ import { VideoService, DownloadUrl, DashDownloadUrl } from './video_service';
 import { UA_PC, BILI_REFERER } from '../config/constants';
 
 import { DownloadTask, DlFolder, DownloadMetadata } from '../model/download';
+import { blockedByWifiOnly } from '../infra/network/net_state';
 import { DownloadFolderService } from './download_folder_service';
 export { DownloadTask, DlFolder };
 const KEY_TASKS: string = 'dl_tasks';
@@ -235,6 +236,10 @@ export class DownloadService {
   static async add(bvid: string, cid: number, title: string, cover: string, qn: number,
     part: string = '', duration: number = 0, upName: string = '', metadata?: DownloadMetadata): Promise<void> {
     await DownloadService.load();
+    // 仅 Wi-Fi 保护（P2-1）：移动网络下不入队，避免后台悄悄吃流量。所有下载入口都经过这里。
+    if (await blockedByWifiOnly()) {
+      throw new Error('当前为移动网络，已按「仅 Wi-Fi 下载」阻止；可在设置里关闭该开关');
+    }
     const dir = DownloadService.dir();
     if (dir.length === 0) {
       throw new Error('下载目录未初始化');
