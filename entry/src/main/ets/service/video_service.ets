@@ -1408,39 +1408,68 @@ export class VideoService {
   }
 
   /** 投屏只传完整音画单流；电视自行访问URI，不传应用Cookie/Referer。 */
+  /**
+   * 投屏取流（spec-32 / 2026-10-28 提清晰度）：电视端直连，只能给单 URI 完整音画，因此必须走 durl。
+   * durl 在 `platform=html5` 下通常只到 720P，故依次试 html5、pc 两个通道取 quality 更高者。
+   * 日志保留两通道的实际 quality，供真机判断电视端能否播 pc 源。
+   */
   static async castUrl(bvid: string, cid: number): Promise<CastUrl> {
     if (!/^BV[A-Za-z0-9]+$/.test(bvid) || !Number.isFinite(cid) || cid <= 0) {
       throw new AppError('parse', -1, '当前视频暂不支持投屏');
     }
     const revision: number = CookieStore.sessionRevision();
+    let best: CastUrl | undefined = undefined;
+    let bestPlatform: string = '';
+    const platforms: string[] = ['html5', 'pc'];
+    for (const platform of platforms) {
+      const one: CastUrl | undefined = await VideoService.castUrlOn(bvid, cid, platform);
+      // 旧账号迟到的-101不能登出新账号，也不回填旧账号媒体地址。
+      if (revision !== CookieStore.sessionRevision()) { throw new AppError('auth', -1, '登录状态已变化，请重试'); }
+      console.info('[PiliMini-cast] platform=' + platform + ' quality=' +
+        (one !== undefined ? one.quality : -1).toString());
+      if (one !== undefined && (best === undefined || one.quality > best.quality)) {
+        best = one;
+        bestPlatform = platform;
+      }
+      // 已经到 1080P 就没必要再试下一个通道。
+      if (best !== undefined && best.quality >= 80) { break; }
+    }
+    if (best === undefined) {
+      throw new AppError('parse', -1, '当前视频暂无可投屏的常规媒体源');
+    }
+    console.info('[PiliMini-cast] picked platform=' + bestPlatform + ' quality=' + best.quality.toString());
+    return best;
+  }
+
+  /** 单通道取 durl 单段源；无可用单段返回 undefined（不抛错，交给上层换通道）。 */
+  private static async castUrlOn(bvid: string, cid: number, platform: string): Promise<CastUrl | undefined> {
     const url: string = API_BASE + '/x/player/playurl?bvid=' + encodeURIComponent(bvid) +
-      '&cid=' + Math.floor(cid).toString() + '&qn=64&platform=html5&high_quality=1&otype=json';
+      '&cid=' + Math.floor(cid).toString() + '&qn=120&platform=' + platform +
+      '&high_quality=1&fourk=1&otype=json';
     const raw: string = await getJson(url);
-    // 旧账号迟到的-101不能登出新账号，也不回填旧账号媒体地址。
-    if (revision !== CookieStore.sessionRevision()) { throw new AppError('auth', -1, '登录状态已变化，请重试'); }
     const resp = parseEnvelope<PlayDataRaw>(raw);
-    ensureOk(resp);
-    const data: PlayDataRaw | undefined = resp.data;
-    const segments: DurlSegRaw[] | undefined = data?.durl;
-    if (!data || !segments || segments.length !== 1 || typeof segments[0].url !== 'string' || !segments[0].url) {
-      throw new AppError('parse', -1, '当前视频没有可投屏的完整媒体源');
+    if (resp.code !== 0 || resp.data === undefined || resp.data === null) { return undefined; }
+    const data: PlayDataRaw = resp.data;
+    const segments: DurlSegRaw[] | undefined = data.durl;
+    if (segments === undefined || segments === null || segments.length !== 1 ||
+      typeof segments[0].url !== 'string' || !segments[0].url) {
+      return undefined;
     }
     const duration: number = data.timelength || segments[0].length || 0;
     if (!Number.isFinite(duration) || duration <= 0 ||
-      (segments[0].length !== undefined && segments[0].length! > 0 &&
-        Math.abs(segments[0].length! - duration) > 2000)) {
-      throw new AppError('parse', -1, '当前视频的投屏媒体源不完整');
+      (segments[0].length !== undefined && segments[0].length > 0 &&
+        Math.abs(segments[0].length - duration) > 2000)) {
+      return undefined;
     }
-    const candidates: string[] = conventionalUrls(segments[0].url!, segments[0].backup_url || []);
-    for (let i: number = 0; i < candidates.length; i++) {
-      const candidate: string = candidates[i];
+    const candidates: string[] = conventionalUrls(segments[0].url, segments[0].backup_url || []);
+    for (const candidate of candidates) {
       // 不接受本机文件、局域网代理或携带用户名/密码的地址；URL仅留在内存。
       if (/^https?:\/\/[A-Za-z0-9.-]+(?::\d+)?\//.test(candidate) &&
         !/^https?:\/\/(?:localhost|127\.|0\.|10\.|192\.168\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.)/i.test(candidate)) {
-        return { url: candidate, durationMs: duration, quality: data.quality || 64 };
+        return { url: candidate, durationMs: duration, quality: data.quality !== undefined ? data.quality : 64 };
       }
     }
-    throw new AppError('parse', -1, '当前视频暂无可投屏的常规媒体源');
+    return undefined;
   }
 
   /** 下载用：直接取 durl 单流（带音轨 mp4，避免 DASH 音视频分离合并）。返回地址 + 备用 + 时长 */
