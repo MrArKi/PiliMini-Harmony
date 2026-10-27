@@ -12,6 +12,8 @@ import { PlayerBrightness } from '../../infra/player/player_brightness';
 import { VideoQuality } from '../../model/video_quality';
 import { PlayerProgressBar } from './PlayerProgressBar';
 import { SeekPreview } from './SeekPreview';
+import { CastPanel } from './CastPanel';
+import { CastSnapshot, DlnaDevice } from '../../model/cast';
 import { PlayPauseIcon } from './PlayPauseIcon';
 import { DanmakuLayer } from './DanmakuLayer';
 import { DanmakuPanel } from './DanmakuPanel';
@@ -69,6 +71,8 @@ export struct PlayerView {
   private danmakuHandle: DanmakuLayerHandle = new DanmakuLayerHandle();
   @State danmakuStatus: string = '';
   @State danmakuPanelShown: boolean = false;
+  @State castPanelShown: boolean = false;
+  @State castInfo: CastSnapshot = new CastSnapshot();
   @State danmakuInitialTab: number = 0;
   @State nearbyDanmaku: DanmakuItem[] = [];
   @State selectedDanmaku: DanmakuItem | undefined = undefined;
@@ -218,6 +222,7 @@ export struct PlayerView {
       this.exiting = true; this.visibilityGeneration++;
       this.onPanEnd(true);
       this.danmakuSelected = false; this.danmakuPanelShown = false;
+      this.closeCastPanel();
       this.requestedSystemLevel = -1; this.brightnessControl.setVisible(false);
       if (this.controller === undefined) { return this.surfaceRelease; }
       this.ready = false;
@@ -256,6 +261,7 @@ export struct PlayerView {
     this.qn = snapshot.quality; this.qualities = snapshot.qualities; this.bufferPercent = snapshot.bufferPercent;
     this.wanted = snapshot.wanted; this.started = snapshot.loaded;
     this.errorText = snapshot.error; this.appInBackground = snapshot.background;
+    this.receiveCast(snapshot.cast);
     this.brightnessControl.setBackground(snapshot.background);
     if (snapshot.background) {
       this.requestedSystemLevel = -1; this.volumeRequests = [];
@@ -267,7 +273,9 @@ export struct PlayerView {
       duration: snapshot.duration, position: snapshot.position, speed: snapshot.speed,
       running: snapshot.state === 'playing' && snapshot.loaded && !snapshot.background && !snapshot.seeking,
       timeRevision: snapshot.timeRevision, sampledAt: snapshot.sampledAt, seeking: snapshot.seeking || !snapshot.loaded });
-    if (snapshot.background) { this.danmakuPanelShown = false; this.danmakuSelected = false; }
+    if (snapshot.background) {
+      this.danmakuPanelShown = false; this.danmakuSelected = false; this.closeCastPanel();
+    }
     if (snapshot.width > 0 && snapshot.height > 0) {
       const ratio: number = snapshot.width / snapshot.height;
       if (Math.abs(ratio - this.actualRatio) > 0.0001) { this.actualRatio = ratio; this.onVideoSize(snapshot.width, snapshot.height); }
@@ -299,6 +307,7 @@ export struct PlayerView {
       this.onPanEnd(true);
       this.requestedSystemLevel = -1; this.volumeRequests = [];
       this.danmakuPanelShown = false; this.danmakuSelected = false;
+      this.closeCastPanel();
       if (!this.wanted) { this.capturePausedFrame(); }
       this.showPausedFrame = !this.wanted && this.pausedFrame !== undefined;
       this.routeSuspended = this.state !== 'idle'; this.ready = false;
@@ -324,6 +333,7 @@ export struct PlayerView {
   onCidChange(): void {
     if (this.destroyed || this.localPath.length > 0 || this.playbackSource !== undefined) { return; }
     this.danmakuPanelShown = false; this.danmakuSelected = false;
+    this.closeCastPanel();
     this.onPanEnd(true);
     this.actualRatio = 0; this.pausedFrame = undefined; this.showPausedFrame = false; this.controlsVisible = true;
     if (this.ready && this.settingsLoaded && this.visible) { this.start(this.qn, false); }
@@ -332,6 +342,7 @@ export struct PlayerView {
   private onLocalSourceChange(): void {
     if (!this.localSource || this.destroyed) { return; }
     this.danmakuSelected = false; this.danmakuPanelShown = false;
+    this.closeCastPanel();
     this.onPanEnd(true);
     this.actualRatio = 0; this.pausedFrame = undefined; this.showPausedFrame = false; this.controlsVisible = true;
     if (this.ready && this.settingsLoaded && this.visible) { this.start(this.qn, false); }
@@ -340,6 +351,7 @@ export struct PlayerView {
   private onPlaybackSourceChange(): void {
     if (!this.playbackSource || this.destroyed) { return; }
     this.danmakuPanelShown = false; this.danmakuSelected = false;
+    this.closeCastPanel();
     this.onPanEnd(true);
     this.actualRatio = 0; this.pausedFrame = undefined; this.showPausedFrame = false; this.controlsVisible = true;
     if (this.ready && this.settingsLoaded && this.visible) { this.start(this.qn, false); }
@@ -355,12 +367,77 @@ export struct PlayerView {
   }
   private togglePlay(): void {
     if (this.controller === undefined) { return; }
+    if (this.castControlsRemote()) { this.openCastPanel(); return; }
     if (this.state === 'idle' || this.state === 'error') { this.start(this.qn); return; }
     if (!this.wanted || this.state === 'completed') { this.pausedFrame = undefined; this.showPausedFrame = false; }
     this.controller.toggle();
   }
-  private seekTo(ms: number): void { if (this.controller !== undefined) { this.controller.seek(ms); } }
-  private applySpeed(value: number): void { if (this.controller !== undefined) { this.controller.speed(value); } }
+  private seekTo(ms: number): void { if (!this.castControlsRemote() && this.controller !== undefined) { this.controller.seek(ms); } }
+  private applySpeed(value: number): void { if (!this.castControlsRemote() && this.controller !== undefined) { this.controller.speed(value); } }
+  /** 已交接的断开/错误仍保留暂停路由，收窄后也能打开手机续播入口。 */
+  private castControlsRemote(): boolean {
+    return this.castInfo.remote || this.castInfo.localHeld;
+  }
+  private castStatusText(): string {
+    if (this.castInfo.phase === 'preparing') { return '正在准备投屏…'; }
+    if (this.castInfo.phase === 'selecting') { return '请选择投屏设备'; }
+    if (this.castInfo.phase === 'connecting') { return '正在连接投屏…'; }
+    if (this.castInfo.phase === 'paused') { return '投屏已暂停'; }
+    if (this.castInfo.phase === 'ended') { return '投屏播放完毕'; }
+    if (this.castInfo.phase === 'error') { return '投屏未成功，点击继续'; }
+    if (this.castInfo.phase === 'disconnected') { return '投屏已断开，点击继续'; }
+    return '正在投屏';
+  }
+  private receiveCast(value: CastSnapshot): void {
+    const old: CastSnapshot = this.castInfo;
+    if (old.phase === value.phase && old.remote === value.remote && old.deviceName === value.deviceName &&
+      old.position === value.position && old.duration === value.duration && old.message === value.message &&
+      old.canPlay === value.canPlay && old.canPause === value.canPause && old.canSeek === value.canSeek &&
+      old.localHeld === value.localHeld && old.selection === value.selection &&
+      old.discovering === value.discovering && old.devices.length === value.devices.length &&
+      old.devices.every((item: DlnaDevice, index: number): boolean => item.id === value.devices[index].id &&
+        item.name === value.devices[index].name && item.host === value.devices[index].host)) { return; }
+    const next: CastSnapshot = new CastSnapshot();
+    next.phase = value.phase; next.remote = value.remote; next.deviceName = value.deviceName;
+    next.position = value.position; next.duration = value.duration; next.message = value.message;
+    next.canPlay = value.canPlay; next.canPause = value.canPause; next.canSeek = value.canSeek;
+    next.localHeld = value.localHeld; next.selection = value.selection;
+    next.discovering = value.discovering; next.devices = value.devices.slice();
+    this.castInfo = next;
+    if (this.castControlsRemote()) {
+      this.onPanEnd(true); this.danmakuSelected = false; this.danmakuPanelShown = false;
+      this.speedMenuVisible = false; this.qualityMenuVisible = false;
+    }
+  }
+  private openCastPanel(): void {
+    if (this.destroyed || this.exiting || !this.visible || this.appInBackground) { return; }
+    this.onPanEnd(true); this.danmakuSelected = false; this.danmakuPanelShown = false;
+    const opening: boolean = !this.castPanelShown;
+    this.castPanelShown = true; this.controller?.setCastPanelVisible(true);
+    if (opening && !this.castControlsRemote() && this.castInfo.phase !== 'connecting') { this.selectCastDevice(); }
+  }
+  private closeCastPanel(): void {
+    this.castPanelShown = false; this.controller?.setCastPanelVisible(false);
+  }
+  private selectCastDevice(): void {
+    this.controller?.beginCast().catch((): void => { this.showToast('投屏准备失败，请重试'); });
+  }
+  @Builder
+  CastSheet() {
+    CastPanel({ snapshot: this.castInfo, onSelect: (): void => { this.selectCastDevice(); },
+      onSelectDevice: (id: string): void => {
+        this.controller?.selectCastDevice(id).catch((): void => { this.showToast('投屏连接失败，请重试'); });
+      },
+      onPlay: (): void => { this.controller?.castPlay(); },
+      onPause: (): void => { this.controller?.castPause(); },
+      onSeek: (ms: number): void => { this.controller?.castSeek(ms); },
+      onDisconnect: (): void => { this.controller?.disconnectCast(false); },
+      onResumeLocal: (): void => {
+        this.controller?.disconnectCast(true).then((): void => {
+          if (!this.castControlsRemote()) { this.closeCastPanel(); }
+        });
+      }, onClose: (): void => { this.closeCastPanel(); } })
+  }
   private syncSession(): void {
     if (this.controller !== undefined) {
       const source = this.playbackSource || this.localSource;
@@ -370,7 +447,8 @@ export struct PlayerView {
   }
   private updateScreenOn(): void {
     if (this.mainWin !== undefined) {
-      const wanted: boolean = !this.destroyed && this.visible && !this.appInBackground && this.state === 'playing';
+      const wanted: boolean = !this.destroyed && this.visible && !this.appInBackground &&
+        !this.castControlsRemote() && this.state === 'playing';
       PlayerScreen.update(this.mainWin, this.surfaceBase, wanted);
     }
   }
@@ -405,6 +483,7 @@ export struct PlayerView {
     }, 3000);
   }
   aboutToDisappear(): void {
+    this.closeCastPanel();
     this.destroyed = true; this.pausedFrame = undefined; this.showPausedFrame = false;
     this.visibilityGeneration++;
     this.registerRelease((): Promise<void> => Promise.resolve());
@@ -420,6 +499,7 @@ export struct PlayerView {
   }
 
   private onSingleTap(event: GestureEvent): void {
+    if (this.castControlsRemote()) { this.openCastPanel(); return; }
     if (this.panConsumed) { return; }
     if (!this.isFullscreen && this.collapseRatio > 0 && this.state !== 'playing') { this.togglePlay(); return; }
     if (this.danmakuReady && this.danmakuPreferences.enabled && this.collapseRatio <= 0 && event.fingerList.length > 0) {
@@ -532,6 +612,7 @@ export struct PlayerView {
   }
 
   private onDoubleTap(): void {
+    if (this.castControlsRemote()) { this.openCastPanel(); return; }
     if (this.panConsumed || this.controller === undefined) {
       return;
     }
@@ -545,6 +626,7 @@ export struct PlayerView {
   }
 
   private onLongPressStart(): void {
+    if (this.castControlsRemote()) { return; }
     if (this.state === 'idle' || this.state === 'error') {
       return;
     }
@@ -567,7 +649,7 @@ export struct PlayerView {
   }
 
   private onPanStart(startX: number): void {
-    if (!this.visible || this.appInBackground || this.exiting) {
+    if (!this.visible || this.appInBackground || this.exiting || this.castControlsRemote()) {
       return;
     }
     this.panMode = 'none';
@@ -584,7 +666,7 @@ export struct PlayerView {
   }
 
   private onPanUpdate(dx: number, dy: number, x: number, y: number): void {
-    if (!this.visible || this.appInBackground || this.exiting) {
+    if (!this.visible || this.appInBackground || this.exiting || this.castControlsRemote()) {
       return;
     }
     // 长按期间垂直滑动 → 锁定/解除锁定倍速
@@ -795,6 +877,16 @@ export struct PlayerView {
       .alignItems(HorizontalAlign.Start)
 
       Row() {
+        if (!this.isFullscreen && this.localPath.length === 0 &&
+          (!this.playbackSource || this.playbackSource.localPath.length === 0) &&
+          (!this.localSource || this.localSource.localPath.length === 0)) {
+          Button({ type: ButtonType.Normal }) {
+            Image($r('app.media.icon_cast')).width(19).height(19)
+              .fillColor(this.castInfo.remote ? $r('app.color.brand_pink') : '#FFFFFF')
+          }.width(40).height(34).padding(0).backgroundColor(Color.Transparent)
+            .id('player-cast').accessibilityText('投屏')
+            .onClick((): void => { this.openCastPanel(); })
+        }
         if (this.isFullscreen) {
           Button({ type: ButtonType.Normal }) {
             Image(this.danmakuPreferences.enabled ? $r('app.media.icon_dm_on') : $r('app.media.icon_dm_off'))
@@ -1146,15 +1238,31 @@ export struct PlayerView {
       if (!this.isFullscreen && this.collapseRatio > 0 && this.state !== 'playing' && this.state !== 'loading') {
         this.CollapseBar()
       }
+      if (this.castControlsRemote()) {
+        Column({ space: 8 }) {
+          if (!this.isFullscreen && this.collapseRatio > 0) {
+            Row({ space: 8 }) {
+              Image($r('app.media.icon_cast')).width(20).height(20).fillColor('#FFFFFF')
+              Text(this.castStatusText()).fontSize(13).fontColor('#FFFFFF').maxLines(1)
+            }.padding({ left: 12, right: 12 })
+          } else {
+            Image($r('app.media.icon_cast')).width(28).height(28).fillColor('#FFFFFF')
+            Text(this.castStatusText()).fontSize(15).fontColor('#FFFFFF')
+            Text(this.castInfo.deviceName).fontSize(12).fontColor('#CCFFFFFF').maxLines(1)
+            Text('点击查看投屏').fontSize(12).fontColor($r('app.color.brand_pink'))
+          }
+        }.id('player-cast-status').width('100%').height('100%').backgroundColor('#ED000000')
+          .justifyContent(FlexAlign.Center).onClick((): void => { this.openCastPanel(); })
+      }
 
       // Nara默认开启服务端快照；稳定保留组件仅复用本源索引，松手立即取消图片工作。
       SeekPreview({ bvid: this.playbackSource ? this.playbackSource.bvid : this.bvid,
         cid: this.playbackSource ? this.playbackSource.cid : this.cid,
-        cacheAllowed: this.visible && !this.appInBackground && !this.exiting && this.localPath.length === 0 &&
+        cacheAllowed: this.visible && !this.appInBackground && !this.exiting && !this.castControlsRemote() && this.localPath.length === 0 &&
           (!this.playbackSource || this.playbackSource.localPath.length === 0) &&
           (!this.localSource || this.localSource.localPath.length === 0),
         active: this.seekPreviewMs >= 0 && !this.seekCancelHint && this.visible && !this.appInBackground &&
-          !this.exiting && this.localPath.length === 0 && (!this.playbackSource || this.playbackSource.localPath.length === 0) &&
+          !this.exiting && !this.castControlsRemote() && this.localPath.length === 0 && (!this.playbackSource || this.playbackSource.localPath.length === 0) &&
           (!this.localSource || this.localSource.localPath.length === 0),
         positionMs: Math.max(0, this.seekPreviewMs), playerWidth: this.playerW, playerHeight: this.playerH,
         fullscreen: this.isFullscreen, vertical: this.videoRatio() < 1 })
@@ -1197,6 +1305,11 @@ export struct PlayerView {
     .bindContentCover(this.danmakuPanelShown, this.DanmakuCover(), {
       modalTransition: ModalTransition.NONE, backgroundColor: Color.Transparent,
       onDisappear: (): void => { this.danmakuPanelShown = false; this.armControls(); }
+    })
+    .bindSheet($$this.castPanelShown, this.CastSheet(), {
+      height: 460, dragBar: true, showClose: false,
+      backgroundColor: $r('app.color.card_bg'),
+      onDisappear: (): void => { this.closeCastPanel(); this.armControls(); }
     })
     .onAreaChange((oldV: Area, newV: Area) => {
       // 手势分区与灵敏度按播放器实际尺寸计算

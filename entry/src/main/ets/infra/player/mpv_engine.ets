@@ -50,8 +50,8 @@ export class MpvEngine {
   seek(ms: number): void { this.api.command(this.handle, ['seek', (ms / 1000).toString(), 'absolute+exact']); }
   speed(value: number): void {
     this.set('speed', value.toString());
-    this.set('cache-secs', (16 * value).toFixed(3));
-    this.set('demuxer-hysteresis-secs', (16 * value / 1.5).toFixed(3));
+    this.set('cache-secs', (8 * value).toFixed(3));
+    this.set('demuxer-hysteresis-secs', (8 * value / 1.5).toFixed(3));
   }
   volume(value: number): void { this.set('volume', (value * 100).toString()); }
   video(enabled: boolean): void { this.set('vid', enabled ? 'auto' : 'no'); }

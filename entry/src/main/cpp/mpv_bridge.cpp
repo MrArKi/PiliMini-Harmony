@@ -250,10 +250,10 @@ void InitializeEngine(const std::shared_ptr<Engine> &engine, const std::string &
     engine->Option("pause", "yes");
     engine->Option("video-sync", "display-resample");
     engine->Option("cache", "yes");
-    engine->Option("demuxer-max-bytes", "4MiB");
-    engine->Option("demuxer-max-back-bytes", "4MiB");
-    engine->Option("cache-secs", "16");
-    engine->Option("demuxer-hysteresis-secs", "10.667");
+    engine->Option("demuxer-max-bytes", "2MiB");
+    engine->Option("demuxer-max-back-bytes", "2MiB");
+    engine->Option("cache-secs", "8");
+    engine->Option("demuxer-hysteresis-secs", "5.333");
     engine->Option("network-timeout", "10");
     engine->Option("vo", "gpu-next");
     // 与Nara OHOS接入一致，允许发布库自动选择GPU后端。

@@ -22,7 +22,8 @@ import { FeedNavigation, FeedNavRequest } from '../../common/feed_navigation';
 @Component
 struct FeedList {
   @Prop source: string = 'rcmd'; // 'rcmd' | 'hot'
-  @Prop selected: boolean = false;
+  /** Tabs 会同时构建两个流；未选中的那个不能先发请求，否则启动就多拉一整页。 */
+  @Prop @Watch('onSelected') selected: boolean = false;
   /** 顶部玻璃栏高度：作为首个网格占位，让内容从栏下穿过（沉浸光感） */
   @Prop topInset: number = 0;
   /** 上滑收起顶栏（首行进入视口即收起，与 Nara 一致） */
@@ -43,6 +44,11 @@ struct FeedList {
   private refreshRunning: boolean = false;
   private rawItems: VideoItem[] = [];
   private fetchGeneration: number = 0;
+  /** 推荐流 fresh_idx：只增不减；同一值重复请求会拿到完全相同的一页（实测 20/20 重复）。 */
+  private rcmdFresh: number = 1;
+  private refreshSerial: number = 0;
+  /** 本次会话已展示过的 bvid，用于刷新后过滤服务端仍返回的旧条目。 */
+  private sessionSeen: Set<string> = new Set<string>();
   @State hiddenPageCount: number = 0;
   @State visibleCount: number = 0;
   private filtersChanged: () => void = (): void => {
@@ -74,7 +80,12 @@ struct FeedList {
 
   aboutToAppear(): void {
     FeedFilterService.subscribe(this.filtersChanged);
-    this.reload();
+    if (this.selected) { this.reload(); }
+  }
+
+  /** 首次切到该流时才拉第一页（Nara 也是按需首载）。 */
+  private onSelected(): void {
+    if (this.selected && !this.destroyed && !this.pager.firstLoaded && !this.pager.loading) { this.reload(); }
   }
 
   aboutToDisappear(): void {
@@ -87,14 +98,32 @@ struct FeedList {
     const pn: number = parseInt(cursor, 10);
     const r: PageResult = this.source === 'hot'
       ? await VideoService.hot(pn, 20)
-      : await VideoService.rcmd(pn, 20);
+      : await VideoService.rcmd(pn, 12);
     const firstPage: boolean = cursor === this.pager.initialCursor;
     const seen: Set<string> = new Set<string>();
     if (!firstPage) { this.rawItems.forEach((item: VideoItem): void => { seen.add(item.bvid); }); }
     const added: VideoItem[] = [];
+    const repeated: VideoItem[] = [];
+    const dedupeAgainstSession: boolean = firstPage && this.source !== 'hot' && this.refreshSerial > 0;
     for (let i: number = 0; i < r.items.length; i++) {
       const item: VideoItem = r.items[i];
-      if (item.bvid.length > 0 && !seen.has(item.bvid)) { seen.add(item.bvid); added.push(item); }
+      if (item.bvid.length === 0 || seen.has(item.bvid)) { continue; }
+      seen.add(item.bvid);
+      if (dedupeAgainstSession && this.sessionSeen.has(item.bvid)) {
+        repeated.push(item);
+        continue;
+      }
+      added.push(item);
+    }
+    // 整页都刷到过时宁可复用旧页也不让用户看到空列表
+    if (added.length === 0 && repeated.length > 0) {
+      for (let i: number = 0; i < repeated.length; i++) { added.push(repeated[i]); }
+    }
+    if (firstPage && this.source !== 'hot') {
+      for (let i: number = 0; i < added.length; i++) {
+        this.sessionSeen.add(added[i].bvid);
+      }
+      if (this.sessionSeen.size > 600) { this.sessionSeen.clear(); }
     }
     const visible: VideoItem[] = added.filter((item: VideoItem): boolean => !FeedFilterService.matches(item));
     if (!this.destroyed && generation === this.fetchGeneration) {
@@ -113,6 +142,8 @@ struct FeedList {
   private async reload(): Promise<void> {
     if (this.destroyed || this.pager.loading) { return; }
     this.hiddenPageCount = 0;
+    // 推荐流每次重新加载都从当前 fresh_idx 起算；热门是普通分页，始终从第 1 页
+    this.pager.initialCursor = this.source === 'hot' ? '1' : this.rcmdFresh.toString();
     const generation: number = ++this.fetchGeneration;
     await this.pager.reload(this.ds, (cursor: string): Promise<PageData<VideoItem>> => this.fetchPage(cursor, generation));
   }
@@ -120,7 +151,9 @@ struct FeedList {
   private async refresh(): Promise<void> {
     if (this.destroyed || this.refreshRunning || this.pager.loading) { return; }
     this.refreshRunning = true;
-    console.info('[PiliMini-feed] refresh source=' + this.source);
+    // 下拉刷新必须换一个 fresh_idx，否则服务端原样返回上一批
+    if (this.source !== 'hot') { this.rcmdFresh++; this.refreshSerial++; }
+    console.info('[PiliMini-feed] refresh source=' + this.source + ' fresh=' + this.rcmdFresh.toString());
     this.refreshing = true;
     try { await this.reload(); }
     finally {

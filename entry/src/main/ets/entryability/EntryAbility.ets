@@ -63,6 +63,28 @@ export default class EntryAbility extends UIAbility {
     hilog.info(DOMAIN, TAG, '%{public}s', 'Ability onDestroy');
   }
 
+  /** 仅小窗/分屏放开旋转，主窗保持竖屏；播放页全屏时不覆盖页面的横屏申请。 */
+  private applyOrientationPolicy(): void {
+    const win: window.Window | undefined = this.mainWindow;
+    if (win === undefined) { return; }
+    if (AppStorage.get<boolean>('playerFullscreen') === true) { return; }
+    let floating: boolean = false;
+    try {
+      const status: window.WindowStatusType = win.getWindowStatus();
+      floating = status === window.WindowStatusType.FLOATING || status === window.WindowStatusType.SPLIT_SCREEN;
+    } catch (err) {
+      floating = false;
+    }
+    try {
+      win.setPreferredOrientation(floating ? window.Orientation.AUTO_ROTATION_UNSPECIFIED
+        : window.Orientation.PORTRAIT).catch((err: Error) => {
+        hilog.warn(DOMAIN, TAG, 'setPreferredOrientation failed: %{public}s', err.message);
+      });
+    } catch (err) {
+      hilog.warn(DOMAIN, TAG, 'setPreferredOrientation throw: %{public}s', JSON.stringify(err));
+    }
+  }
+
   onWindowStageCreate(windowStage: window.WindowStage): void {
     hilog.info(DOMAIN, TAG, '%{public}s', 'Ability onWindowStageCreate');
     // 沉浸式布局（Nara 同款）：全屏布局 + 透明系统栏 + 安全区高度入 AppStorage
@@ -70,6 +92,15 @@ export default class EntryAbility extends UIAbility {
       const win = windowStage.getMainWindowSync();
       this.mainWindow = win;
       win.setWindowLayoutFullScreen(true);
+      // 进入/退出小窗、分屏时重新决定能不能横屏
+      try {
+        win.on('windowStatusChange', (_status: window.WindowStatusType): void => {
+          this.applyOrientationPolicy();
+        });
+      } catch (err) {
+        hilog.warn(DOMAIN, TAG, 'windowStatusChange subscribe failed: %{public}s', JSON.stringify(err));
+      }
+      this.applyOrientationPolicy();
       this.syncSystemBarTheme(this.context.config.colorMode);
       const sysArea = win.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM);
       AppStorage.setOrCreate('statusBarHeight', px2vp(sysArea.topRect.height));

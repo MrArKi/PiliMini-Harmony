@@ -8,6 +8,8 @@ import { AppError } from '../infra/error/app_error';
 import { MemberService } from './member_service';
 import { VideoItem } from '../model/video_item';
 import { VideoQuality } from '../model/video_quality';
+import { CookieStore } from '../infra/cookie/cookie_store';
+import { CommentEmote } from '../model/emote';
 
 interface OwnerInfo {
   mid?: number;
@@ -74,6 +76,15 @@ interface SearchData {
   result?: SearchItem[];
   numPages: number;
   page: number;
+}
+
+interface UserSearchItemRaw {
+  mid?: number;
+  uname?: string;
+}
+
+interface UserSearchData {
+  result?: UserSearchItemRaw[];
 }
 
 // ===== 详情（view） =====
@@ -191,6 +202,8 @@ export class CommentItem {
   uname: string = '';
   avatar: string = '';
   message: string = '';
+  /** 正文里的表情，渲染时按占位符替换成图片 */
+  emotes: CommentEmote[] = [];
   ctime: number = 0;
   like: number = 0;
   rcount: number = 0;
@@ -244,9 +257,20 @@ interface ReplyPictureRaw {
   img_height: number;
 }
 
+interface ReplyEmoteMetaRaw {
+  size?: number;
+}
+
+interface ReplyEmoteRaw {
+  url?: string;
+  meta?: ReplyEmoteMetaRaw;
+}
+
 interface ReplyContentRaw {
   message: string;
   pictures?: ReplyPictureRaw[];
+  /** 表情占位符 → 图片；键是正文里的 [doge] 这类字符串 */
+  emote?: Record<string, ReplyEmoteRaw>;
 }
 
 interface ReplyControlRaw {
@@ -308,6 +332,25 @@ export interface PageResult {
   nextCursor: number;
 }
 
+/** 搜索联想词（spec-04 / 2026-10-27）：term 为干净词，label 保留 <em> 高亮标记。 */
+export interface SuggestItem {
+  term: string;
+  label: string;
+}
+
+interface SuggestTagRaw {
+  term?: string;
+  name?: string;
+}
+
+interface SuggestResultRaw {
+  tag?: SuggestTagRaw[];
+}
+
+interface SuggestData {
+  result?: SuggestResultRaw;
+}
+
 // ===== 相关推荐 / UP 关注（spec-05 V2） =====
 
 interface RelatedItem {
@@ -367,6 +410,7 @@ interface DurlSegRaw {
   order?: number;
   url?: string;
   backup_url?: string[];
+  length?: number;
   /** 文件字节数（下载完成判定用） */
   size?: number;
 }
@@ -382,6 +426,46 @@ interface PlayDataRaw {
 
 interface RelationStatData {
   follower: number;
+}
+
+interface UpLevelRaw {
+  current_level?: number;
+}
+
+interface UpCardRaw {
+  fans?: number;
+  archive_count?: number;
+  level_info?: UpLevelRaw;
+}
+
+interface UpCardData {
+  card?: UpCardRaw;
+  /** 投稿数在 data 层，不在 card 内 */
+  archive_count?: number;
+}
+
+interface VideoTagRaw {
+  tag_id?: number;
+  tag_name?: string;
+  tag_type?: string;
+}
+
+/** UP 行需要的三件套；card 接口一次取齐，避免再单查粉丝。 */
+export class UpCard {
+  fans: number = 0;
+  videos: number = 0;
+  level: number = 0;
+}
+
+/** 视频标签；topic 显示#，其余按原名，点击都走搜索。 */
+export class VideoTag {
+  id: number = 0;
+  name: string = '';
+  type: string = '';
+
+  display(): string {
+    return this.type === 'topic' ? '#' + this.name : this.name;
+  }
 }
 
 function fixUrl(u: string): string {
@@ -452,11 +536,30 @@ function mapComment(raw: ReplyItemRaw): CommentItem {
   const c: CommentItem = new CommentItem();
   c.rpid = raw.rpid;
   const memberOk: boolean = raw.member !== undefined && raw.member !== null;
-  c.mid = memberOk ? raw.member.mid : 0;
+  // 评论接口的 member.mid 可能是字符串（view接口是数字），统一转成数字，否则空间入口被判为无效mid。
+  const mid: number = memberOk ? Number(raw.member.mid) : 0;
+  c.mid = Number.isFinite(mid) && mid > 0 ? mid : 0;
   c.uname = memberOk ? raw.member.uname : '';
   c.avatar = memberOk ? fixUrl(stripAvatarSize(raw.member.avatar)) : '';
   const contentOk: boolean = raw.content !== undefined && raw.content !== null;
   c.message = contentOk ? raw.content.message : '';
+  if (contentOk && raw.content.emote !== undefined && raw.content.emote !== null) {
+    const table: Record<string, ReplyEmoteRaw> = raw.content.emote;
+    const keys: string[] = Object.keys(table);
+    for (let i: number = 0; i < keys.length; i++) {
+      const entry: ReplyEmoteRaw | undefined = table[keys[i]];
+      if (entry === undefined || entry === null) { continue; }
+      const path: string = entry.url === undefined ? '' : (entry.url as string);
+      if (path.length === 0) { continue; }
+      const emote: CommentEmote = new CommentEmote();
+      emote.key = keys[i];
+      emote.url = fixUrl(path);
+      const size: number = entry.meta === undefined || entry.meta === null || entry.meta.size === undefined ?
+        1 : (entry.meta.size as number);
+      emote.size = size >= 2 ? 2 : 1;
+      c.emotes.push(emote);
+    }
+  }
   c.ctime = raw.ctime;
   c.like = raw.like;
   c.rcount = raw.rcount;
@@ -546,15 +649,18 @@ export class VideoService {
 
   /** 首页推荐流（wbi 签名） */
   static async rcmd(freshIdx: number, ps: number): Promise<PageResult> {
+    // fresh_idx 是服务端去重游标：重复同一个值会拿到完全相同的 20 条（实测 20/20 重复）；
+    // brush/fresh_idx_1h 跟随刷新序号，与网页版/Nara 的请求形状一致。
+    const idx: string = Math.max(1, Math.floor(freshIdx)).toString();
     const params: Record<string, string> = {
       'web_location': '1430650',
       'y_num': '5',
       'fresh_type': '4',
       'feed_version': 'V8',
-      'fresh_idx_1h': '1',
-      'fetch_row': '1',
-      'fresh_idx': freshIdx.toString(),
-      'brush': '0',
+      'fresh_idx_1h': idx,
+      'fetch_row': idx,
+      'fresh_idx': idx,
+      'brush': idx,
       'homepage_ver': '1',
       'ps': ps.toString(),
       'last_y_num': '5',
@@ -672,6 +778,156 @@ export class VideoService {
       }
     }
     return { items: items, hasMore: data.page < data.numPages, nextCursor: page + 1 };
+  }
+
+  /** 搜索联想（spec-04 / 2026-10-27，对齐 Nara `SearchHttp.searchSuggest`）：wbi 签名，失败不抛给页面。 */
+  static async suggest(term: string): Promise<SuggestItem[]> {
+    const trimmed: string = term.trim();
+    const out: SuggestItem[] = [];
+    if (trimmed.length === 0) {
+      return out;
+    }
+    const params: Record<string, string> = {
+      'term': trimmed,
+      'highlight': '0',
+      'spmid': '333.1365',
+      'web_location': '333.1365'
+    };
+    const signed: Record<string, string> = await wbiSign(params);
+    const raw: string = await getJson(API_BASE + '/x/web-interface/suggest?' + buildQuery(signed));
+    const resp = parseEnvelope<SuggestData>(raw);
+    if (resp.code !== 0) {
+      return out;
+    }
+    const data: SuggestData | undefined = resp.data;
+    if (data === undefined || data === null || data.result === undefined || data.result === null) {
+      return out;
+    }
+    const list: SuggestTagRaw[] | undefined = data.result.tag;
+    if (list === undefined || list === null) {
+      return out;
+    }
+    for (let i: number = 0; i < list.length; i++) {
+      const item: SuggestTagRaw = list[i];
+      const word: string | undefined = item.term;
+      if (word === undefined || word.length === 0) {
+        continue;
+      }
+      const label: string | undefined = item.name;
+      out.push({ term: word, label: label !== undefined && label.length > 0 ? label : word });
+    }
+    return out;
+  }
+
+  /**
+   * 下载取流（spec-17 2026-10-27）：DASH 固定最高画质 + 最高音轨。
+   * 返回 undefined 表示该视频没有可用 DASH（如 PGC/老片），由调用方降级到 durl 单文件。
+   */
+  static async dashForDownload(bvid: string, cid: number): Promise<DashDownloadUrl | undefined> {
+    const params: Record<string, string> = {
+      'bvid': bvid,
+      'cid': cid.toString(),
+      'qn': '120',
+      'fnval': '4048',
+      'fnver': '0',
+      'fourk': '1'
+    };
+    const signed: Record<string, string> = await wbiSign(params);
+    const raw: string = await getJson(API_BASE + '/x/player/wbi/playurl?' + buildQuery(signed));
+    const resp = parseEnvelope<PlayDataRaw>(raw);
+    ensureOk(resp);
+    const d: PlayDataRaw | undefined = resp.data;
+    if (d === undefined || d === null) { return undefined; }
+    const dash: DashRaw | undefined = d.dash;
+    if (dash === undefined || dash === null || dash.video === undefined || dash.video === null
+      || dash.video.length === 0) {
+      return undefined;
+    }
+    const videos: DashSegRaw[] = dash.video;
+    let top: number = 0;
+    for (const seg of videos) {
+      const q: number = seg.id !== undefined ? seg.id : 0;
+      if (q > top) { top = q; }
+    }
+    // 同档位优先 H.264（兼容性最好），没有则取该档首个。
+    let pick: DashSegRaw | undefined = undefined;
+    for (const seg of videos) {
+      if (seg.id !== top) { continue; }
+      if (pick === undefined) { pick = seg; }
+      const codecs: string = (seg.codecs !== undefined ? seg.codecs : '').toLowerCase();
+      if (seg.codecid === 7 || codecs.startsWith('avc')) { pick = seg; break; }
+    }
+    if (pick === undefined) { return undefined; }
+    const videoUrl: string = VideoService.dashSegUrl(pick);
+    if (videoUrl.length === 0) { return undefined; }
+
+    // 音频取 id 最大（30280=192k；有 Hi-Res/Dolby 时自然取到更高的）。
+    const audios: DashSegRaw[] | undefined = dash.audio;
+    let bestAudio: DashSegRaw | undefined = undefined;
+    if (audios !== undefined && audios !== null) {
+      for (const seg of audios) {
+        if (VideoService.dashSegUrl(seg).length === 0) { continue; }
+        const segId: number = seg.id !== undefined ? seg.id : 0;
+        const bestId: number = bestAudio !== undefined && bestAudio.id !== undefined ? bestAudio.id : 0;
+        if (bestAudio === undefined || segId > bestId) { bestAudio = seg; }
+      }
+    }
+    const out: DashDownloadUrl = {
+      videoUrl: videoUrl,
+      videoBackup: VideoService.dashSegBackup(pick),
+      audioUrl: bestAudio !== undefined ? VideoService.dashSegUrl(bestAudio) : '',
+      audioBackup: bestAudio !== undefined ? VideoService.dashSegBackup(bestAudio) : [],
+      quality: top,
+      durationMs: dash.duration !== undefined ? dash.duration * 1000 : 0
+    };
+    return out;
+  }
+
+  private static dashSegUrl(seg: DashSegRaw): string {
+    const u: string = seg.baseUrl !== undefined && seg.baseUrl.length > 0
+      ? seg.baseUrl : (seg.base_url !== undefined ? seg.base_url : '');
+    return u.length > 0 ? fixUrl(u) : '';
+  }
+
+  private static dashSegBackup(seg: DashSegRaw): string[] {
+    const out: string[] = [];
+    const a: string[] | undefined = seg.backupUrl !== undefined ? seg.backupUrl : seg.backup_url;
+    if (a !== undefined && a !== null) {
+      for (let i: number = 0; i < a.length; i++) {
+        if (a[i].length > 0) { out.push(fixUrl(a[i])); }
+      }
+    }
+    return out;
+  }
+
+  /** 评论@昵称解析：用户搜索取同名mid；无精确同名且仅一个候选时用该候选，其余返回0。 */
+  static async searchUserByName(name: string): Promise<number> {
+    const keyword: string = name.trim();
+    if (keyword.length === 0) { return 0; }
+    try {
+      const params: Record<string, string> = {
+        'search_type': 'bili_user',
+        'keyword': keyword,
+        'page': '1',
+        'page_size': '10',
+        'web_location': '1430650'
+      };
+      const signed: Record<string, string> = await wbiSign(params);
+      const raw: string = await getJson(API_BASE + '/x/web-interface/wbi/search/type?' + buildQuery(signed));
+      const resp = parseEnvelope<UserSearchData>(raw);
+      if (resp.code !== 0) { return 0; }
+      const data: UserSearchData | undefined = resp.data;
+      const list: UserSearchItemRaw[] | undefined = data === undefined ? undefined : data.result;
+      if (list === undefined || list === null || list.length === 0) { return 0; }
+      let first: number = 0;
+      for (let i: number = 0; i < list.length; i++) {
+        const mid: number = list[i].mid === undefined ? 0 : (list[i].mid as number);
+        if (mid <= 0) { continue; }
+        if (first <= 0) { first = mid; }
+        if (list[i].uname === keyword) { return mid; }
+      }
+      return list.length === 1 ? first : 0;
+    } catch (_) { return 0; }
   }
 
   /** 视频详情（view，无需签名） */
@@ -883,6 +1139,53 @@ export class VideoService {
     }
     const loaded: number = page * 20;
     return { items: items, page: page, total: total, hasMore: loaded < total && items.length > 0 };
+  }
+
+  /** UP 卡片：粉丝/投稿数/等级一次取齐（详情页UP行）。失败返回空对象，不阻断页面。 */
+  static async upCard(mid: number): Promise<UpCard> {
+    const card: UpCard = new UpCard();
+    if (!Number.isFinite(mid) || mid <= 0) { return card; }
+    try {
+      const raw: string = await getJson(API_BASE + '/x/web-interface/card?mid=' + mid.toString());
+      const resp = parseEnvelope<UpCardData>(raw);
+      if (resp.code === -101) { ensureOk(resp); }
+      if (resp.code !== 0 || resp.data === undefined || resp.data === null) { return card; }
+      const info: UpCardRaw | undefined = resp.data.card;
+      if (info === undefined || info === null) { return card; }
+      card.fans = info.fans !== undefined ? info.fans : 0;
+      // archive_count 在 data.archive_count；兼容旧结构时才看 card.archive_count
+      const videos: number = resp.data.archive_count !== undefined ? Number(resp.data.archive_count) :
+        (info.archive_count !== undefined ? Number(info.archive_count) : 0);
+      card.videos = Number.isFinite(videos) && videos > 0 ? videos : 0;
+      card.level = info.level_info !== undefined && info.level_info.current_level !== undefined ?
+        info.level_info.current_level : 0;
+      return card;
+    } catch (_) { return card; }
+  }
+
+  /** 视频标签（view/detail/tag）；未登录或接口拒绝时返回空数组，页面不显示标签行。 */
+  static async tags(bvid: string, cid: number): Promise<VideoTag[]> {
+    const out: VideoTag[] = [];
+    if (bvid.length === 0) { return out; }
+    try {
+      const url: string = API_BASE + '/x/web-interface/view/detail/tag?bvid=' + bvid +
+        (cid > 0 ? '&cid=' + cid.toString() : '');
+      const raw: string = await getJson(url);
+      const resp = parseEnvelope<VideoTagRaw[]>(raw);
+      if (resp.code === -101) { ensureOk(resp); }
+      if (resp.code !== 0 || resp.data === undefined || resp.data === null) { return out; }
+      const list: VideoTagRaw[] = resp.data;
+      for (let i: number = 0; i < list.length; i++) {
+        const name: string = list[i].tag_name === undefined ? '' : (list[i].tag_name as string);
+        if (name.length === 0) { continue; }
+        const tag: VideoTag = new VideoTag();
+        tag.id = list[i].tag_id === undefined ? 0 : (list[i].tag_id as number);
+        tag.name = name;
+        tag.type = list[i].tag_type === undefined ? '' : (list[i].tag_type as string);
+        out.push(tag);
+      }
+      return out;
+    } catch (_) { return out; }
   }
 
   /** UP 主粉丝数（relation/stat） */
@@ -1104,6 +1407,42 @@ export class VideoService {
     }
   }
 
+  /** 投屏只传完整音画单流；电视自行访问URI，不传应用Cookie/Referer。 */
+  static async castUrl(bvid: string, cid: number): Promise<CastUrl> {
+    if (!/^BV[A-Za-z0-9]+$/.test(bvid) || !Number.isFinite(cid) || cid <= 0) {
+      throw new AppError('parse', -1, '当前视频暂不支持投屏');
+    }
+    const revision: number = CookieStore.sessionRevision();
+    const url: string = API_BASE + '/x/player/playurl?bvid=' + encodeURIComponent(bvid) +
+      '&cid=' + Math.floor(cid).toString() + '&qn=64&platform=html5&high_quality=1&otype=json';
+    const raw: string = await getJson(url);
+    // 旧账号迟到的-101不能登出新账号，也不回填旧账号媒体地址。
+    if (revision !== CookieStore.sessionRevision()) { throw new AppError('auth', -1, '登录状态已变化，请重试'); }
+    const resp = parseEnvelope<PlayDataRaw>(raw);
+    ensureOk(resp);
+    const data: PlayDataRaw | undefined = resp.data;
+    const segments: DurlSegRaw[] | undefined = data?.durl;
+    if (!data || !segments || segments.length !== 1 || typeof segments[0].url !== 'string' || !segments[0].url) {
+      throw new AppError('parse', -1, '当前视频没有可投屏的完整媒体源');
+    }
+    const duration: number = data.timelength || segments[0].length || 0;
+    if (!Number.isFinite(duration) || duration <= 0 ||
+      (segments[0].length !== undefined && segments[0].length! > 0 &&
+        Math.abs(segments[0].length! - duration) > 2000)) {
+      throw new AppError('parse', -1, '当前视频的投屏媒体源不完整');
+    }
+    const candidates: string[] = conventionalUrls(segments[0].url!, segments[0].backup_url || []);
+    for (let i: number = 0; i < candidates.length; i++) {
+      const candidate: string = candidates[i];
+      // 不接受本机文件、局域网代理或携带用户名/密码的地址；URL仅留在内存。
+      if (/^https?:\/\/[A-Za-z0-9.-]+(?::\d+)?\//.test(candidate) &&
+        !/^https?:\/\/(?:localhost|127\.|0\.|10\.|192\.168\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.)/i.test(candidate)) {
+        return { url: candidate, durationMs: duration, quality: data.quality || 64 };
+      }
+    }
+    throw new AppError('parse', -1, '当前视频暂无可投屏的常规媒体源');
+  }
+
   /** 下载用：直接取 durl 单流（带音轨 mp4，避免 DASH 音视频分离合并）。返回地址 + 备用 + 时长 */
   static async durlForDownload(bvid: string, cid: number, qn: number): Promise<DownloadUrl> {
     const url: string = API_BASE + '/x/player/playurl?bvid=' + bvid + '&cid=' + cid.toString() +
@@ -1141,6 +1480,13 @@ export class VideoService {
   }
 }
 
+/** 投屏候选：接收端直连的完整单段音画源（spec-32） */
+export interface CastUrl {
+  url: string;
+  durationMs: number;
+  quality: number;
+}
+
 /** 下载源（spec-09） */
 export interface DownloadUrl {
   url: string;
@@ -1149,6 +1495,18 @@ export interface DownloadUrl {
   durationMs: number;
   /** 文件字节数（0 表示未知） */
   size: number;
+}
+
+/** DASH 下载源（spec-17 2026-10-27）：视频流与音频流分开下，播放时由 libmpv 绑定音轨。 */
+export interface DashDownloadUrl {
+  videoUrl: string;
+  videoBackup: string[];
+  /** 空字符串表示该视频无独立音轨（极少数），调用方应降级 durl。 */
+  audioUrl: string;
+  audioBackup: string[];
+  /** 实际选中的 qn */
+  quality: number;
+  durationMs: number;
 }
 
 /** durl 段 → PlayInfo（单流，无独立音轨） */

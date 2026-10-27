@@ -61,6 +61,10 @@
     {
       "name": "top_bar_mask_end",
       "value": "#00000000"
+    },
+    {
+      "name": "link_blue",
+      "value": "#6FB6FF"
     }
   ]
 }

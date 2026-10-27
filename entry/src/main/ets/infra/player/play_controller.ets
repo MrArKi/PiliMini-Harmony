@@ -4,16 +4,22 @@ import { audio } from '@kit.AudioKit';
 import type { NativePlayerEvent, NativePlayerSnapshot } from 'libpilimini_player.so';
 import { MpvEngine } from './mpv_engine';
 import { BgAudio } from './audio_mode';
+import { DlnaCastSession } from './dlna_session';
+import { DlnaDiscovery } from './dlna_discovery';
+import { CastSnapshot, DlnaDevice, DlnaMedia } from '../../model/cast';
 import { PlaybackHistory } from './playback_history';
-import { VideoService, PlayInfo, PlayQuality } from '../../service/video_service';
+import { VideoService, PlayInfo, PlayQuality, CastUrl } from '../../service/video_service';
 import { AuthService } from '../../service/auth_service';
 import { PlaybackPos } from '../storage/playback_pos';
 import { prefsGet } from '../storage/prefs';
-import { onAppBackground, onAppForeground } from '../event/app_events';
+import { onAppBackground, onAppForeground, onAuthLogout } from '../event/app_events';
+import { CookieStore } from '../cookie/cookie_store';
 import { DownloadLibraryService } from '../../service/download_library_service';
 
 export interface PlaybackSource {
   bvid: string; cid: number; localPath: string;
+  /** DASH 双文件：独立音频路径（空=单文件 MP4）。 */
+  localAudioPath?: string;
   title: string; artist: string; cover: string;
   localDuration?: number;
   offlineScope?: string;
@@ -21,6 +27,7 @@ export interface PlaybackSource {
 }
 
 export class PlaybackSnapshot {
+  cast: CastSnapshot = new CastSnapshot();
   state: string = 'idle';
   position: number = 0;
   /** 与position同次采样的ACTIVE单调毫秒，供画面弹幕插值，不增加原生轮询。 */
@@ -106,8 +113,18 @@ export class PlayController {
   private volumeManager: audio.AudioVolumeManager = audio.getAudioManager().getVolumeManager();
   private offBg: (() => void) | undefined = undefined;
   private offFg: (() => void) | undefined = undefined;
+  private offLogout: (() => void) | undefined = undefined;
+  private castSession: DlnaCastSession | undefined = undefined;
+  private castCleanupSession: DlnaCastSession | undefined = undefined;
+  private castDiscovery: DlnaDiscovery | undefined = undefined;
+  private castMedia: DlnaMedia | undefined = undefined;
+  private castGeneration: number = 0;
+  private startRequest: number = 0;
+  private castRevision: number = -1;
+  private castHeld: boolean = false;
+  private castPanelVisible: boolean = false;
   private readonly focusListener = (event: audio.AudioSessionStateChangedEvent): void => {
-    if (this.disposed || !this.visible || this.source === undefined || PlayController.focusOwner !== this.owner) { return; }
+    if (this.castHeld || this.disposed || !this.visible || this.source === undefined || PlayController.focusOwner !== this.owner) { return; }
     const hint: audio.AudioSessionStateChangeHint = event.stateChangeHint;
     console.info('[PiliMini-focus] hint=' + hint.toString() + ' wanted=' + this.state.wanted.toString());
     if (hint === audio.AudioSessionStateChangeHint.AUDIO_SESSION_STATE_CHANGE_HINT_PAUSE) {
@@ -128,7 +145,7 @@ export class PlayController {
     }
   };
   private readonly deviceListener = (event: audio.DeviceChangeAction): void => {
-    if (event.type === audio.DeviceChangeType.DISCONNECT && (this.state.wanted || this.focusPausedGeneration >= 0)) {
+    if (!this.castHeld && event.type === audio.DeviceChangeType.DISCONNECT && (this.state.wanted || this.focusPausedGeneration >= 0)) {
       this.setWanted(false);
     }
     this.syncSystemVolume();
@@ -162,6 +179,10 @@ export class PlayController {
     this.initialized = true;
     this.offBg = onAppBackground((): void => { this.onBackground(); });
     this.offFg = onAppForeground((): void => { this.onForeground(); });
+    this.offLogout = onAuthLogout((): void => {
+      this.invalidateCast(false);
+      this.emit();
+    });
     this.focusManager.on('audioSessionStateChanged', this.focusListener);
     this.focusSubscribed = true;
     this.routing.on('deviceChange', audio.DeviceFlag.OUTPUT_DEVICES_FLAG, this.deviceListener);
@@ -190,7 +211,7 @@ export class PlayController {
   /** 原生事件即时响应；只有播放/准备/seek需要快照，稳定暂停无定时任务。 */
   private scheduleRefresh(): void {
     if (this.timer !== -1) { clearTimeout(this.timer); this.timer = -1; }
-    if (this.refreshInFlight || this.disposed || !this.visible || this.engine === undefined ||
+    if (this.castHeld || this.refreshInFlight || this.disposed || !this.visible || this.engine === undefined ||
       this.state.state === 'error' || this.state.state === 'completed' ||
       (this.state.loaded && !this.state.wanted && this.pendingSeek < 0 && !this.restoring && this.audioMissingAt === 0)) { return; }
     const urgent: boolean = !this.state.loaded || this.pendingSeek >= 0 || this.restoring || this.audioMissingAt > 0;
@@ -213,7 +234,7 @@ export class PlayController {
     BgAudio.claim(this.ctx, this.owner, source.title, source.bvid + ':' + source.cid.toString(), {
       play: (): void => { this.setWanted(true); }, pause: (): void => { this.setWanted(false); },
       seek: (ms: number): void => { this.seek(ms); },
-      skip: (ms: number): void => { this.seek(this.position() + ms); }
+      skip: (ms: number): void => { this.seek((this.castHeld ? this.state.cast.position : this.position()) + ms); }
     }, source.artist, source.cover);
   }
 
@@ -230,8 +251,307 @@ export class PlayController {
     this.lastSessionAt = Date.now();
     BgAudio.updateMetadata(this.owner, source.title, source.bvid + ':' + source.cid.toString(),
       this.state.duration, source.artist, source.cover);
+    if (this.castHeld) {
+      const cast: CastSnapshot = this.state.cast;
+      BgAudio.setState(this.owner, cast.remote && cast.phase === 'playing', cast.position,
+        cast.duration || this.state.duration, 1, cast.remote && cast.phase === 'connecting', true);
+      return;
+    }
     BgAudio.setState(this.owner, this.state.wanted && this.state.state !== 'completed' && this.state.state !== 'error',
       this.state.position, this.state.duration, this.state.speed, this.state.state === 'loading');
+  }
+
+  /** 取完整媒体源后直接发现DLNA；不依赖OEM系统设备选择器。 */
+  async beginCast(): Promise<void> {
+    const source: PlaybackSource | undefined = this.source;
+    if (this.disposed || !this.visible || this.background || source === undefined || source.localPath.length > 0) { return; }
+    if (!this.checkCastAccount()) { return; }
+    if (this.state.cast.phase === 'preparing' || this.state.cast.phase === 'connecting') { return; }
+    const closing: Promise<void> = this.invalidateCast(false);
+    const generation: number = this.castGeneration;
+    const revision: number = CookieStore.sessionRevision();
+    this.castRevision = revision;
+    const snapshot: CastSnapshot = new CastSnapshot();
+    if (this.castHeld) {
+      snapshot.deviceName = this.state.cast.deviceName;
+      snapshot.position = this.state.cast.position; snapshot.duration = this.state.cast.duration;
+    }
+    snapshot.localHeld = this.castHeld; snapshot.selection = false; snapshot.phase = 'preparing'; snapshot.message = '正在准备投屏…';
+    this.state.cast = snapshot; this.emit();
+    const current = (): boolean => this.castCurrent(generation, revision, source);
+    try {
+      if (!this.state.loaded || this.engine === undefined) { throw new Error('请等待视频准备完成后再投屏'); }
+      await closing;
+      if (!current()) { this.checkCastAccount(); return; }
+      const stopped: boolean = await DlnaCastSession.drainStops();
+      if (!current()) { this.checkCastAccount(); return; }
+      if (!stopped || (this.castCleanupSession !== undefined && !this.castCleanupSession.stopped())) {
+        throw new Error('尚未确认电视停止，请重试断开');
+      }
+      this.castCleanupSession = undefined;
+      const media: CastUrl = await VideoService.castUrl(source.bvid, source.cid);
+      if (!current()) { this.checkCastAccount(); return; }
+      if (this.background || !this.castPanelVisible) { this.cancelCastDiscovery(); return; }
+      if (this.state.duration > 0 && Math.abs(media.durationMs - this.state.duration) > 2000) {
+        throw new Error('当前视频的投屏媒体源不完整');
+      }
+      const item: DlnaMedia = new DlnaMedia();
+      item.url = media.url; item.title = source.title; item.duration = media.durationMs;
+      item.position = this.position(); this.castMedia = item;
+      this.state.cast.phase = 'selecting'; this.state.cast.selection = true; this.state.cast.message = ''; this.state.cast.discovering = true;
+      let discovery: DlnaDiscovery | undefined = undefined;
+      discovery = new DlnaDiscovery((devices: DlnaDevice[], discovering: boolean, message: string): void => {
+        if (!current() || this.castDiscovery !== discovery) { return; }
+        if (!this.checkCastAccount()) { return; }
+        this.state.cast.devices = devices.slice(); this.state.cast.discovering = discovering;
+        this.state.cast.message = message; this.emit();
+      });
+      this.castDiscovery = discovery; this.emit();
+      await discovery.start();
+    } catch (error) {
+      if (!current()) { this.checkCastAccount(); return; }
+      this.stopCastDiscovery();
+      this.state.cast.phase = 'error'; this.state.cast.remote = false; this.state.cast.selection = false;
+      const message: string = (error as Error).message || '';
+      const allowed: string[] = ['请等待视频准备完成后再投屏', '当前视频暂不支持投屏',
+        '当前视频没有可投屏的完整媒体源', '当前视频的投屏媒体源不完整',
+        '当前视频暂无可投屏的常规媒体源', '登录状态已变化，请重试', '尚未确认电视停止，请重试断开'];
+      this.state.cast.message = allowed.indexOf(message) >= 0 ? message : '暂时无法投屏，请检查网络后重试';
+      this.emit();
+    }
+  }
+
+  async selectCastDevice(id: string): Promise<void> {
+    const source: PlaybackSource | undefined = this.source;
+    const media: DlnaMedia | undefined = this.castMedia;
+    if (this.disposed || !this.visible || this.background || !this.castPanelVisible ||
+      !this.state.cast.selection || source === undefined || media === undefined || !this.checkCastAccount()) { return; }
+    const device: DlnaDevice | undefined = this.state.cast.devices.find((item: DlnaDevice): boolean => item.id === id);
+    if (device === undefined) { return; }
+    const generation: number = this.castGeneration;
+    const revision: number = CookieStore.sessionRevision();
+    const current = (): boolean => this.castCurrent(generation, revision, source);
+    this.stopCastDiscovery(); this.state.cast.selection = false;
+    this.state.cast.phase = 'connecting'; this.state.cast.message = '正在连接…'; this.emit();
+    let transport: DlnaCastSession | undefined = undefined;
+    transport = new DlnaCastSession(
+      (): boolean => {
+        if (generation === this.castGeneration && revision !== CookieStore.sessionRevision()) {
+          this.checkCastAccount(); return false;
+        }
+        return current();
+      },
+      (): number => {
+        if (!current()) { throw new Error('投屏已取消'); }
+        const position: number = Math.floor(Math.max(0, Math.min(this.position(), Math.max(0, media.duration - 1000))));
+        if (!this.castHeld) { this.setWanted(false); }
+        this.castHeld = true;
+        this.clearFocusResume(); this.releaseFocus();
+        this.clearBackgroundTimer(); this.clearRestore(); this.invalidateSnapshot();
+        this.pendingSeek = -1; this.seekStarted = false; this.pendingEnd = false; this.audioMissingAt = 0;
+        this.state.seeking = false; BgAudio.setRemote(this.owner, true); this.scheduleRefresh();
+        return position;
+      },
+      (cast: CastSnapshot): void => {
+        if (!current() || this.castSession !== transport) { return; }
+        cast.localHeld = this.castHeld; cast.selection = false; cast.discovering = false; cast.devices = [];
+        this.state.cast = cast;
+        if (this.castHeld && cast.duration <= 0) { cast.duration = media.duration; }
+        if (this.castHeld && Number.isFinite(cast.position)) {
+          this.state.position = Math.max(0, cast.position);
+          this.state.sampledAt = systemDateTime.getUptime(systemDateTime.TimeType.ACTIVE);
+          if (this.history !== undefined && cast.remote) {
+            this.history.observe(cast.position, cast.phase === 'playing', false,
+              cast.phase === 'paused' || cast.phase === 'ended', this.background);
+          }
+          this.savePosition(false);
+        }
+        if (!cast.remote && this.castHeld) {
+          BgAudio.stop(this.owner); this.state.wanted = false; this.state.state = 'paused';
+        }
+        this.syncSession(); this.updateCastBackground(); this.emit();
+      });
+    this.castSession = transport;
+    BgAudio.setCastCleanup(this.owner, (): Promise<void> => transport!.disconnect());
+    transport.setBackground(this.background); transport.setPanelVisible(this.castPanelVisible);
+    try { await transport.connect(device, media); }
+    catch (_) {
+      if (!current() || this.castSession !== transport) { return; }
+      this.state.cast.phase = 'error'; this.state.cast.message = '投屏连接失败，请重试'; this.emit();
+    }
+  }
+
+  private stopCastDiscovery(): void {
+    const discovery: DlnaDiscovery | undefined = this.castDiscovery;
+    this.castDiscovery = undefined;
+    if (discovery !== undefined) { discovery.stop(); }
+    this.state.cast.discovering = false;
+  }
+
+  private cancelCastDiscovery(): void {
+    this.invalidateCast(false);
+    if (!this.castHeld) { this.state.cast = new CastSnapshot(); }
+    this.emit();
+  }
+
+  private castCurrent(generation: number, revision: number, source: PlaybackSource): boolean {
+    return !this.disposed && this.visible && generation === this.castGeneration &&
+      revision === CookieStore.sessionRevision() && this.source === source;
+  }
+
+  private checkCastAccount(): boolean {
+    if (this.castRevision < 0 || this.castRevision === CookieStore.sessionRevision()) { return true; }
+    this.invalidateCast(false);
+    this.state.cast.phase = 'disconnected'; this.state.cast.message = '登录状态已变化，请重新投屏';
+    this.emit(); return false;
+  }
+
+  castPlay(): void {
+    if (!this.checkCastAccount() || this.disposed || !this.visible || this.castSession === undefined) { return; }
+    this.castSession.command('play');
+  }
+
+  castPause(): void {
+    if (!this.checkCastAccount() || this.disposed || !this.visible || this.castSession === undefined) { return; }
+    this.castSession.command('pause');
+  }
+
+  castSeek(ms: number): void {
+    if (!Number.isFinite(ms) || !this.checkCastAccount() || this.disposed || !this.visible || this.castSession === undefined) { return; }
+    this.castSession.command('seek', ms);
+  }
+
+  setCastPanelVisible(visible: boolean): void {
+    this.castPanelVisible = visible;
+    if (!this.checkCastAccount()) { return; }
+    if (!visible && (this.state.cast.phase === 'preparing' || this.state.cast.selection)) {
+      this.cancelCastDiscovery(); return;
+    }
+    if (this.castSession !== undefined) { this.castSession.setPanelVisible(visible); }
+  }
+
+  async disconnectCast(resumeLocal: boolean): Promise<void> {
+    const held: boolean = this.castHeld;
+    const transport: DlnaCastSession | undefined = this.castSession || this.castCleanupSession;
+    let position: number = held ? this.state.cast.position : this.position();
+    // 周期读取最多滞后5秒；续播前补读一次，读取超时只退回既有快照，不阻塞断开。
+    if (resumeLocal && held && this.castSession !== undefined) {
+      const fresh: number = await this.readRemotePosition(this.castSession);
+      if (fresh >= 0) { position = fresh; }
+    }
+    console.warn('[PiliMini-cast] disconnect resume=' + resumeLocal.toString() + ' held=' + held.toString() +
+      ' phase=' + this.state.cast.phase + ' remote=' + Math.floor(position).toString() +
+      ' local=' + Math.floor(this.state.position).toString() + ' loaded=' + this.state.loaded.toString());
+    const source: PlaybackSource | undefined = this.source;
+    const revision: number = CookieStore.sessionRevision();
+    const closing: Promise<void> = this.invalidateCast(false);
+    const generation: number = this.castGeneration;
+    this.syncSession(); this.emit();
+    await closing;
+    if (source === undefined || !this.castCurrent(generation, revision, source)) { return; }
+    if (held && transport !== undefined && !transport.stopped()) {
+      this.state.cast.phase = 'error'; this.state.cast.message = '尚未确认电视停止，请重试断开或在手机继续播放';
+      this.emit(); return;
+    }
+    if (!resumeLocal || !held) { return; }
+    this.castCleanupSession = undefined;
+    this.castHeld = false; BgAudio.setRemote(this.owner, false);
+    this.state.cast = new CastSnapshot();
+    this.resumeLocalAt(position);
+    this.emit();
+  }
+
+  /** 断开前的最后进度补读；1.5秒内没结果就按既有快照处理，远端慢不能拖住本机恢复。 */
+  private readRemotePosition(session: DlnaCastSession): Promise<number> {
+    return new Promise<number>((resolve: (value: number) => void): void => {
+      let settled: boolean = false;
+      const timer: number = setTimeout((): void => {
+        if (settled) { return; }
+        settled = true; resolve(-1);
+      }, 1500);
+      session.syncPosition().then((value: number): void => {
+        if (settled) { return; }
+        settled = true; clearTimeout(timer); resolve(value);
+      }).catch((): void => {
+        if (settled) { return; }
+        settled = true; clearTimeout(timer); resolve(-1);
+      });
+    });
+  }
+
+  /**
+   * 远端确认停止后回到本机：按远端进度seek再起播。
+   * 不走setWanted的完成态重播分支，也不依赖引擎一定在内存里——引擎已被回收时按同一进度重载。
+   */
+  private resumeLocalAt(target: number): void {
+    const source: PlaybackSource | undefined = this.source;
+    if (this.disposed || !this.visible || source === undefined) { return; }
+    const duration: number = this.state.duration;
+    const value: number = Number.isFinite(target) ? Math.max(0, target) : 0;
+    const position: number = duration > 0 ? Math.min(value, Math.max(0, duration - 1000)) : value;
+    console.warn('[PiliMini-cast] resume target=' + Math.floor(value).toString() +
+      ' position=' + Math.floor(position).toString() + ' duration=' + Math.floor(duration).toString() +
+      ' loaded=' + this.state.loaded.toString() + ' engine=' + (this.engine !== undefined).toString());
+    this.state.position = position;
+    this.state.sampledAt = systemDateTime.getUptime(systemDateTime.TimeType.ACTIVE);
+    this.state.timeRevision++;
+    this.state.wanted = true;
+    this.pendingEnd = false;
+    this.clearFocusResume();
+    this.clearBackgroundTimer();
+    if (this.state.audioOnly && !this.background && this.engine !== undefined) {
+      this.state.audioOnly = false; this.restoring = true; this.restoreAttempt = 0;
+      try { this.engine.video(true); this.waitRestore(); } catch (_) { this.restoreMedia(); }
+    }
+    if (this.engine !== undefined && this.state.loaded) {
+      try {
+        this.invalidateSnapshot();
+        this.pendingSeek = position; this.seekStarted = false; this.seekAt = Date.now();
+        this.state.seeking = true;
+        this.engine.seek(position);
+        this.setState('loading');
+        this.playAfterFocus(this.engine);
+        this.savePosition(true); this.syncSession(); this.scheduleRefresh();
+        return;
+      } catch (_) {
+        this.pendingSeek = -1; this.state.seeking = false;
+      }
+    }
+    // 引擎不可用：保留目标进度重载；完成态必须先退出，否则start按0起播。
+    if (this.state.state === 'completed') { this.setState('paused'); }
+    this.start(source, this.state.quality, true);
+  }
+
+  /** 同步作废投屏回调后才异步释放；不影响mpv自己的generation。 */
+  private invalidateCast(reset: boolean): Promise<void> {
+    this.stopCastDiscovery(); this.castMedia = undefined;
+    this.state.cast.selection = false; this.state.cast.devices = [];
+    const transport: DlnaCastSession | undefined = this.castSession || this.castCleanupSession;
+    this.castSession = undefined; this.castGeneration++; this.castRevision = -1;
+    this.castCleanupSession = reset ? undefined : transport;
+    const wasRemote: boolean = this.castHeld;
+    if (wasRemote && Number.isFinite(this.state.cast.position)) {
+      this.state.position = Math.max(0, this.state.cast.position);
+      this.state.sampledAt = systemDateTime.getUptime(systemDateTime.TimeType.ACTIVE);
+      this.state.timeRevision++;
+    }
+    if (reset) { this.castHeld = false; this.state.cast = new CastSnapshot(); }
+    else if (transport !== undefined || wasRemote || this.state.cast.phase !== 'idle') {
+      this.state.cast.remote = false; this.state.cast.phase = 'disconnected';
+      this.state.cast.message = '投屏已断开';
+      this.state.cast.canPlay = false; this.state.cast.canPause = false; this.state.cast.canSeek = false;
+    }
+    this.state.cast.localHeld = this.castHeld;
+    if (wasRemote) { BgAudio.stop(this.owner); }
+    BgAudio.setRemote(this.owner, !reset && this.castHeld);
+    if (wasRemote) { this.syncSession(); }
+    return transport === undefined ? Promise.resolve() : transport.disconnect();
+  }
+
+  private updateCastBackground(): void {
+    if (!this.castHeld) { return; }
+    if (this.background && this.state.cast.remote && this.state.cast.phase === 'playing') { BgAudio.start(this.ctx, this.owner); }
+    else { BgAudio.stop(this.owner); }
   }
 
   private enqueue(work: () => Promise<void>, generation: number = this.generation): Promise<void> {
@@ -251,6 +571,22 @@ export class PlayController {
 
   async start(source: PlaybackSource, quality: number, preserve: boolean = true): Promise<void> {
     if (!this.ready()) { return; }
+    const request: number = ++this.startRequest;
+    const castClosing: Promise<void> = this.invalidateCast(false);
+    await castClosing;
+    if (!this.ready() || request !== this.startRequest) { return; }
+    const stopped: boolean = await DlnaCastSession.drainStops();
+    if (!this.ready() || request !== this.startRequest) { return; }
+    if (!stopped) {
+      this.state.cast.phase = 'error'; this.state.cast.message = '尚未确认电视停止，请重试断开';
+      this.state.cast.localHeld = this.castHeld;
+      if (!this.castHeld) {
+        this.state.wanted = false; this.state.error = '尚未确认电视停止，请重试播放';
+        this.setState('error');
+      }
+      this.emit(); return;
+    }
+    this.invalidateCast(true);
     this.clearFocusResume();
     const previous: PlaybackSource | undefined = this.source;
     const same: boolean = preserve && previous !== undefined && previous.bvid === source.bvid &&
@@ -288,11 +624,17 @@ export class PlayController {
     // 取流与释放可并行，创建只能在释放完成之后；旧实例不能继续发声。
     const closing: Promise<void> = this.enqueue(async (): Promise<void> => { await this.closeEngine(); });
     try {
+      if (!this.current(generation)) { return; }
       let info: PlayInfo;
       let start: number = position;
       if (source.localPath.length > 0) {
-        info = { videoUrl: 'file://' + source.localPath, audioUrl: '', videoBackup: [], audioBackup: [],
-          qualities: [], currentQn: 0, durationMs: (source.localDuration || 0) * 1000, isDash: false };
+        // DASH 双文件（spec-17 2026-10-27）：有独立音轨时按 isDash 交给 mpv 绑定；
+        // 旧版单文件 MP4 仍走 audioUrl 空、isDash=false 的原路径。
+        const localAudio: string = source.localAudioPath !== undefined ? source.localAudioPath : '';
+        const hasAudio: boolean = localAudio.length > 0;
+        info = { videoUrl: 'file://' + source.localPath, audioUrl: hasAudio ? 'file://' + localAudio : '',
+          videoBackup: [], audioBackup: [],
+          qualities: [], currentQn: 0, durationMs: (source.localDuration || 0) * 1000, isDash: hasAudio };
         if (!same) {
           const saved: number = await PlaybackPos.get(source.bvid, source.cid);
           if (!this.current(generation)) { return; }
@@ -359,6 +701,7 @@ export class PlayController {
   }
 
   private onEvent(event: NativePlayerEvent): void {
+    if (this.castHeld) { return; }
     if (event.type === 'video-output-error') { this.fail('视频画面初始化失败，请返回后重试'); return; }
     if (event.type === 'error') { this.retry('播放失败（' + event.code.toString() + '）'); return; }
     if (event.type === 'command-error') {
@@ -383,7 +726,7 @@ export class PlayController {
   }
 
   private refresh(): void {
-    if (this.disposed || !this.visible || this.engine === undefined ||
+    if (this.castHeld || this.disposed || !this.visible || this.engine === undefined ||
       this.state.state === 'error' || this.state.state === 'completed') { return; }
     if (this.timer !== -1) { clearTimeout(this.timer); this.timer = -1; }
     if (this.refreshInFlight) { this.refreshAgain = true; return; }
@@ -402,7 +745,7 @@ export class PlayController {
     const engine: MpvEngine | undefined = this.engine;
     const generation: number = this.generation, revision: number = this.refreshRevision;
     if (engine === undefined) { return; }
-    const valid = (): boolean => this.current(generation) && this.engine === engine &&
+    const valid = (): boolean => !this.castHeld && this.current(generation) && this.engine === engine &&
       revision === this.refreshRevision && this.state.state !== 'error' && this.state.state !== 'completed';
     try {
       if (!this.state.loaded) {
@@ -431,6 +774,7 @@ export class PlayController {
       // restart可能早于VO配置完成；快照确认出图后也必须结束恢复等待。
       if (this.restoring && native.videoEnabled && native.outputReady && !native.seeking && !native.buffering) {
         this.clearRestore();
+        if (this.state.wanted && this.engine !== undefined) { this.playAfterFocus(this.engine); }
       }
       if (diagnostic) {
         const stats = MpvEngine.stats();
@@ -485,12 +829,17 @@ export class PlayController {
   }
 
   toggle(): void {
+    if (this.castHeld) {
+      if (this.state.cast.phase === 'playing') { this.castPause(); } else { this.castPlay(); }
+      return;
+    }
     if (this.state.state === 'completed') { this.seek(0); this.setWanted(true); }
     else { this.setWanted(!this.state.wanted); }
   }
 
   setWanted(wanted: boolean, user: boolean = true): void {
     if (this.disposed || !this.visible) { return; }
+    if (this.castHeld) { if (wanted) { this.castPlay(); } else { this.castPause(); } return; }
     if (user) { this.clearFocusResume(); }
     else { this.focusRevision++; }
     this.commitPosition(); this.invalidateSnapshot();
@@ -514,6 +863,7 @@ export class PlayController {
   }
 
   seek(ms: number): void {
+    if (this.castHeld) { this.castSeek(ms); return; }
     if (this.disposed || !this.visible || this.engine === undefined || !this.state.loaded || !Number.isFinite(ms)) { return; }
     const target: number = Math.max(0, Math.min(ms, Math.max(0, this.state.duration - 1000)));
     try {
@@ -532,7 +882,7 @@ export class PlayController {
   }
 
   speed(value: number): void {
-    if (!Number.isFinite(value) || value < 0.25 || value > 5 || this.disposed) { return; }
+    if (this.castHeld || !Number.isFinite(value) || value < 0.25 || value > 5 || this.disposed) { return; }
     this.commitPosition(); this.invalidateSnapshot();
     this.state.speed = value;
     if (this.engine !== undefined) { this.engine.speed(value); }
@@ -646,7 +996,7 @@ export class PlayController {
   }
 
   private activateFocus(generation: number, revision: number): Promise<boolean> {
-    const valid = (): boolean => this.current(generation) && this.state.wanted && revision === this.focusRevision;
+    const valid = (): boolean => !this.castHeld && this.current(generation) && this.state.wanted && revision === this.focusRevision;
     const work: Promise<boolean> = PlayController.focusQueue.then(async (): Promise<boolean> => {
       if (!valid()) { return false; }
       try {
@@ -677,8 +1027,10 @@ export class PlayController {
 
   private async playAfterFocus(engine: MpvEngine): Promise<void> {
     const generation: number = this.generation, revision: number = this.focusRevision;
-    if (!await this.activateFocus(generation, revision) || !this.current(generation) ||
-      revision !== this.focusRevision || !this.state.wanted || this.engine !== engine) { return; }
+    // 画面恢复期间先不取焦点、不出声；clearRestore后由快照统一再起播，避免只有声音先走。
+    if (this.restoring) { return; }
+    if (!await this.activateFocus(generation, revision) || this.castHeld || !this.current(generation) ||
+      this.restoring || revision !== this.focusRevision || !this.state.wanted || this.engine !== engine) { return; }
     try {
       this.invalidateSnapshot();
       engine.play();
@@ -702,12 +1054,18 @@ export class PlayController {
     this.commitPosition(); this.invalidateSnapshot();
     this.background = true; this.state.background = true; this.savePosition(true);
     if (this.history !== undefined) { this.history.flush(); }
+    this.checkCastAccount();
+    if (this.castSession !== undefined) { this.castSession.setBackground(true); }
+    if (this.castHeld) {
+      this.updateCastBackground(); this.emit(); return;
+    }
     if (this.visible && this.state.wanted && this.engine !== undefined) { this.startBackground(); }
     else if (this.visible && this.state.state === 'paused') { this.stopBackgroundVideo(); }
     this.scheduleRefresh();
     this.emit();
   }
   private async startBackground(): Promise<void> {
+    if (this.castHeld) { this.updateCastBackground(); return; }
     const generation: number = this.generation;
     await BgAudio.start(this.ctx, this.owner);
     if (!this.current(generation) || !this.background || !this.state.wanted) { return; }
@@ -732,10 +1090,18 @@ export class PlayController {
     this.background = false; this.state.background = false; this.clearBackgroundTimer(); BgAudio.stop(this.owner);
     if (this.disposed || !this.visible) { return; }
     this.readSystemVolume();
+    this.checkCastAccount();
+    if (this.castSession !== undefined) { this.castSession.setBackground(false); }
+    if (this.castHeld) { this.emit(); return; }
     if (this.state.audioOnly && this.engine !== undefined) {
       this.state.audioOnly = false; this.restoring = true; this.restoreAttempt = 0;
-      try { this.engine.video(true); this.waitRestore(); }
-      catch (error) { this.restoreMedia(); }
+      try {
+        // 重开视频轨时mpv会立刻出声但画面要等重新配置；先停住声音，出图后整段一起起播。
+        this.engine.pause();
+        this.engine.video(true);
+        this.setState(this.state.wanted ? 'loading' : 'paused');
+        this.waitRestore();
+      } catch (error) { this.restoreMedia(); }
     }
     this.refresh(); this.emit();
   }
@@ -765,13 +1131,15 @@ export class PlayController {
 
   suspend(): Promise<void> {
     if (this.disposed || !this.visible) { return this.nativeQueue; }
+    this.startRequest++;
+    const castClosing: Promise<void> = this.invalidateCast(true);
     this.commitPosition(); this.savePosition(true);
     if (this.history !== undefined) { this.history.flush(); }
     this.clearFocusResume();
     this.visible = false; this.generation++; this.surface = '';
     this.scheduleRefresh();
     this.clearBackgroundTimer(); this.clearRestore(); this.state.loaded = false;
-    const released: Promise<void> = this.enqueue(async (): Promise<void> => { await this.closeEngine(); });
+    const released: Promise<void> = this.enqueue(async (): Promise<void> => { await castClosing; await this.closeEngine(); });
     BgAudio.release(this.owner);
     this.releaseFocus();
     return released;
@@ -784,6 +1152,8 @@ export class PlayController {
 
   dispose(): Promise<void> {
     if (this.disposed) { return this.nativeQueue; }
+    this.startRequest++;
+    const castClosing: Promise<void> = this.invalidateCast(true);
     this.commitPosition(); this.savePosition(true);
     if (this.history !== undefined) { this.history.flush(); this.history = undefined; }
     this.clearFocusResume();
@@ -792,6 +1162,7 @@ export class PlayController {
     if (this.timer !== -1) { clearTimeout(this.timer); this.timer = -1; }
     if (this.offBg !== undefined) { this.offBg(); this.offBg = undefined; }
     if (this.offFg !== undefined) { this.offFg(); this.offFg = undefined; }
+    if (this.offLogout !== undefined) { this.offLogout(); this.offLogout = undefined; }
     if (this.focusSubscribed) {
       this.focusManager.off('audioSessionStateChanged', this.focusListener);
       this.focusSubscribed = false;
@@ -807,6 +1178,7 @@ export class PlayController {
     BgAudio.release(this.owner);
     this.releaseFocus();
     return this.enqueue(async (): Promise<void> => {
+      await castClosing;
       await this.closeEngine();
       const stats = MpvEngine.stats();
       console.info('[PiliMini-mpv] disposed instances=' + stats.instances.toString() + ' threads=' + stats.eventThreads.toString());

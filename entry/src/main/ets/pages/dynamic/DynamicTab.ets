@@ -37,7 +37,8 @@ struct DynFeedList {
 
   aboutToAppear(): void {
     this.pager.initialCursor = ''; // 动态流首页 offset 为空串
-    this.reload();
+    // 三个模式同属一个 Tabs，未选中的先不请求，避免进一次动态拉三页
+    if (this.selected) { this.reload(); }
   }
 
   aboutToDisappear(): void { this.destroyed = true; this.pager.cancel(); }

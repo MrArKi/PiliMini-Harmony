@@ -6,9 +6,11 @@
  * 规格来源：docs/ui/评论区.html、docs/参考-NaraUI基准.md §1
  */
 import { NARA_ROUTE_DURATION, NARA_ROUTE_CURVE } from '../../common/nara_motion';
-import { openMember } from '../../common/member_route';
+import { openMember, openMention } from '../../common/member_route';
+import { RichKind, RichSegment, RichText } from '../../common/rich_text';
 import { router, promptAction, window, display, curves } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
+import { pasteboard } from '@kit.BasicServicesKit';
 import { FrameCallback } from '@ohos.arkui.UIContext';
 import { BasicDataSource } from '../../common/list_data_source';
 import { AsyncImage } from '../../components/AsyncImage';
@@ -19,12 +21,12 @@ import { PlaybackSource } from '../../infra/player/play_controller';
 import { LoadingFooter } from '../../components/StateViews';
 import { formatPlayCount, formatDuration } from '../../components/VideoCard';
 import { VideoItem } from '../../model/video_item';
-import { VideoService, VideoDetail, VideoPageInfo, VideoSeasonSection, VideoEpisode, CommentItem, SubReplyPage } from '../../service/video_service';
+import { VideoService, VideoDetail, VideoPageInfo, VideoSeasonSection, VideoEpisode, CommentItem, SubReplyPage, VideoTag } from '../../service/video_service';
 import { SubReplyPanel } from '../../components/SubReplyPanel';
 import { VideoPartsStrip, VideoEpisodePanel, EpisodeSelection, makeVideoPartsSource } from '../../components/VideoEpisodePanel';
 import { AuthService } from '../../service/auth_service';
 import { FavService, FavFolder } from '../../service/fav_service';
-import { DownloadService, DownloadTask } from '../../service/download_service';
+import { DownloadService, DownloadTask, qualityLabel } from '../../service/download_service';
 import { DownloadLibraryService } from '../../service/download_library_service';
 import { OfflineContext } from '../../model/download';
 import { prefsGet } from '../../infra/storage/prefs';
@@ -70,6 +72,9 @@ struct VideoDetailPage {
   @State loading: boolean = true;
   @State error: string = '';
   @State descExpanded: boolean = false;
+  /** 简介里的链接/@只解析一次，展开/收起不重复切分。 */
+  private descRichKey: string = '';
+  private descRichCache: RichSegment[] = [];
   @State @Watch('onPageIndexChange') currentPageIdx: number = 0;
   private initialCid: number = 0;
   @State onlineSource: PlaybackSource | undefined = undefined;
@@ -97,6 +102,10 @@ struct VideoDetailPage {
 
   // ===== UP 主区（R8） =====
   @State upFans: number = 0;
+  @State upVideos: number = 0;
+  @State upLevel: number = 0;
+  /** 标签行：接口失败保持空，不显示占位空行。 */
+  @State videoTags: VideoTag[] = [];
 
   // ===== 收藏/稍后再看（spec-07） =====
   @State favoured: boolean = false;
@@ -132,6 +141,8 @@ struct VideoDetailPage {
   };
   /** 离线播放：本地文件路径（非空 = 播放已下载文件，播放器同在线一套 UI） */
   @State localPath: string = '';
+  /** DASH 双文件：独立音轨路径（空=旧版单文件 MP4）。 */
+  @State localAudioPath: string = '';
   @State localCover: string = '';
   @State localArtist: string = '';
   @State localDuration: number = 0;
@@ -252,6 +263,7 @@ struct VideoDetailPage {
       const lp: string | undefined = pm['localPath'];
       if (lp !== undefined && lp.length > 0) {
         this.localPath = lp;
+        this.localAudioPath = pm['localAudioPath'] || '';
         this.localCid = parseInt(pm['cid'] || '0', 10);
         this.localCover = pm['localCover'] || ''; this.localArtist = pm['localArtist'] || '';
         this.localDuration = Number(pm['localDuration'] || '0');
@@ -427,7 +439,7 @@ struct VideoDetailPage {
       this.commentGeneration++; this.loadingMoreReply = false; this.ds.reload([]); this.topItems = [];
       this.nextOffset = ''; this.replyEnd = false; this.replyErr = ''; this.replyHeaderOffset = 0;
       this.lastReplyOffset = 0; this.effectiveReplyOffset = 0;
-      this.relatedDs.reload([]); this.relatedCount = 0; this.upFans = 0; this.followed = false;
+      this.relatedDs.reload([]); this.relatedCount = 0; this.upFans = 0; this.upVideos = 0; this.upLevel = 0; this.videoTags = []; this.followed = false;
       this.favoured = false; this.laterAdded = false; this.favFoldersReady = false;
       this.folders = []; this.folderOriginal = []; this.folderChecked = [];
       this.descExpanded = false; this.subShown = false; this.subRoot = undefined;
@@ -438,8 +450,13 @@ struct VideoDetailPage {
 
   private loadOnlineExtras(detail: VideoDetail): void {
     const generation: number = this.detailContentGeneration;
-    VideoService.fans(detail.ownerMid).then((n: number): void => {
-      if (!this.destroyed && generation === this.detailContentGeneration) { this.upFans = n; }
+    VideoService.upCard(detail.ownerMid).then((card): void => {
+      if (!this.destroyed && generation === this.detailContentGeneration) {
+        this.upFans = card.fans; this.upVideos = card.videos; this.upLevel = card.level;
+      }
+    }).catch(() => {});
+    VideoService.tags(detail.bvid, this.currentCid()).then((list: VideoTag[]): void => {
+      if (!this.destroyed && generation === this.detailContentGeneration) { this.videoTags = list; }
     }).catch(() => {});
     this.loadFavState();
     VideoService.related(detail.bvid).then(async (list: VideoItem[]): Promise<void> => {
@@ -481,6 +498,8 @@ struct VideoDetailPage {
   /** 播放器高度：横屏视频 16:9（Nara minVideoHeight）；竖屏视频 max(屏高*0.65, 屏宽)（Nara maxVideoHeight）；
    全屏在 build 里用 100% 铺满 */
   private playerHeight(): number {
+    // 横屏窗口（小窗/分屏）里播放器占满窗口，不要再按窄边算 16:9
+    if (this.isLandscape && !this.isFullscreen && this.viewportHeight > 0) { return px2vp(this.viewportHeight); }
     const shortSide: number = Math.min(this.screenW, this.screenH);
     const longSide: number = Math.max(this.screenW, this.screenH);
     if (this.isVerticalVideo()) {
@@ -560,7 +579,9 @@ struct VideoDetailPage {
         this.offlineDs.reload(this.offlineTasks);
         const task = this.offlineTasks.find((t: DownloadTask): boolean => t.bvid === this.bvid && t.cid === this.localCid);
         if (!task) { this.error = '本地文件已失效，请返回缓存页检查'; }
-        else { this.localCover = task.cover; this.localArtist = task.upName; this.localDuration = task.duration; }
+        else { this.localCover = task.cover; this.localArtist = task.upName; this.localDuration = task.duration;
+          this.localAudioPath = task.audioPath; if (this.localPath !== task.filePath) { this.localPath = task.filePath; }
+          this.updateLocalSource(); }
       } catch (e) { if (!this.destroyed) { this.error = (e as Error).message; } }
       if (!this.destroyed) { this.loading = false; }
       return;
@@ -834,6 +855,10 @@ struct VideoDetailPage {
   private onWindowSize(size: window.Size): void {
     this.viewportWidth = size.width; this.viewportHeight = size.height;
     this.isLandscape = size.width > size.height;
+    // 小窗/分屏：布局按窗口尺寸算，不能继续用整块屏幕的宽高
+    const w: number = px2vp(size.width);
+    const h: number = px2vp(size.height);
+    if (w > 0 && h > 0) { this.screenW = w; this.screenH = h; }
     this.updateControlInsets();
     this.finishFullscreen(size.width, size.height);
   }
@@ -915,7 +940,8 @@ struct VideoDetailPage {
         t.bvid === this.bvid && t.cid === p.cid);
       if (existing !== undefined && existing.status === 'failed') { await DownloadService.resume(p.cid); }
       else { await DownloadService.add(this.bvid, p.cid, d.title, d.cover, realQn, part, p.duration, d.ownerName,
-        { page: p.page, seasonId: d.seasonId || '', seasonTitle: d.seasonTitle || '', seasonOrder: d.seasonOrder || 0 }); }
+        { page: p.page, seasonId: d.seasonId || '', seasonTitle: d.seasonTitle || '', seasonOrder: d.seasonOrder || 0,
+          upMid: this.upMid }); }
       this.refreshCacheState();
       promptAction.showToast({ message: '已加入缓存队列' });
     } catch (e) {
@@ -1026,54 +1052,115 @@ struct VideoDetailPage {
   }
 
   // ===== 详情头（含 R8 UP 主区） =====
+  /** 标签行：Nara 的圆角标签，点击进搜索；无标签时不占行高。 */
+  @Builder
+  TagRow() {
+    if (this.videoTags.length > 0) {
+      Flex({ wrap: FlexWrap.Wrap }) {
+        ForEach(this.videoTags, (tag: VideoTag) => {
+          Text(tag.display())
+            .fontSize(13)
+            .fontColor($r('app.color.nara_secondary'))
+            .backgroundColor($r('app.color.btn_soft_bg'))
+            .borderRadius(6)
+            .padding({ left: 11, right: 11, top: 5, bottom: 5 })
+            .margin({ right: 8, bottom: 8 })
+            .id('video_tag_' + tag.id.toString())
+            .onClick((): void => { this.openTag(tag); })
+        }, (tag: VideoTag) => tag.id.toString() + '_' + tag.name)
+      }
+      .width('100%').margin({ top: 8 })
+    }
+  }
+
+  /** 简介/标签是否有点开的必要：都没内容时点标题不该有任何反应。 */
+  private hasIntro(d: VideoDetail): boolean {
+    return d.desc.length > 0 || this.videoTags.length > 0;
+  }
+
+  private toggleIntro(): void {
+    const d: VideoDetail | undefined = this.detail;
+    if (d === undefined || !this.hasIntro(d)) { return; }
+    this.descExpanded = !this.descExpanded;
+  }
+
+  private openTag(tag: VideoTag): void {
+    const keyword: string = tag.display();
+    if (keyword.length === 0) { return; }
+    router.pushUrl({ url: 'pages/search/SearchPage', params: { 'keyword': keyword } });
+  }
+
+  private descSegments(desc: string): RichSegment[] {
+    if (this.descRichKey !== desc) {
+      this.descRichKey = desc;
+      this.descRichCache = RichText.isRich(desc) ? RichText.parse(desc) : [];
+    }
+    return this.descRichCache;
+  }
+
+  private descSegmentColor(segment: RichSegment): ResourceColor {
+    return segment.kind === RichKind.Link ? $r('app.color.link_blue') : $r('app.color.brand_pink');
+  }
+
+  private tapDescSegment(segment: RichSegment): void {
+    if (segment.kind === RichKind.Link) {
+      RichText.openUrl(getContext(this) as common.UIAbilityContext, segment.target);
+    } else if (segment.kind === RichKind.Mention) {
+      openMention(segment.target, []);
+    }
+  }
+
   @Builder
   Header(d: VideoDetail) {
     Column() {
-      Row({ space: 6 }) {
-        Text(this.bvid)
-          .fontSize(11)
-          .fontColor($r('app.color.text_secondary'))
-        Blank()
-      }
-      .width('100%')
-
+      // Nara 行为：标题/播放数据整块可点，简介与标签默认折叠（高度 0），点一下展开
       Text(d.title)
-        .margin({ top: 10 })
         .fontSize(17)
         .fontWeight(FontWeight.Medium)
         .fontColor($r('app.color.text_primary'))
         .width('100%')
+        .onClick((): void => { this.toggleIntro(); })
 
       Text(formatPlayCount(d.viewCount) + '播放 · ' + formatPlayCount(d.danmakuCount) + '弹幕 · ' + fmtDate(d.pubdate))
         .fontSize(12)
         .fontColor($r('app.color.text_secondary'))
-        .width('100%').margin({ top: 10 })
+        .width('100%').margin({ top: 8 })
+        .onClick((): void => { this.toggleIntro(); })
 
-      Column({ space: 2 }) {
-        Text(d.desc.length > 0 ? d.desc : '（无简介）')
-          .fontSize(13)
-          .fontColor($r('app.color.text_secondary'))
-          .maxLines(this.descExpanded ? 200 : 3)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .width('100%')
-        if (d.desc.length > 40) {
-          Text(this.descExpanded ? '收起' : '展开更多')
+      if (this.descExpanded) {
+        Column({ space: 2 }) {
+          if (this.descSegments(d.desc).length > 0) {
+            Text() {
+              ForEach(this.descSegments(d.desc), (segment: RichSegment) => {
+                if (segment.kind === RichKind.Plain) {
+                  Span(segment.text).fontSize(13).fontColor($r('app.color.text_secondary'))
+                } else {
+                  Span(segment.text).fontSize(13).fontColor(this.descSegmentColor(segment))
+                    .onClick((): void => { this.tapDescSegment(segment); })
+                }
+              }, (segment: RichSegment, index: number) => index.toString() + '_' + segment.kind.toString())
+            }
+            .fontSize(13)
+            .lineHeight(20)
+            .width('100%')
+          }
+          Text('收起')
             .fontSize(12)
-            .fontColor($r('app.color.brand_pink'))
-            .onClick(() => {
-              this.descExpanded = !this.descExpanded;
-            })
+            .fontColor($r('app.color.text_secondary'))
+            .onClick((): void => { this.descExpanded = false; })
         }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start).margin({ top: 8 })
+
+        this.TagRow()
       }
-      .width('100%')
-      .alignItems(HorizontalAlign.Start).margin({ top: 10 })
 
       Row({ space: 10 }) {
         this.DetailAction(0)
         this.DetailAction(1)
         this.DetailAction(2)
       }
-      .width('100%').margin({ top: 10 })
+      .width('100%').margin({ top: this.descExpanded && this.videoTags.length > 0 ? 0 : 8 })
       if (d.season !== undefined) {
         Row({ space: 10 }) {
           Text('合集：' + d.season.title).fontSize(12).fontColor($r('app.color.text_primary'))
@@ -1093,7 +1180,7 @@ struct VideoDetailPage {
       }
     }
     .width('100%')
-    .padding({ left: 12, right: 12, top: 12, bottom: 10 })
+    .padding({ left: 12, right: 12, top: 8, bottom: 8 })
     .alignItems(HorizontalAlign.Start).backgroundColor($r('app.color.bg_page'))
   }
 
@@ -1144,6 +1231,18 @@ struct VideoDetailPage {
   @Builder
   TabBar() {
     Row() {
+    if (this.isOfflinePlayback()) {
+      // Nara video/view.dart:2341/2362：本地源只有一个 tab「离线视频」，
+      // 单 tab 不画下划线指示器，label 用常规主文字色（非主题主色），最宽 96 左对齐。
+      Text('离线视频')
+        .fontSize(13)
+        .fontWeight(FontWeight.Medium)
+        .fontColor($r('app.color.text_primary'))
+        .width(96)
+        .height(45)
+        .textAlign(TextAlign.Start)
+        .accessibilityText('离线视频')
+    } else {
     Stack({ alignContent: Alignment.BottomStart }) {
       Row() {
         this.TabLabel('简介', 0)
@@ -1158,13 +1257,14 @@ struct VideoDetailPage {
     .width('calc(100% - 52vp)').constraintSize({ maxWidth: 192 })
     .height(45)
     .onAreaChange((_old: Area, area: Area): void => { this.tabBarWidth = Number(area.width); })
+    }
     Blank()
     Button({ type: ButtonType.Normal }) {
       Image(this.danmakuPreferences.enabled ? $r('app.media.icon_dm_on') : $r('app.media.icon_dm_off'))
         .width(22).height(22)
         .fillColor(this.danmakuPreferences.enabled ? $r('app.color.nara_secondary') : $r('app.color.nara_outline'))
     }.width(38).height(38).padding(0).margin({ right: 14 }).backgroundColor(Color.Transparent)
-      .enabled(this.danmakuReady)
+      .enabled(this.danmakuReady && !this.isOfflinePlayback())
       .id('danmaku_inline_toggle')
       .accessibilityText(this.danmakuPreferences.enabled ? '关闭弹幕' : '开启弹幕')
       .onClick((): void => { this.toggleDanmaku(); })
@@ -1293,25 +1393,40 @@ struct VideoDetailPage {
   @Builder
   UpArea(d: VideoDetail) {
     Row({ space: 10 }) {
-      Column() {
-        AsyncImage({ src: d.ownerFace, w: 112, h: 112 })
+      Stack({ alignContent: Alignment.BottomStart }) {
+        Column() {
+          AsyncImage({ src: d.ownerFace, w: 120, h: 120 })
+        }
+        .width(40)
+        .height(40)
+        .borderRadius(20)
+        .clip(true)
+        .backgroundColor($r('app.color.btn_soft_bg'))
+        if (this.upLevel > 0) {
+          Text(this.upLevel.toString())
+            .fontSize(8)
+            .fontColor(Color.White)
+            .backgroundColor($r('app.color.brand_pink'))
+            .borderRadius(3)
+            .padding({ left: 3, right: 3, top: 0, bottom: 0 })
+            .margin({ left: 1, bottom: 1 })
+        }
       }
-      .width(38)
-      .height(38)
-      .borderRadius(19)
-      .clip(true)
-      .backgroundColor($r('app.color.btn_soft_bg'))
+      .width(40)
+      .height(40)
       .onClick(() => { openMember(d.ownerMid); })
 
-      Column({ space: 2 }) {
+      Column({ space: 3 }) {
         Text(d.ownerName)
-          .fontSize(14)
+          .fontSize(15)
           .fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.text_primary'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
-        Text(this.upFans > 0 ? (formatPlayCount(this.upFans) + '粉丝') : '粉丝数加载中…')
+        Text(this.upSubText())
           .fontSize(11)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
           .fontColor($r('app.color.text_secondary'))
       }
       .layoutWeight(1)
@@ -1319,10 +1434,10 @@ struct VideoDetailPage {
       .onClick(() => { openMember(d.ownerMid); })
 
       Button(this.followed ? '已关注' : '关注')
-        .fontSize(13)
-        .height(32)
-        .padding({ left: 16, right: 16 })
-        .borderRadius(16)
+        .fontSize(12)
+        .height(30)
+        .padding({ left: 14, right: 14 })
+        .borderRadius(15)
         .backgroundColor(this.followed ? $r('app.color.btn_soft_bg') : $r('app.color.brand_pink'))
         .fontColor(this.followed ? $r('app.color.text_secondary') : '#FFFFFF')
         .enabled(!this.followBusy)
@@ -1331,7 +1446,14 @@ struct VideoDetailPage {
         })
     }
     .width('100%')
-    .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+    .padding({ left: 12, right: 12, top: 8, bottom: 0 })
+  }
+
+  /** UP 行副标题：粉丝 + 投稿数（Nara 同行展示）。 */
+  private upSubText(): string {
+    if (this.upFans <= 0 && this.upVideos <= 0) { return '粉丝数加载中…'; }
+    const fans: string = formatPlayCount(this.upFans) + '粉丝';
+    return this.upVideos > 0 ? fans + ' · ' + formatPlayCount(this.upVideos) + '视频' : fans;
   }
 
   /** R5：排序头（左「热门评论」+ 右「sort 图标 + 按热度/按时间」） */
@@ -1455,6 +1577,7 @@ struct VideoDetailPage {
 
   private updateLocalSource(): void {
     this.localSource = { bvid: this.bvid, cid: this.localCid, localPath: this.localPath,
+      localAudioPath: this.localAudioPath,
       title: this.localTitle, artist: this.localArtist, cover: this.localCover, localDuration: this.localDuration,
       offlineScope: this.offlineContext.scope, offlineKey: this.offlineContext.key };
   }
@@ -1464,6 +1587,7 @@ struct VideoDetailPage {
     if (!DownloadLibraryService.available(task)) { promptAction.showToast({ message: '本地文件已失效' }); return; }
     // 同一页面/Surface保留全屏和倍速，单个源快照避免不同P的字段交叉。
     this.bvid = task.bvid; this.localCid = task.cid; this.localPath = task.filePath;
+    this.localAudioPath = task.audioPath;
     this.localCover = task.cover; this.localArtist = task.upName; this.localDuration = task.duration;
     this.localTitle = task.part ? task.title + ' · ' + task.part : task.title;
     this.nativeWidth = 0; this.nativeHeight = 0; this.updateLocalSource();
@@ -1474,40 +1598,116 @@ struct VideoDetailPage {
     if (index >= 0 && index < this.offlineTasks.length) { this.playOffline(this.offlineTasks[index]); }
   }
 
+  private isOfflinePlayback(): boolean {
+    return this.localPath.length > 0;
+  }
+
+  /** 回到该视频的在线页：先释放本地播放器再 replaceUrl，避免同栈叠出第二个内核实例。 */
+  private async openOnlineDetail(t: DownloadTask): Promise<void> {
+    if (this.exitPending || this.destroyed) { return; }
+    this.exitPending = true;
+    try {
+      await this.releasePlayer();
+      if (this.destroyed) { return; }
+      await router.replaceUrl({
+        url: 'pages/video/VideoDetailPage',
+        params: { 'bvid': t.bvid, 'cid': t.cid.toString() }
+      });
+    } catch (_) {
+      this.exitPending = false;
+      if (!this.destroyed) { promptAction.showToast({ message: '打开视频页失败' }); }
+    }
+  }
+
+  private async copyOfflinePath(t: DownloadTask): Promise<void> {
+    try {
+      const data: pasteboard.PasteData =
+        pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, t.filePath);
+      await pasteboard.getSystemPasteboard().setData(data);
+      if (!this.destroyed) { promptAction.showToast({ message: '已复制缓存路径' }); }
+    } catch (_) {
+      if (!this.destroyed) { promptAction.showToast({ message: '复制失败' }); }
+    }
+  }
+
+  /** 删除单个缓存：二次确认 → 删文件 → 重排列表（删的是当前播放项则切到剩余首项）。 */
+  private confirmRemoveOffline(t: DownloadTask): void {
+    AlertDialog.show({
+      title: '删除缓存',
+      message: '将删除「' + (t.part.length > 0 ? t.part : t.title) + '」的本地文件。',
+      autoCancel: true,
+      primaryButton: { value: '取消', action: () => {} },
+      secondaryButton: {
+        value: '删除',
+        fontColor: '#E54D42',
+        action: () => { this.removeOffline(t); }
+      }
+    });
+  }
+
+  private async removeOffline(t: DownloadTask): Promise<void> {
+    try {
+      await DownloadService.removeMany([t.cid]);
+    } catch (e) {
+      if (!this.destroyed) { promptAction.showToast({ message: (e as Error).message }); }
+      return;
+    }
+    if (this.destroyed) { return; }
+    this.offlineTasks = DownloadLibraryService.playlist(this.offlineContext);
+    this.offlineDs.reload(this.offlineTasks);
+    if (this.offlineTasks.length === 0) { this.leaveVideo(); return; }
+    const playing: boolean = this.offlineTasks.some((v: DownloadTask): boolean => v.bvid === this.bvid && v.cid === this.localCid);
+    if (!playing) { this.playOffline(this.offlineTasks[0]); }
+  }
+
+  /** 旧任务没存 mid（upMid=0）时按 UP 名反查一次，命中后回填内存。 */
+  private async visitUpOf(t: DownloadTask): Promise<void> {
+    if (t.upMid > 0) { openMember(t.upMid); return; }
+    const name: string = t.upName.trim();
+    if (name.length === 0) {
+      promptAction.showToast({ message: '缺少 UP 主信息' });
+      return;
+    }
+    try {
+      const mid: number = await VideoService.searchUserByName(name);
+      if (this.destroyed) { return; }
+      if (mid > 0) {
+        t.upMid = mid;
+        openMember(mid);
+      } else {
+        promptAction.showToast({ message: '未找到该 UP 主' });
+      }
+    } catch (_) {
+      if (!this.destroyed) { promptAction.showToast({ message: '查找失败，请检查网络' }); }
+    }
+  }
+
+  /** 离线视频列表：与在线播放同一骨架，tab 栏下方就是这一列（不再有页面级大标题与上下集按钮）。 */
   @Builder
-  OfflinePanel() {
-    Column({ space: 8 }) {
-      Text(this.localTitle).fontSize(16).fontColor($r('app.color.text_primary'))
-        .width('100%').maxLines(2).padding({ left: 12, right: 12, top: 12 })
-      Row() {
-        Text('上一集').id('offline_previous').fontSize(13).fontColor($r('app.color.brand_pink'))
-          .opacity(this.offlineIndex() > 0 ? 1 : 0.35).enabled(this.offlineIndex() > 0)
-          .padding(12).onClick(() => { this.nextOffline(-1); })
-        Blank()
-        Text('本地播放 · ' + (this.offlineIndex() + 1).toString() + '/' + this.offlineTasks.length.toString())
-          .fontSize(12).fontColor($r('app.color.text_secondary'))
-        Blank()
-        Text('下一集').id('offline_next').fontSize(13).fontColor($r('app.color.brand_pink'))
-          .opacity(this.offlineIndex() + 1 < this.offlineTasks.length ? 1 : 0.35)
-          .enabled(this.offlineIndex() + 1 < this.offlineTasks.length)
-          .padding(12).onClick(() => { this.nextOffline(1); })
-      }.width('100%')
-      List() {
-        LazyForEach(this.offlineDs, (t: DownloadTask) => {
-          ListItem() {
-            Row({ space: 10 }) {
-              Image($r('app.media.icon_play')).width(16).height(16)
-                .fillColor(t.cid === this.localCid ? $r('app.color.brand_pink') : $r('app.color.text_secondary'))
-              Text(t.part || t.title).fontSize(14).layoutWeight(1).maxLines(2)
-                .fontColor(t.cid === this.localCid ? $r('app.color.brand_pink') : $r('app.color.text_primary'))
-              Text(formatDuration(t.duration)).fontSize(12).fontColor($r('app.color.text_secondary'))
-            }.width('100%').padding({ left: 12, right: 12, top: 14, bottom: 14 })
-              .id('offline_item_' + t.cid.toString()).onClick(() => { if (t.cid !== this.localCid) { this.playOffline(t); } })
-          }
-        }, (t: DownloadTask): string => t.bvid + ':' + t.cid.toString())
-      }.width('100%').layoutWeight(1).cachedCount(1)
-        .edgeEffect(EdgeEffect.None, { alwaysEnabled: true }).nestedScroll(DETAIL_NESTED_SCROLL)
-    }.width('100%').height(this.bodyHeight())
+  LocalVideoPanel() {
+    List() {
+      LazyForEach(this.offlineDs, (t: DownloadTask) => {
+        ListItem() {
+          OfflineVideoCard({
+            task: t,
+            current: t.cid === this.localCid && t.bvid === this.bvid,
+            onOpen: (): void => { if (t.cid !== this.localCid) { this.playOffline(t); } },
+            onOpenOnline: (): void => { this.openOnlineDetail(t); },
+            onCopyPath: (): void => { this.copyOfflinePath(t); },
+            onVisitUp: (): void => { this.visitUpOf(t); },
+            onRemove: (): void => { this.confirmRemoveOffline(t); }
+          })
+        }
+      }, (t: DownloadTask): string => t.bvid + ':' + t.cid.toString())
+    }
+    .width('100%')
+    .layoutWeight(1)
+    .cachedCount(2)
+    // 与收藏/历史等列表页一致：只留顶部 7vp，滚到底就是最后一项贴底，不做底部留白。
+    .padding({ top: 7 })
+    .scrollBar(BarState.Off)
+    .edgeEffect(EdgeEffect.None, { alwaysEnabled: true })
+    .nestedScroll(DETAIL_NESTED_SCROLL)
   }
 
   build() {
@@ -1538,8 +1738,16 @@ struct VideoDetailPage {
         }
         .layoutWeight(1)
         .justifyContent(FlexAlign.Center)
-      } else if (this.localPath.length > 0 && !this.isFullscreen) {
-        this.OfflinePanel()
+      } else if (this.isOfflinePlayback() && !this.isFullscreen) {
+        // 与在线播放同一骨架：播放器 → tab 栏 → 内容（Nara video/view.dart:1916-1950）。
+        // 高度必须跟 playerBoxHeight 联动（visibleBodyHeight），用 bodyHeight 会在播放时
+        // 比可见区高出一条，外层 Scroll 会把 tab 栏一起滚走。
+        Column() {
+          this.TabBar()
+          this.LocalVideoPanel()
+        }
+        .width('100%')
+        .height(this.visibleBodyHeight())
       } else if (this.detail !== undefined && !this.isFullscreen) {
         Stack({ alignContent: Alignment.TopStart }) {
         Column() {
@@ -1845,5 +2053,100 @@ struct VideoDetailPage {
      .height('100%')
      .onAreaChange((_old: Area, area: Area) => { this.pageHeight = Number(area.height); })
      .backgroundColor(this.isFullscreen ? '#000000' : $r('app.color.bg_page'))
+  }
+}
+
+/**
+ * 离线视频列表项（Nara introduction/local/view.dart:50-199）。
+ * 菜单状态必须放在组件内：所有行共享父页面 @State 会让整个列表的菜单同时展开。
+ */
+@Component
+struct OfflineVideoCard {
+  @ObjectLink task: DownloadTask;
+  @Prop current: boolean = false;
+  onOpen: () => void = () => {};
+  onOpenOnline: () => void = () => {};
+  onCopyPath: () => void = () => {};
+  onVisitUp: () => void = () => {};
+  onRemove: () => void = () => {};
+  @State menuShown: boolean = false;
+
+  @Builder
+  MenuRow(icon: Resource, label: string) {
+    Row({ space: 8 }) {
+      Image(icon).width(16).height(16).fillColor($r('app.color.text_secondary'))
+      Text(label).fontSize(13).fontColor($r('app.color.text_primary')).maxLines(1)
+    }
+    .width('100%').height(45).padding({ left: 8, right: 8 })
+  }
+
+  @Builder
+  MenuPanel() {
+    Menu() {
+      MenuItem(this.MenuRow($r('app.media.icon_play'), '查看详情页'))
+        .onClick(() => { this.menuShown = false; this.onOpenOnline(); })
+      MenuItem(this.MenuRow($r('app.media.icon_copy'), '复制缓存路径'))
+        .onClick(() => { this.menuShown = false; this.onCopyPath(); })
+      MenuItem(this.MenuRow($r('app.media.icon_person'), '访问 UP 主'))
+        .enabled(this.task.upMid > 0 || this.task.upName.length > 0)
+        .onClick(() => { this.menuShown = false; this.onVisitUp(); })
+      MenuItem(this.MenuRow($r('app.media.icon_delete_all'), '删除缓存'))
+        .onClick(() => { this.menuShown = false; this.onRemove(); })
+    }.width(192)
+  }
+
+  build() {
+    Stack({ alignContent: Alignment.BottomEnd }) {
+      Row({ space: 10 }) {
+        Stack({ alignContent: Alignment.TopEnd }) {
+          AsyncImage({ src: this.task.cover, w: 320, h: 200 })
+          Text(qualityLabel(this.task.quality)).fontSize(10).fontColor(Color.White)
+            .backgroundColor('#80000000').borderRadius(4).padding({ left: 4, right: 4, top: 1, bottom: 1 })
+            .margin({ top: 6, right: 6 })
+          Text(formatDuration(this.task.duration)).fontSize(10).fontColor(Color.White)
+            .backgroundColor('#80000000').borderRadius(4).padding({ left: 4, right: 4, top: 1, bottom: 1 })
+            .position({ right: 6, bottom: 6 })
+        }
+        .width(160).height(100).borderRadius(6).clip(true).backgroundColor($r('app.color.btn_soft_bg'))
+
+        Column({ space: 5 }) {
+          Text(this.task.title).fontSize(14).lineHeight(19.88).letterSpacing(0.3)
+            .fontColor(this.current ? $r('app.color.brand_pink') : $r('app.color.text_primary'))
+            .fontWeight(this.current ? FontWeight.Medium : FontWeight.Normal)
+            .width('100%').maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
+          if (this.task.part.length > 0 && this.task.part !== this.task.title) {
+            Text(this.task.part).fontSize(12).lineHeight(18).fontColor($r('app.color.text_secondary'))
+              .width('100%').maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+          }
+          Blank()
+          Text(this.task.upName).fontSize(12).lineHeight(18).fontColor($r('app.color.text_secondary'))
+            .width('100%').maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+            .padding({ right: 30 })
+        }
+        .layoutWeight(1).height(100).alignItems(HorizontalAlign.Start)
+      }
+      .width('100%').height(110)
+      .padding({ left: 12, right: 12, top: 5, bottom: 5 })
+      .id('offline_item_' + this.task.cid.toString())
+      .onClick(() => { if (!this.current) { this.onOpen(); } })
+
+      Row() {
+        Image($r('app.media.icon_more')).width(29).height(29).padding(5.5)
+          .fillColor($r('app.color.text_secondary'))
+      }
+      .width(29)
+      .height(29)
+      .margin({ right: 12, bottom: 5 })
+      .accessibilityText('缓存操作')
+      .id('offline_menu_' + this.task.cid.toString())
+      .onClick(() => { this.menuShown = !this.menuShown; })
+      .bindMenu(this.menuShown, this.MenuPanel(), {
+        placement: Placement.TopRight,
+        enableArrow: false,
+        onDisappear: () => { this.menuShown = false; }
+      })
+    }
+    .width('100%')
+    .height(112)
   }
 }

@@ -6,7 +6,9 @@
  *  「共N条回复」→ 楼中楼面板（R3）｜只读点赞icon16+数字11，无独立操作行
  */
 import { AsyncImage } from './AsyncImage';
-import { openMember } from '../common/member_route';
+import { openMember, openMention } from '../common/member_route';
+import { RichKind, RichSegment, RichText } from '../common/rich_text';
+import { common } from '@kit.AbilityKit';
 import { GalleryThumbnail, nextGalleryId } from './GalleryThumbnail';
 import { thumbUrl } from '../infra/image/bili_image';
 import { formatPlayCount } from './VideoCard';
@@ -27,7 +29,49 @@ export struct CommentItemView {
   };
 
   private galleryId: string = nextGalleryId();
+  private messageCacheKey: string = '';
+  private messageCache: RichSegment[] = [];
+
+  /** 含链接/@时才分层渲染，普通评论保持单Text，不额外增加节点。 */
+  private messageSegments(): RichSegment[] {
+    if (this.messageCacheKey !== this.item.message) {
+      this.messageCacheKey = this.item.message;
+      const rich: boolean = RichText.isRich(this.item.message) || this.item.emotes.length > 0;
+      this.messageCache = rich ? RichText.parse(this.item.message, this.item.emotes) : [];
+    }
+    return this.messageCache;
+  }
+
+  /** 表情占位符渲染尺寸（vp）：正文与楼中楼行高不同，大表情单独收一档。 */
+  private emoteSize(segment: RichSegment, sub: boolean): number {
+    if (segment.size >= 2) { return sub ? 22 : 34; }
+    return sub ? 18 : 20;
+  }
+
+  private segmentColor(segment: RichSegment): ResourceColor {
+    if (segment.kind === RichKind.Link) { return $r('app.color.link_blue'); }
+    if (segment.kind === RichKind.Mention) { return $r('app.color.brand_pink'); }
+    return $r('app.color.text_primary');
+  }
+
+  private tapSegment(segment: RichSegment, scope: CommentItem): void {
+    if (segment.kind === RichKind.Link) {
+      RichText.openUrl(getContext(this) as common.UIAbilityContext, segment.target);
+    } else if (segment.kind === RichKind.Mention) {
+      const candidates: CommentItem[] = [this.item];
+      for (let i: number = 0; i < this.item.replies.length; i++) { candidates.push(this.item.replies[i]); }
+      if (candidates.indexOf(scope) < 0) { candidates.push(scope); }
+      openMention(segment.target, candidates);
+    }
+  }
+
   private hasSubFooter(): boolean { return this.item.expanded || this.item.rcount > this.item.replies.length; }
+
+  /** 子回复正文较短，逐行解析即可；空文本返回单段，避免空Text。 */
+  private subSegments(sub: CommentItem): RichSegment[] {
+    return sub.message.length > 0 ? RichText.parse(sub.message, sub.emotes)
+      : [new RichSegment(RichKind.Plain, ' ', '')];
+  }
   private pictureUrls(pics: CommentPic[]): string[] { return pics.map((p: CommentPic) => p.url); }
   private pictureThumbs(pics: CommentPic[]): string[] {
     return pics.map((p: CommentPic) => thumbUrl(p.url, pics.length === 1 ? 480 : 320, 320));
@@ -128,9 +172,28 @@ export struct CommentItemView {
       Span(sub.uname + '：')
         .fontColor($r('app.color.brand_pink'))
         .fontSize(14)
-      Span(sub.message)
-        .fontColor($r('app.color.text_primary'))
-        .fontSize(14)
+        .onClick((): void => { openMember(sub.mid); })
+      ForEach(this.subSegments(sub), (segment: RichSegment) => {
+        // Text级onClick会吞掉Span点击，这里把「打开楼中楼」下沉到正文片段，昵称单独进空间。
+        if (segment.kind === RichKind.Emote) {
+          ImageSpan(segment.target)
+            .width(this.emoteSize(segment, true))
+            .height(this.emoteSize(segment, true))
+            .verticalAlign(ImageSpanAlignment.CENTER)
+            .objectFit(ImageFit.Contain)
+            .onClick((): void => { this.onOpenSub(this.item, sub.rpid); })
+        } else if (segment.kind === RichKind.Plain) {
+          Span(segment.text)
+            .fontColor($r('app.color.text_primary'))
+            .fontSize(14)
+            .onClick((): void => { this.onOpenSub(this.item, sub.rpid); })
+        } else {
+          Span(segment.text)
+            .fontColor(this.segmentColor(segment))
+            .fontSize(14)
+            .onClick((): void => { this.tapSegment(segment, sub); })
+        }
+      }, (segment: RichSegment, index: number) => index.toString() + '_' + segment.kind.toString())
     }
     .lineHeight(22.4)
     .maxLines(2)
@@ -143,7 +206,6 @@ export struct CommentItemView {
       bottom: this.item.replies.length === 1 && !this.hasSubFooter() ? 5 : (last ? 8 : 4)
     })
     .id('comment_preview_' + sub.rpid.toString())
-    .onClick(() => { this.onOpenSub(this.item, sub.rpid); })
   }
 
   build() {
@@ -158,6 +220,8 @@ export struct CommentItemView {
         .borderRadius(17)
         .clip(true)
         .backgroundColor($r('app.color.btn_soft_bg'))
+        .id('comment_avatar_' + this.item.rpid.toString())
+        .onClick(() => { openMember(this.item.mid); })
 
         Column() {
           // 名字行（13sp + UP/TOP 徽章）
@@ -217,11 +281,33 @@ export struct CommentItemView {
       // 正文与图片保留分段间距，正文后直接接灰底回复，不再放空操作行。
       Column() {
         if (this.item.message.length > 0) {
-          Text(this.item.message)
+          if (this.messageSegments().length > 0) {
+            Text() {
+              ForEach(this.messageSegments(), (segment: RichSegment) => {
+                if (segment.kind === RichKind.Emote) {
+                  ImageSpan(segment.target)
+                    .width(this.emoteSize(segment, false))
+                    .height(this.emoteSize(segment, false))
+                    .verticalAlign(ImageSpanAlignment.CENTER)
+                    .objectFit(ImageFit.Contain)
+                } else if (segment.kind === RichKind.Plain) {
+                  Span(segment.text).fontColor($r('app.color.text_primary')).fontSize(14)
+                } else {
+                  Span(segment.text).fontColor(this.segmentColor(segment)).fontSize(14)
+                    .onClick((): void => { this.tapSegment(segment, this.item); })
+                }
+              }, (segment: RichSegment, index: number) => index.toString() + '_' + segment.kind.toString())
+            }
             .fontSize(14)
             .lineHeight(24.5)
-            .fontColor($r('app.color.text_primary'))
             .width('100%')
+          } else {
+            Text(this.item.message)
+              .fontSize(14)
+              .lineHeight(24.5)
+              .fontColor($r('app.color.text_primary'))
+              .width('100%')
+          }
         }
         if (this.item.pics.length > 0) {
           this.PicGrid(this.item.pics)

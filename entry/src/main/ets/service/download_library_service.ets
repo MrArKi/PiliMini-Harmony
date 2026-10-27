@@ -82,7 +82,14 @@ export class DownloadLibraryService {
 
   static available(t: DownloadTask): boolean {
     if (t.status !== 'done' || !t.filePath) { return false; }
-    try { return fs.statSync(t.filePath).size > 0; } catch (_) { return false; }
+    try {
+      if (fs.statSync(t.filePath).size <= 0) { return false; }
+    } catch (_) { return false; }
+    // DASH 双文件：音轨缺失同样视为不可播，避免无声播放被当成正常。
+    if (t.audioPath.length > 0) {
+      try { return fs.statSync(t.audioPath).size > 0; } catch (_) { return false; }
+    }
+    return true;
   }
   static playlist(context: OfflineContext): DownloadTask[] {
     return DownloadLibraryService.inScope(DownloadService.list(), context).filter((t: DownloadTask): boolean => DownloadLibraryService.available(t));
@@ -90,6 +97,7 @@ export class DownloadLibraryService {
   static params(t: DownloadTask, context: OfflineContext): Record<string, string> {
     const params: Record<string, string> = {
       'bvid': t.bvid, 'cid': t.cid.toString(), 'localPath': t.filePath,
+      'localAudioPath': t.audioPath,
       'title': t.part ? t.title + ' · ' + t.part : t.title, 'localCover': t.cover, 'localArtist': t.upName,
       'localDuration': t.duration.toString(), 'offlineScope': context.scope, 'offlineKey': context.key
     };

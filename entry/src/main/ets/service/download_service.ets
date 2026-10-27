@@ -10,7 +10,7 @@ import { http } from '@kit.NetworkKit';
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { common } from '@kit.AbilityKit';
 import { prefsGet, prefsPut } from '../infra/storage/prefs';
-import { VideoService, DownloadUrl } from './video_service';
+import { VideoService, DownloadUrl, DashDownloadUrl } from './video_service';
 import { UA_PC, BILI_REFERER } from '../config/constants';
 
 import { DownloadTask, DlFolder, DownloadMetadata } from '../model/download';
@@ -155,6 +155,7 @@ export class DownloadService {
           (t.seasonOrder !== undefined && (!Number.isSafeInteger(t.seasonOrder) || t.seasonOrder < 0)) ||
           (t.part !== undefined && typeof t.part !== 'string') ||
           (t.upName !== undefined && typeof t.upName !== 'string') ||
+          (t.upMid !== undefined && (!Number.isSafeInteger(t.upMid) || t.upMid < 0)) ||
           (t.seasonId !== undefined && typeof t.seasonId !== 'string') ||
           (t.seasonTitle !== undefined && typeof t.seasonTitle !== 'string') ||
           !['done', 'downloading', 'paused', 'queued', 'failed'].includes(t.status)) {
@@ -169,9 +170,17 @@ export class DownloadService {
         task.quality = t.quality;
         task.duration = t.duration !== undefined ? t.duration : 0;
         task.upName = t.upName !== undefined ? t.upName : '';
+        task.upMid = t.upMid !== undefined ? t.upMid : 0;
         task.page = t.page || Number(/^P(\d+)/i.exec(task.part)?.[1] || '0');
         task.seasonId = t.seasonId || ''; task.seasonTitle = t.seasonTitle || ''; task.seasonOrder = t.seasonOrder || 0;
-        task.filePath = DownloadService.dir() + task.bvid + '_' + task.cid.toString() + '.mp4';
+        // DASH 任务（有 audioPath）用 .video.m4s / .audio.m4s；旧任务仍是单文件 .mp4。
+        const dashTask: boolean = t.audioPath !== undefined && typeof t.audioPath === 'string' && t.audioPath.length > 0;
+        const base: string = DownloadService.dir() + task.bvid + '_' + task.cid.toString();
+        task.filePath = dashTask ? base + '.video.m4s' : base + '.mp4';
+        task.audioPath = dashTask ? base + '.audio.m4s' : '';
+        task.videoDone = t.videoDone === true;
+        task.videoSize = t.videoSize !== undefined && Number.isSafeInteger(t.videoSize) && t.videoSize > 0 ? t.videoSize : 0;
+        task.audioSize = t.audioSize !== undefined && Number.isSafeInteger(t.audioSize) && t.audioSize > 0 ? t.audioSize : 0;
         task.folderId = t.folderId !== undefined ? t.folderId : '';
         if (t.status === 'done') {
           // 校验文件是否还在
@@ -249,6 +258,7 @@ export class DownloadService {
     if (metadata) {
       task.page = metadata.page; task.seasonId = metadata.seasonId;
       task.seasonTitle = metadata.seasonTitle; task.seasonOrder = metadata.seasonOrder;
+      task.upMid = metadata.upMid !== undefined ? metadata.upMid : 0;
     }
     task.status = 'queued';
     task.filePath = dir + bvid + '_' + cid.toString() + '.mp4';
@@ -303,6 +313,21 @@ export class DownloadService {
       DownloadService.deleteFile(next);
       next.receivedSize = 0;
       next.progress = 0;
+      // 优先 DASH（固定最高画质，spec-17 2026-10-27）；没有可用 DASH 时降级 durl 单文件。
+      const dash: DashDownloadUrl | undefined = await VideoService.dashForDownload(next.bvid, next.cid);
+      if (!DownloadService.valid(next, generation) || next.status !== 'downloading') { return; }
+      if (dash !== undefined && dash.audioUrl.length > 0) {
+        const dir: string = DownloadService.dir();
+        next.filePath = dir + next.bvid + '_' + next.cid.toString() + '.video.m4s';
+        next.audioPath = dir + next.bvid + '_' + next.cid.toString() + '.audio.m4s';
+        next.videoDone = false;
+        next.videoSize = 0;
+        next.audioSize = 0;
+        next.quality = dash.quality;
+        if (dash.durationMs > 0) { next.duration = dash.durationMs / 1000; }
+        await DownloadService.runDash(next, dash, generation);
+        return;
+      }
       const u: DownloadUrl = await VideoService.durlForDownload(next.bvid, next.cid, next.quality);
       if (!DownloadService.valid(next, generation) || next.status !== 'downloading') { return; }
       next.quality = u.quality;
@@ -375,6 +400,98 @@ export class DownloadService {
     const statusAfterCreate: string = DownloadService.currentStatus(task);
     if (statusAfterCreate === 'paused') { await rtask.pause(); }
     else if (statusAfterCreate === 'downloading') { DownloadService.startPoll(task, key, generation); }
+  }
+
+  /** DASH 串行下载（spec-17 2026-10-27）：先视频后音频，两份都到齐才 finish。 */
+  private static async runDash(task: DownloadTask, dash: DashDownloadUrl, generation: number): Promise<void> {
+    const key: string = DownloadService.key(task);
+    // 预取两份总字节：进度从一开始就是合并口径（HEAD 失败则退化为各阶段独立）
+    if (task.videoSize <= 0) { task.videoSize = await DownloadService.fetchContentLength(dash.videoUrl); }
+    if (task.audioSize <= 0) { task.audioSize = await DownloadService.fetchContentLength(dash.audioUrl); }
+    task.totalSize = task.videoSize + task.audioSize;
+    if (!DownloadService.valid(task, generation) || task.status !== 'downloading') { return; }
+
+    if (!task.videoDone) {
+      const videoOk: boolean = await DownloadService.downloadStage(task, dash.videoUrl, task.filePath, true, generation);
+      if (!videoOk) { return; }
+      task.videoDone = true;
+      if (task.videoSize <= 0) {
+        try { task.videoSize = fs.statSync(task.filePath).size; } catch (e) {}
+      }
+      await DownloadService.persist();
+    }
+    const audioOk: boolean = await DownloadService.downloadStage(task, dash.audioUrl, task.audioPath, false, generation);
+    if (!audioOk) { return; }
+    DownloadService.finish(task, key);
+  }
+
+  /**
+   * 单阶段下载：完成 resolve(true)；失败由 failTask 收尾后 resolve(false)。
+   * 暂停会让 Promise 挂起（任务 status=paused，事件不再处理），resume 后原生任务继续推事件。
+   */
+  private static async downloadStage(task: DownloadTask, url: string, path: string, isVideo: boolean,
+    generation: number): Promise<boolean> {
+    const ctx = DownloadService.ctx;
+    const key: string = DownloadService.key(task);
+    if (ctx === undefined) { return false; }
+    try { fs.mkdirSync(DownloadService.dir(), true); } catch (e) {}
+    const config: request.DownloadConfig = {
+      url: url,
+      header: {
+        'User-Agent': UA_PC,
+        'Referer': BILI_REFERER
+      },
+      filePath: path,
+      enableMetered: true,
+      enableRoaming: true,
+      title: task.title
+    };
+    let rtask: request.DownloadTask;
+    try {
+      rtask = await request.downloadFile(ctx, config);
+    } catch (e) {
+      await DownloadService.failTask(task, key, generation, '下载启动失败');
+      return false;
+    }
+    if (!DownloadService.valid(task, generation) || task.status !== 'downloading') {
+      await rtask.delete().catch((): void => {});
+      return false;
+    }
+    DownloadService.reqTasks.set(key, rtask);
+    return new Promise<boolean>((resolve: (value: boolean) => void): void => {
+      rtask.on('progress', (received: number, total: number): void => {
+        if (!DownloadService.valid(task, generation) || task.status !== 'downloading') { return; }
+        if (received > task.receivedSize) { DownloadService.stallCounts.set(key, 0); }
+        if (isVideo) {
+          if (total > 0) { task.videoSize = total; }
+          task.receivedSize = received;
+        } else {
+          if (total > 0) { task.audioSize = total; }
+          task.receivedSize = task.videoSize + received;
+        }
+        task.totalSize = task.videoSize + task.audioSize;
+        if (task.totalSize > 0) {
+          task.progress = Math.min(99, Math.round(task.receivedSize * 100 / task.totalSize));
+        }
+        DownloadService.notify(false);
+      });
+      rtask.on('complete', (): void => {
+        if (!DownloadService.valid(task, generation)) { resolve(false); return; }
+        resolve(true);
+      });
+      rtask.on('fail', (err: number): void => {
+        if (!DownloadService.valid(task, generation) || task.status !== 'downloading') { resolve(false); return; }
+        let size: number = 0;
+        try { size = fs.statSync(path).size; } catch (e) {}
+        const expect: number = isVideo ? task.videoSize : task.audioSize;
+        if (size > 0 && (expect <= 0 || size >= expect)) { resolve(true); return; }
+        DownloadService.failTask(task, key, generation, '下载失败(' + err.toString() + ')');
+        resolve(false);
+      });
+      const statusAfterCreate: string = DownloadService.currentStatus(task);
+      if (statusAfterCreate === 'paused') { rtask.pause(); }
+      else if (statusAfterCreate === 'downloading') { DownloadService.startPoll(task, key, generation); }
+    });
   }
 
   private static currentStatus(task: DownloadTask): string { return task.status; }
@@ -516,6 +633,9 @@ export class DownloadService {
     // 只删除服务根据 bvid/cid 生成、下载目录内的文件。
     if (!t.filePath.startsWith(DownloadService.dir()) || DownloadService.dir().length === 0) { return; }
     try { if (fs.accessSync(t.filePath)) { fs.unlinkSync(t.filePath); } } catch (e) {}
+    if (t.audioPath.length > 0 && t.audioPath.startsWith(DownloadService.dir())) {
+      try { if (fs.accessSync(t.audioPath)) { fs.unlinkSync(t.audioPath); } } catch (e) {}
+    }
   }
 
   static async pause(cid: number): Promise<void> {
@@ -630,14 +750,21 @@ export class DownloadService {
 
   /** 任务对应文件实时大小（progress 回调在模拟器可能不触发，用文件大小兜底） */
   static fileBytes(task: DownloadTask): number {
+    let bytes: number = 0;
     try {
       if (task.filePath.length > 0) {
-        const st = fs.statSync(task.filePath);
-        return st.size;
+        bytes += fs.statSync(task.filePath).size;
       }
     } catch (e) {
       // 文件尚未创建
     }
-    return 0;
+    if (task.audioPath.length > 0) {
+      try {
+        bytes += fs.statSync(task.audioPath).size;
+      } catch (e) {
+        // DASH 音频尚未创建
+      }
+    }
+    return bytes;
   }
 }

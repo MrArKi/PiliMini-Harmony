@@ -14,9 +14,10 @@ export class DanmakuClock {
     const now: number = Number.isFinite(monotonicMs) ? monotonicMs : this.stamp;
     const rate: number = Number.isFinite(speed) ? Math.max(0.25, Math.min(5, speed)) : 1;
     const predicted: number = this.position(now);
+    // 倍速切换与暂停恢复在媒体时间上是连续的：只要位置没有真跳，就不能清轨道重投。
     const discontinuity: boolean = !this.initialized || revision !== this.revision ||
-      Math.abs(position - predicted) > 900 || now < this.stamp || now - this.stamp > 1500;
-    const continuous: boolean = !discontinuity && this.running && running && rate === this.rate;
+      Math.abs(position - predicted) > 900 || now < this.stamp;
+    const continuous: boolean = !discontinuity && this.running && running;
     // 连续播放保留采样边界的显示位置，只在随后1秒缓校；推进速度始终至少为正常值90%。
     this.media = continuous ? predicted : position;
     this.correction = continuous ? Math.max(-rate * 100, Math.min(rate * 100, position - predicted)) : 0;

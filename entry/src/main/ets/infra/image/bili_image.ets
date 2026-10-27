@@ -39,9 +39,9 @@ export function imageRequestUrl(src: string, w: number, h: number, original: boo
   if (!/\.(jpe?g|png|webp|gif|avif)$/i.test(base)) { return src; }
   // 只指定一条边并保留完整内容，裁剪由布局负责，不能破坏缩略图往返转场。
   const size: number = Math.max(1, Math.round(w <= h ? w : h));
-  return base + '@' + size.toString() + (w <= h ? 'w' : 'h') + '_80q.webp';
+  return base + '@' + size.toString() + (w <= h ? 'w' : 'h') + '_70q.webp';
 }
 
 export function isDiskThumbnail(url: string): boolean {
-  return /^https?:\/\/[^/]+\.(hdslb\.com|biliimg\.com)\/.+@\d+[wh]_80q\.webp$/i.test(url);
+  return /^https?:\/\/[^/]+\.(hdslb\.com|biliimg\.com)\/.+@\d+[wh]_70q\.webp$/i.test(url);
 }

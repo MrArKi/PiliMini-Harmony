@@ -23,6 +23,9 @@ export class BgAudio {
   private static metadata: avSession.AVMetadata | undefined = undefined;
   private static cover: string = '';
   private static coverGeneration: number = 0;
+  private static remote: boolean = false;
+  private static routeRevision: number = 0;
+  private static castCleanup: (() => Promise<void>) | undefined = undefined;
 
   private static enqueue(work: () => Promise<void>): Promise<void> {
     const next: Promise<void> = BgAudio.queue.then(work);
@@ -34,6 +37,8 @@ export class BgAudio {
     commands: MediaCommands, artist: string = '', cover: string = ''): Promise<void> {
     BgAudio.owner = owner;
     BgAudio.wantsTask = false;
+    BgAudio.remote = false;
+    BgAudio.routeRevision++;
     return BgAudio.enqueue(async (): Promise<void> => {
       await BgAudio.teardown();
       if (BgAudio.owner !== owner) { return; }
@@ -91,10 +96,12 @@ export class BgAudio {
   }
 
   static setState(owner: string, playing: boolean, position: number, duration: number, speed: number,
-    buffering: boolean = false): Promise<void> {
+    buffering: boolean = false, remote: boolean = false): Promise<void> {
+    const revision: number = BgAudio.routeRevision;
     return BgAudio.enqueue(async (): Promise<void> => {
       const s: avSession.AVSession | undefined = BgAudio.session;
-      if (BgAudio.owner !== owner || s === undefined) { return; }
+      if (BgAudio.owner !== owner || s === undefined || revision !== BgAudio.routeRevision ||
+        BgAudio.remote !== remote) { return; }
       await s.setAVPlaybackState({
         state: buffering ? avSession.PlaybackState.PLAYBACK_STATE_BUFFERING :
           (playing ? avSession.PlaybackState.PLAYBACK_STATE_PLAY : avSession.PlaybackState.PLAYBACK_STATE_PAUSE),
@@ -154,7 +161,18 @@ export class BgAudio {
     if (BgAudio.owner !== owner) { return Promise.resolve(); }
     BgAudio.owner = '';
     BgAudio.wantsTask = false;
+    BgAudio.routeRevision++;
     return BgAudio.enqueue(async (): Promise<void> => { await BgAudio.teardown(); });
+  }
+
+  static setRemote(owner: string, remote: boolean): void {
+    if (BgAudio.owner !== owner || BgAudio.remote === remote) { return; }
+    BgAudio.remote = remote;
+    BgAudio.routeRevision++;
+  }
+
+  static setCastCleanup(owner: string, cleanup: () => Promise<void>): void {
+    if (BgAudio.owner === owner) { BgAudio.castCleanup = cleanup; }
   }
 
   private static async stopTask(): Promise<void> {
@@ -178,12 +196,17 @@ export class BgAudio {
 
   private static async teardown(): Promise<void> {
     const s: avSession.AVSession | undefined = BgAudio.session;
+    const castCleanup: (() => Promise<void>) | undefined = BgAudio.castCleanup;
+    BgAudio.castCleanup = undefined;
     BgAudio.session = undefined;
     BgAudio.metadata = undefined;
     BgAudio.cover = '';
     BgAudio.coverGeneration++;
     BgAudio.want = undefined;
     if (s !== undefined) { BgAudio.removeListeners(s); }
+    if (castCleanup !== undefined) {
+      try { await castCleanup(); } catch (_) { console.warn('[BgAudio] 投屏会话回收失败'); }
+    }
     try { await BgAudio.stopTask(); } finally {
       if (s !== undefined) { try { await s.deactivate(); } finally { await s.destroy(); } }
     }
