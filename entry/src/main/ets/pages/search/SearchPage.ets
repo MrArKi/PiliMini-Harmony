@@ -134,6 +134,12 @@ struct SearchPage {
     if (this.suggest.length > 0) { this.suggest = []; }
     this.suggestOpen = false;
     const term: string = value.trim();
+    // 输入内容与上次搜索词不同 → 立刻回到输入态。否则联想浮层会盖在旧结果列表上
+    // （输入法选词/继续打字都会走这里，用户看到的是"提示词压住搜索结果"）。
+    if (this.submitted.length > 0 && term !== this.submitted) {
+      this.pager.cancel();
+      this.submitted = '';
+    }
     if (term.length === 0) {
       // 清空输入回到历史视图（结果数据保留，下次搜索会整体覆盖）
       this.pager.cancel();
@@ -427,7 +433,8 @@ struct SearchPage {
         }
 
         // 联想浮层压在内容之上，不改变已有结果状态
-        if (this.suggestOpen && this.suggest.length > 0) {
+        // 联想浮层只存在于输入态；有搜索结果时一律不渲染，避免压住列表
+        if (this.suggestOpen && this.suggest.length > 0 && this.submitted.length === 0) {
           this.SuggestPanel()
         }
       }
