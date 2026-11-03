@@ -7,7 +7,7 @@ import { http } from '@kit.NetworkKit';
 import { image } from '@kit.ImageKit';
 import { fileIo } from '@kit.CoreFileKit';
 import { UA_PC, BILI_REFERER } from '../../config/constants';
-import { md5Hex } from '../sign/wbi';
+import lazy { md5Hex } from '../sign/md5';
 import { imageRequestUrl, isDiskThumbnail } from './bili_image';
 
 const MEM_MAX: number = 64;
@@ -41,6 +41,12 @@ let bigBytes: number = 0;
 const pending: Map<string, Promise<image.PixelMap>> = new Map<string, Promise<image.PixelMap>>();
 let cacheDir: string = '';
 let cacheGeneration: number = 0;
+/** 扫描不占首帧；并发写盘/清空后旧统计不可回写。 */
+let diskRevision: number = 0;
+let trimTimer: number = -1;
+let trimRunning: boolean = false;
+let trimRequested: boolean = false;
+const TRIM_BATCH: number = 8;
 
 export function initImageLoader(dir: string): void {
   cacheDir = dir + '/img';
@@ -48,39 +54,84 @@ export function initImageLoader(dir: string): void {
     if (!fileIo.accessSync(cacheDir)) {
       fileIo.mkdirSync(cacheDir);
     }
-    trimIfOversize();
+    scheduleDiskTrim();
   } catch (e) {
     console.warn('[ImgLoader] init 异常: ' + JSON.stringify(e));
   }
 }
 
-/** 升级删除无法区分原图的旧格式；超限只淘汰最久未从磁盘读取的缩略图。 */
-function trimIfOversize(): void {
+/** 合并初始化、限额设置和超限写入；不在Ability.onCreate同步遍历磁盘。 */
+function scheduleDiskTrim(): void {
+  trimRequested = true;
+  if (trimTimer >= 0 || trimRunning || cacheDir.length === 0) { return; }
+  trimTimer = setTimeout((): void => {
+    trimTimer = -1;
+    trimRunning = true;
+    trimRequested = false;
+    trimDisk(cacheDir, diskRevision).catch((e: Error): void => {
+      console.warn('[ImgLoader] trim 异常: ' + e.message);
+    }).finally((): void => {
+      trimRunning = false;
+      if (trimRequested) { scheduleDiskTrim(); }
+    });
+  }, 32);
+}
+
+function diskSnapshotCurrent(dir: string, revision: number): boolean {
+  const current: boolean = cacheDir === dir && diskRevision === revision;
+  if (!current) { trimRequested = true; }
+  return current;
+}
+
+async function scanDiskEntry(dir: string, name: string, revision: number): Promise<DiskEntry | undefined> {
+  if (!diskSnapshotCurrent(dir, revision)) { return undefined; }
+  const path: string = dir + '/' + name;
   try {
-    const names: string[] = fileIo.listFileSync(cacheDir);
-    const entries: DiskEntry[] = [];
-    let total: number = 0;
-    for (let i = 0; i < names.length; i++) {
-      const path: string = cacheDir + '/' + names[i];
+    if (/^img_[0-9a-f]{32}$/.test(name)) { fileIo.unlinkSync(path); return undefined; }
+    if (!/^thumb_[0-9a-f]{32}$/.test(name)) { return undefined; }
+    const st = await fileIo.stat(path);
+    if (!diskSnapshotCurrent(dir, revision)) { return undefined; }
+    // 删除前无await：扫描期间发生的清空/新写入不能被旧快照误删。
+    if (st.size <= 0 || st.size > DISK_FILE_MAX) { fileIo.unlinkSync(path); return undefined; }
+    return { name: name, size: st.size, usedAt: st.mtime };
+  } catch (_) { return undefined; }
+}
+
+/** 升级清理旧格式；官方异步元信息每批最多8项，不阻塞UI线程全盘扫描。 */
+async function trimDisk(dir: string, revision: number): Promise<void> {
+  const started: number = Date.now();
+  const names: string[] = await fileIo.listFile(dir);
+  const entries: DiskEntry[] = [];
+  let total: number = 0;
+  for (let i = 0; i < names.length; i += TRIM_BATCH) {
+    if (!diskSnapshotCurrent(dir, revision)) { return; }
+    const batch: Array<DiskEntry | undefined> = await Promise.all(names.slice(i, i + TRIM_BATCH)
+      .map((name: string): Promise<DiskEntry | undefined> => scanDiskEntry(dir, name, revision)));
+    for (let j = 0; j < batch.length; j++) {
+      const entry: DiskEntry | undefined = batch[j];
+      if (entry !== undefined) { entries.push(entry); total += entry.size; }
+    }
+    // 一批全为无需stat的旧格式时也让出事件循环，避免迁移形成连续长任务。
+    if (i + TRIM_BATCH < names.length) { await new Promise<void>((resolve): void => { setTimeout(resolve, 0); }); }
+  }
+  if (!diskSnapshotCurrent(dir, revision)) { return; }
+  if (total > diskLimitBytes) {
+    entries.sort((a: DiskEntry, b: DiskEntry): number => a.usedAt - b.usedAt);
+    for (let i = 0; i < entries.length && total > diskLimitBytes; i++) {
       try {
-        if (/^img_[0-9a-f]{32}$/.test(names[i])) { fileIo.unlinkSync(path); continue; }
-        if (!/^thumb_[0-9a-f]{32}$/.test(names[i])) { continue; }
-        const st = fileIo.statSync(path);
-        if (st.size <= 0 || st.size > DISK_FILE_MAX) { fileIo.unlinkSync(path); continue; }
-        entries.push({ name: names[i], size: st.size, usedAt: st.mtime });
-        total += st.size;
-      } catch (_) { /* 单文件失败不阻断其余缓存维护。 */ }
+        const entry: DiskEntry = entries[i];
+        const path: string = dir + '/' + entry.name;
+        const st = await fileIo.stat(path);
+        if (!diskSnapshotCurrent(dir, revision)) { return; }
+        if (st.mtime > entry.usedAt || st.size !== entry.size) { trimRequested = true; continue; }
+        fileIo.unlinkSync(path); total -= entry.size;
+      } catch (_) { /* 保留未能删除的条目占用，不能假报已释放。 */ }
     }
-    if (total > diskLimitBytes) {
-      entries.sort((a: DiskEntry, b: DiskEntry): number => a.usedAt - b.usedAt);
-      for (let i = 0; i < entries.length && total > diskLimitBytes; i++) {
-        try { fileIo.unlinkSync(cacheDir + '/' + entries[i].name); total -= entries[i].size; }
-        catch (_) { /* 保留未能删除的条目占用，不能假报已释放。 */ }
-      }
-    }
+  }
+  if (diskSnapshotCurrent(dir, revision)) {
     diskBytes = total;
-  } catch (e) {
-    console.warn('[ImgLoader] trim 异常: ' + JSON.stringify(e));
+    console.info('[ImgLoader] async trim files=' + names.length.toString() +
+      ' elapsedMs=' + (Date.now() - started).toString());
   }
 }
 
@@ -106,6 +157,7 @@ export function imageCacheSize(): number {
 export function clearImageCache(): number {
   const before: number = imageCacheSize();
   trimImageMemory();
+  diskRevision++;
   diskBytes = 0;
   try {
     const names: string[] = fileIo.listFileSync(cacheDir);
@@ -136,8 +188,10 @@ export function trimImageMemory(): void {
 
 /** 设置磁盘缓存上限（MB）；传 0 表示用默认 1GB */
 export function setDiskLimitMB(mb: number): void {
-  diskLimitBytes = mb > 0 ? mb * 1024 * 1024 : 1024 * 1024 * 1024;
-  trimIfOversize();
+  const next: number = mb > 0 ? mb * 1024 * 1024 : 1024 * 1024 * 1024;
+  if (diskLimitBytes === next) { return; }
+  diskLimitBytes = next;
+  scheduleDiskTrim();
 }
 
 /** 当前磁盘缓存上限（MB，便于设置页回显） */
@@ -246,16 +300,16 @@ async function loadInner(url: string, w: number, h: number, key: string, generat
 
   // 1) 磁盘
   try {
-    if (cacheOnDisk && fileIo.accessSync(fileName)) {
-      const st = fileIo.statSync(fileName);
+    if (cacheOnDisk) {
+      const st = await fileIo.stat(fileName);
       if (st.size > 0 && st.size <= DISK_FILE_MAX) {
-        const f = fileIo.openSync(fileName, fileIo.OpenMode.READ_ONLY);
+        const f = await fileIo.open(fileName, fileIo.OpenMode.READ_ONLY);
         try {
           const buf = new ArrayBuffer(st.size);
-          fileIo.readSync(f.fd, buf);
-          data = buf;
+          const bytes: number = await fileIo.read(f.fd, buf);
+          if (bytes === st.size) { data = buf; }
         } finally {
-          fileIo.closeSync(f);
+          await fileIo.close(f);
         }
         try { fileIo.utimes(fileName, Date.now()); } catch (_) { /* 更新时间失败仍可显示已读图片。 */ }
         console.info('[ImgLoader] disk hit');
@@ -316,11 +370,12 @@ async function loadInner(url: string, w: number, h: number, key: string, generat
       // 校验解码成功再落盘；原图、失败响应、大缩略图和清理前的请求均不能回填。
       if (downloaded && cacheOnDisk && data.byteLength > 0 && data.byteLength <= DISK_FILE_MAX) {
         try {
+          diskRevision++;
           const oldSize: number = fileIo.accessSync(fileName) ? fileIo.statSync(fileName).size : 0;
           const f = fileIo.openSync(fileName, fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC);
           try { fileIo.writeSync(f.fd, data); } finally { fileIo.closeSync(f); }
           diskBytes += data.byteLength - oldSize;
-          if (diskBytes > diskLimitBytes) { trimIfOversize(); }
+          if (diskBytes > diskLimitBytes) { scheduleDiskTrim(); }
         } catch (e) { console.warn('[ImgLoader] 写盘失败: ' + JSON.stringify(e)); }
       }
     }

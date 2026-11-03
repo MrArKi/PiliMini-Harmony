@@ -3,10 +3,10 @@
  * 算法参照 PiliNara lib/utils/wbi_sign.dart（bilibili-API-collect 文档）
  * 流程：nav 取 img_key/sub_key → mixinKey → 参数排序 + wts → md5(query + mixinKey) = w_rid
  */
-import { buffer } from '@kit.ArkTS';
-import { cryptoFramework } from '@kit.CryptoArchitectureKit';
-import { getJson, parseEnvelope } from '../http/http';
-import { API_BASE } from '../../config/constants';
+import { md5Hex } from './md5';
+import { parseEnvelope } from '../http/http';
+import { requestNav } from '../http/nav_request';
+import { prefsGet, prefsPut } from '../storage/prefs';
 
 const MIXIN_KEY_ENC_TAB: number[] = [
   46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
@@ -16,6 +16,15 @@ const CHR_FILTER = /[!'()*]/g;
 
 let cachedMixinKey: string = '';
 let cachedDayKey: string = '';
+let loadingKey: Promise<string> | undefined = undefined;
+let keyGeneration: number = 0;
+let keyWrites: Promise<void> = Promise.resolve();
+const WBI_CACHE_KEY: string = 'wbi_public_key_v1';
+
+interface StoredMixinKey {
+  day: string;
+  key: string;
+}
 
 interface WbiImg {
   img_url: string;
@@ -24,14 +33,6 @@ interface WbiImg {
 
 interface NavData {
   wbi_img?: WbiImg;
-}
-
-/** MD5（cryptoFramework，输出 hex） */
-export async function md5Hex(input: string): Promise<string> {
-  const md = cryptoFramework.createMd('MD5');
-  await md.update({ data: new Uint8Array(buffer.from(input, 'utf-8').buffer) });
-  const digest = await md.digest();
-  return buffer.from(digest.data).toString('hex');
 }
 
 export function getMixinKey(orig: string): string {
@@ -49,28 +50,67 @@ function fileNameNoExt(url: string): string {
   return dot > 0 ? base.substring(0, dot) : base;
 }
 
-/** 取 mixinKey（按天缓存；nav 未登录也会返回 wbi_img） */
-export async function getMixinKeyCached(): Promise<string> {
+function todayKey(): string {
   const now = new Date();
-  const dayKey: string = now.getFullYear() + '-' + now.getMonth() + '-' + now.getDate();
-  if (cachedMixinKey.length > 0 && cachedDayKey === dayKey) {
-    return cachedMixinKey;
-  }
-  const raw: string = await getJson(API_BASE + '/x/web-interface/nav');
-  // nav 匿名也返回 code=0 + wbi_img；不走 ensureOk（-101 属常态）
+  return now.getFullYear().toString() + '-' + now.getMonth().toString() + '-' + now.getDate().toString();
+}
+
+/** 仅清公开签名材料，下一次签名重新取；不影响登录凭据。 */
+export async function invalidateMixinKey(): Promise<void> {
+  keyGeneration++;
+  cachedMixinKey = ''; cachedDayKey = ''; loadingKey = undefined;
+  await persistMixinKey('', keyGeneration);
+}
+
+function persistMixinKey(raw: string, generation: number): Promise<void> {
+  const operation: Promise<void> = keyWrites.then(async (): Promise<void> => {
+    if (generation !== keyGeneration) { return; }
+    try { await prefsPut(WBI_CACHE_KEY, raw); } catch (_) { /* 公开缓存写失败不阻断签名。 */ }
+  });
+  keyWrites = operation.catch((): void => {});
+  return keyWrites;
+}
+
+async function loadMixinKey(dayKey: string, generation: number): Promise<string> {
+  try {
+    const raw: string = await prefsGet(WBI_CACHE_KEY, '');
+    if (raw.length > 0) {
+      const stored: StoredMixinKey = JSON.parse(raw) as StoredMixinKey;
+      if (stored !== null && stored.day === dayKey && typeof stored.key === 'string' && /^[0-9a-f]{32}$/.test(stored.key)) {
+        if (generation === keyGeneration) { cachedMixinKey = stored.key; cachedDayKey = dayKey; }
+        return stored.key;
+      }
+    }
+  } catch (_) { /* 无缓存/缓存损坏/存储暂不可用均继续正常网络路径。 */ }
+  const raw: string = await requestNav();
+  // nav匿名也可返回wbi_img；公开签名材料不包含账号凭据。
   const resp = parseEnvelope<NavData>(raw);
-  const data: NavData | undefined = resp.data;
-  if (data === undefined || data === null) {
-    throw new Error('nav 无 wbi 数据');
-  }
-  const img: WbiImg | undefined = data.wbi_img;
-  if (img === undefined || img === null) {
+  const img: WbiImg | undefined = resp.data?.wbi_img;
+  if (img === undefined || img === null || typeof img.img_url !== 'string' || typeof img.sub_url !== 'string') {
     throw new Error('nav 无 wbi 数据');
   }
   const key: string = getMixinKey(fileNameNoExt(img.img_url) + fileNameNoExt(img.sub_url));
-  cachedMixinKey = key;
-  cachedDayKey = dayKey;
+  if (!/^[0-9a-f]{32}$/.test(key)) { throw new Error('nav wbi 数据无效'); }
+  if (generation === keyGeneration) {
+    cachedMixinKey = key; cachedDayKey = dayKey;
+    const stored: StoredMixinKey = { day: dayKey, key: key };
+    persistMixinKey(JSON.stringify(stored), generation);
+  }
   return key;
+}
+
+/** 取公开mixin key：当天磁盘缓存优先，并发请求共用一个Promise。 */
+export function getMixinKeyCached(): Promise<string> {
+  const dayKey: string = todayKey();
+  if (cachedMixinKey.length > 0 && cachedDayKey === dayKey) {
+    return Promise.resolve(cachedMixinKey);
+  }
+  if (loadingKey !== undefined) { return loadingKey; }
+  const operation: Promise<string> = loadMixinKey(dayKey, keyGeneration).finally((): void => {
+    if (loadingKey === operation) { loadingKey = undefined; }
+  });
+  loadingKey = operation;
+  return operation;
 }
 
 /** 对参数签名：附加 wts + w_rid 后返回新参数表 */

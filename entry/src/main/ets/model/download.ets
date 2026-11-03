@@ -27,6 +27,10 @@ export class DownloadTask {
   /** DASH 合并进度用：视频/音频各自的总字节（HEAD 预取，0 表示未知）。 */
   videoSize: number = 0;
   audioSize: number = 0;
+  /** 官方后台任务日志：重启前先关闭旧写入者，不存签名URL或登录凭据。 */
+  agentTid: string = '';
+  /** single | video | audio；空字符串表示当前没有系统下载任务。 */
+  agentStage: string = '';
   errMsg: string = '';
   /** 只供旧版本迁移读取，新文件夹不再改写任务。 */
   folderId: string = '';

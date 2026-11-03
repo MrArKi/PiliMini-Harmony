@@ -6,7 +6,10 @@
         "name": "default",
         "compatibleSdkVersion": "6.0.2(22)",
         "runtimeOS": "HarmonyOS",
-        "targetSdkVersion": "26.0.0"
+        "targetSdkVersion": "26.0.0",
+        "buildOption": {
+          "nativeCompiler": "BiSheng"
+        }
       }
     ],
     "buildModeSet": [
@@ -32,8 +35,7 @@
               "excludes": [
                 "**/armeabi/*.so",
                 "**/armeabi-v7a/*.so",
-                "**/x86/*.so",
-                "**/x86_64/*.so"
+                "**/x86/*.so"
               ]
             }
           }

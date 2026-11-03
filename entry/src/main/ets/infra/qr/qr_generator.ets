@@ -1,32 +1,35 @@
 /**
  * 二维码生成（spec-03 任务 3.1）
- * zxing 编码 → BitMatrix → RGBA buffer → PixelMap
+ * 官方 Scan Kit `generateBarcode` 直接出 PixelMap：
+ *  - 替代原 @ohos/zxing 第三方编码 + 手写 RGBA 缓冲 + createPixelMapSync
+ *  - 编码在原生层完成，不再占用 UI 线程（原实现 240×240 逐像素 57600 次循环）
+ *  - 去掉一个第三方依赖
  */
 import { image } from '@kit.ImageKit';
-import { MultiFormatWriter, BarcodeFormat } from '@ohos/zxing';
+import { generateBarcode, scanCore } from '@kit.ScanKit';
 
-export function generateQrPixelMap(content: string, size: number): image.PixelMap | undefined {
+/** 官方宽高取值范围 [200, 4096]（px） */
+const MIN_PX: number = 200;
+const MAX_PX: number = 4096;
+
+export async function generateQrPixelMap(content: string, size: number): Promise<image.PixelMap | undefined> {
+  if (content.length === 0) {
+    return undefined;
+  }
+  const px: number = Math.max(MIN_PX, Math.min(MAX_PX, Math.round(size)));
+  const options: generateBarcode.CreateOptions = {
+    scanType: scanCore.ScanType.QR_CODE,
+    width: px,
+    height: px,
+    // 官方 margin 取值 1~10；1 与 B 站网页二维码的静区一致
+    margin: 1,
+    // 扫码场景用 M（15%）即可：L 在屏幕反光下识别率低，H 会让码点变密
+    level: generateBarcode.ErrorCorrectionLevel.LEVEL_M
+  };
   try {
-    const writer = new MultiFormatWriter();
-    const matrix = writer.encode(content, BarcodeFormat.QR_CODE, size, size, null);
-    const w: number = matrix.getWidth();
-    const h: number = matrix.getHeight();
-    const buf = new ArrayBuffer(w * h * 4);
-    const view = new Uint32Array(buf);
-    for (let y = 0; y < h; y++) {
-      const rowOff = y * w;
-      for (let x = 0; x < w; x++) {
-        view[rowOff + x] = matrix.get(x, y) ? 0xFF000000 : 0xFFFFFFFF;
-      }
-    }
-    const opts: image.InitializationOptions = {
-      size: { width: w, height: h },
-      pixelFormat: image.PixelMapFormat.RGBA_8888,
-      editable: true
-    };
-    return image.createPixelMapSync(buf, opts);
+    return await generateBarcode.createBarcode(content, options);
   } catch (e) {
-    console.warn('[QR] 生成失败: ' + JSON.stringify(e));
+    console.warn('[QR] ScanKit 生成失败: ' + JSON.stringify(e));
     return undefined;
   }
 }

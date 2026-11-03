@@ -31,7 +31,7 @@ export struct DynamicVideoCard {
         .alignItems(VerticalAlign.Bottom)
         .linearGradient({ angle: 180, colors: [['#00000000', 0.0], ['#8A000000', 1.0]] })
       }
-      .width('100%').aspectRatio(16 / 9).borderRadius(6).clip(true)
+      .width('100%').aspectRatio(16 / 10).borderRadius(10).clip(true)
       .backgroundColor($r('app.color.btn_soft_bg'))
 
       if (this.detail) {

@@ -9,12 +9,15 @@ export interface DanmakuPlaybackInput {
   running: boolean;
   timeRevision: number;
   sampledAt: number;
+  /** true仅代表原生位置实采；控制边界的外推估算不能替代实采基线。 */
+  positionObserved: boolean;
   seeking: boolean;
 }
 
 function copyInput(value: DanmakuPlaybackInput): DanmakuPlaybackInput {
   return { cid: value.cid, duration: value.duration, position: value.position, speed: value.speed,
-    running: value.running, timeRevision: value.timeRevision, sampledAt: value.sampledAt, seeking: value.seeking };
+    running: value.running, timeRevision: value.timeRevision, sampledAt: value.sampledAt,
+    positionObserved: value.positionObserved, seeking: value.seeking };
 }
 
 /** 普通对象单订阅桥；复用播放器快照，不订阅mpv、不建立轮询。 */
@@ -26,7 +29,7 @@ export class DanmakuPlaybackFeed {
     if (!Number.isSafeInteger(value.cid) || value.cid < 0 || !Number.isFinite(value.duration) || value.duration < 0 ||
       !Number.isFinite(value.position) || value.position < 0 || !Number.isFinite(value.speed) || value.speed <= 0 ||
       !Number.isSafeInteger(value.timeRevision) || value.timeRevision < 0 || !Number.isFinite(value.sampledAt) || value.sampledAt < 0 ||
-      typeof value.running !== 'boolean' || typeof value.seeking !== 'boolean') { return; }
+      typeof value.running !== 'boolean' || typeof value.seeking !== 'boolean' || typeof value.positionObserved !== 'boolean') { return; }
     this.last = copyInput(value);
     if (this.listener !== undefined) { this.listener(copyInput(this.last)); }
   }

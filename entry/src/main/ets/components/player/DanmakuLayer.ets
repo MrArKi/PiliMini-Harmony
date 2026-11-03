@@ -56,6 +56,7 @@ export struct DanmakuLayer {
   private destroyed: boolean = false;
   private isBackground: boolean = false;
   private awaitingSnapshot: boolean = false;
+  private awaitingFreshSample: boolean = false;
   private frozenResumeAllowed: boolean = false;
   private frozenActive: FrozenDanmaku | undefined = undefined;
   private wasEnabled: boolean = true;
@@ -153,9 +154,11 @@ export struct DanmakuLayer {
       this.effectiveEnabled() && this.cid > 0 && this.canvasW > 0 && this.canvasH > 0;
   }
   private moving(): boolean {
-    return this.allowed() && !this.awaitingSnapshot && this.snapshot !== undefined && this.snapshot.running && !this.snapshot.seeking;
+    return this.allowed() && !this.awaitingSnapshot && !this.awaitingFreshSample &&
+      this.snapshot !== undefined && this.snapshot.running && !this.snapshot.seeking;
   }
   private media(): number {
+    if (this.awaitingFreshSample) { return this.lastFrameMedia; }
     const position: number = this.clock.position(this.now());
     return this.snapshot !== undefined && this.snapshot.duration > 0 ? Math.min(position, this.snapshot.duration) : position;
   }
@@ -240,6 +243,7 @@ export struct DanmakuLayer {
     if (this.sourceCid !== value.cid) { this.onSourceChanged(); }
     if (value.running || value.seeking) { this.frozenResumeAllowed = false; }
     if (this.frozenActive !== undefined && !this.matchesFrozen(value)) { this.frozenActive = undefined; }
+    const previous: DanmakuPlaybackInput | undefined = this.snapshot;
     this.snapshot = value;
     this.lastSampledAt = value.sampledAt;
     if (this.stream === undefined) { return; }
@@ -251,12 +255,41 @@ export struct DanmakuLayer {
     const now: number = this.now();
     const frozen: boolean = !value.running && !value.seeking;
     this.frozenResumeAllowed = frozen;
-    if ((!frozen && now - value.sampledAt > 1500) || value.sampledAt > now + 1) { this.suspend('stale-snapshot'); return; }
+    if ((!frozen && now - value.sampledAt > 1500) || value.sampledAt > now + 1) {
+      // 同一媒体的暂时失鲜只停帧；通用suspend会清轨与已加载段，不能用于切速采样断档。
+      if (value.seeking || this.awaitingSnapshot || previous === undefined || previous.timeRevision !== value.timeRevision) {
+        this.suspend('stale-snapshot');
+      } else {
+        // 合成切速锚点即使发布迟到，仍提供控制边界；只记速率区间，不冒充真实采样。
+        if (!value.positionObserved) {
+          this.clock.update(value.position, value.sampledAt, value.speed,
+            value.running && this.allowed(), value.timeRevision, false, false);
+        }
+        this.waitForFreshSample(now);
+      }
+      return;
+    }
+    const resumedSample: boolean = this.awaitingFreshSample;
+    this.awaitingFreshSample = false;
     const wasWaiting: boolean = this.awaitingSnapshot;
     this.awaitingSnapshot = false;
     const jump: boolean = this.clock.update(value.position, value.sampledAt, value.speed,
-      value.running && !value.seeking && this.allowed(), value.timeRevision);
-    if (jump || wasWaiting || value.seeking) { this.clearPicture(); this.lastFrameMedia = value.position; }
+      value.running && !value.seeking && this.allowed(), value.timeRevision, !resumedSample, value.positionObserved);
+    if (jump || wasWaiting || value.seeking) {
+      if (this.tracks.size() > 0) {
+        console.info('[PiliMini-dm] reset reason=' + (value.seeking ? 'seeking' : (wasWaiting ? 'waiting' : 'clock-jump')) +
+          ' active=' + this.tracks.size().toString() + ' observed=' + value.positionObserved.toString() +
+          ' speed=' + value.speed.toString() + ' ageMs=' + Math.max(0, Math.round(now - value.sampledAt)).toString() +
+          ' frameDeltaMs=' + Math.round(value.position - this.lastFrameMedia).toString());
+      }
+      this.clearPicture(); this.lastFrameMedia = value.position;
+    } else if (resumedSample) {
+      // 原项按真实媒体时间继续离场；断档期间的新项不补发。
+      this.pending.length = 0; this.pendingIndex = 0; this.lastFrameMedia = value.position;
+    }
+    if (resumedSample) {
+      console.info('[PiliMini-dm] resume-sample reset=' + jump.toString() + ' active=' + this.tracks.size().toString());
+    }
     if (value.seeking) {
       this.awaitingSnapshot = true;
       this.stream.cancelPending();
@@ -289,9 +322,19 @@ export struct DanmakuLayer {
       reason === 'invisible' || reason === 'hidden-snapshot') { this.captureFrozen(); }
     else { this.frozenActive = undefined; }
     this.awaitingSnapshot = true;
+    this.awaitingFreshSample = false;
     if (this.stream !== undefined) { this.stream.setEnabled(false); }
     this.clearPicture();
     this.stopFrames(reason);
+  }
+  /** 短时采样断档保留最后已绘制画面与有界段缓存，等现有播放器下一份真实锚点。 */
+  private waitForFreshSample(now: number): void {
+    if (!this.awaitingFreshSample) {
+      console.info('[PiliMini-dm] wait-sample ageMs=' + Math.max(0, Math.round(now - this.lastSampledAt)).toString() +
+        ' active=' + this.tracks.size().toString());
+    }
+    this.awaitingFreshSample = true;
+    this.stopFrames('stale-sample');
   }
   private matchesFrozen(value: DanmakuPlaybackInput): boolean {
     const frozen: FrozenDanmaku | undefined = this.frozenActive;
@@ -389,7 +432,7 @@ export struct DanmakuLayer {
   private onFrame(timestampNs: number): void {
     if (!this.moving()) { this.stopFrames('not-running'); return; }
     const now: number = this.now();
-    if (now - this.lastSampledAt > 1500) { this.suspend('stale-snapshot'); return; }
+    if (now - this.lastSampledAt > 1500) { this.waitForFreshSample(now); return; }
     if (!this.pacer.due(timestampNs)) { return; }
     const media: number = this.media();
     while (this.pendingIndex < this.pending.length && this.pending[this.pendingIndex].time <= media) {

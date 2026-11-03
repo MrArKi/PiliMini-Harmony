@@ -2,7 +2,7 @@
  * HTTP 基础封装（spec-01 任务 1.2 雏形）
  * 统一注入 UA / Referer；返回原始字符串（保持最小可用，错误模型后续加）
  */
-import { http } from '@kit.NetworkKit';
+import { connection, http } from '@kit.NetworkKit';
 import { UA_PC, BILI_REFERER } from '../../config/constants';
 import { AppError } from '../error/app_error';
 import { emitAuthLogout } from '../event/app_events';
@@ -84,31 +84,84 @@ export async function buildGetHeaders(extraHeaders?: Record<string, string>): Pr
   return headers;
 }
 
-async function getJsonOnce(url: string, headers: Record<string, string>): Promise<string> {
-  const req = http.createHttp();
+/** 只把系统明确无默认网络视为离线；系统查询异常仍交实际请求判断。 */
+function ensureNetworkAvailable(): void {
+  let available: boolean = true;
+  try { available = connection.hasDefaultNetSync(); } catch (_) {}
+  if (!available) { throw new AppError('network', -3, '网络未连接，请连接网络后重试'); }
+}
+
+function remainingBudget(deadline: number): number {
+  const remaining: number = deadline - Date.now();
+  if (remaining <= 0) { throw new AppError('network', 2300028, '网络请求超时，请重试'); }
+  return remaining;
+}
+
+async function getHeadersWithinBudget(extraHeaders: Record<string, string> | undefined,
+  deadline: number): Promise<Record<string, string>> {
+  const remaining: number = remainingBudget(deadline);
+  let timer: number = -1;
   try {
-    const res = await req.request(url, {
-      method: http.RequestMethod.GET,
-      header: headers,
-      connectTimeout: 15000,
-      readTimeout: 15000
+    // 凭据读取由CookieStore共享，不能取消别的消费者；超时后本次GET不再发起HTTP。
+    const timeout: Promise<Record<string, string>> = new Promise<Record<string, string>>((_resolve, reject): void => {
+      timer = setTimeout((): void => {
+        reject(new AppError('network', 2300028, '网络请求超时，请重试'));
+      }, remaining);
     });
-    if (typeof res.result === 'string') {
-      return res.result as string;
-    }
-    return JSON.stringify(res.result);
+    return await Promise.race([buildGetHeaders(extraHeaders), timeout]);
   } finally {
-    req.destroy();
+    if (timer !== -1) { clearTimeout(timer); }
   }
 }
 
-/** 网络类错误重试 1 次（设计约束；GET 幂等，写操作见 postForm 不重试） */
+async function getJsonOnce(url: string, headers: Record<string, string>, deadline: number): Promise<string> {
+  const remaining: number = remainingBudget(deadline);
+  const req: http.HttpRequest = http.createHttp();
+  // 原生超时不是整个逻辑GET的总预算；到期必须同时结束等待并停止原生请求。
+  return new Promise<string>((resolve, reject): void => {
+    let settled: boolean = false;
+    let timer: number = -1;
+    const cleanup = (): void => {
+      if (timer !== -1) { clearTimeout(timer); timer = -1; }
+      try { req.destroy(); } catch (_) {}
+    };
+    const fail = (error: Error): void => {
+      if (settled) { return; }
+      settled = true; cleanup(); reject(error);
+    };
+    timer = setTimeout((): void => {
+      fail(new AppError('network', 2300028, '网络请求超时，请重试') as Error);
+    }, remaining);
+    try {
+      req.request(url, {
+        method: http.RequestMethod.GET,
+        header: headers,
+        connectTimeout: remaining,
+        readTimeout: remaining
+      }).then((res: http.HttpResponse): void => {
+        if (settled) { return; }
+        try {
+          remainingBudget(deadline);
+          const raw: string = typeof res.result === 'string' ? res.result : JSON.stringify(res.result);
+          remainingBudget(deadline);
+          settled = true; cleanup(); resolve(raw);
+        } catch (e) { fail(e as Error); }
+      }).catch((e: Error): void => { fail(e); });
+    } catch (e) { fail(e as Error); }
+  });
+}
+
+/** GET至多重试一次，共享15秒预算；明确断网不请求、不重试。POST不重试。 */
 export async function getJson(url: string, extraHeaders?: Record<string, string>): Promise<string> {
-  const headers: Record<string, string> = await buildGetHeaders(extraHeaders);
+  const deadline: number = Date.now() + 15000;
+  ensureNetworkAvailable();
+  const headers: Record<string, string> = await getHeadersWithinBudget(extraHeaders, deadline);
+  ensureNetworkAvailable();
   try {
-    return await getJsonOnce(url, headers);
+    return await getJsonOnce(url, headers, deadline);
   } catch (e) {
-    return await getJsonOnce(url, headers);
+    ensureNetworkAvailable();
+    return await getJsonOnce(url, headers, deadline);
   }
 }
 

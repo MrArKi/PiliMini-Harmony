@@ -13,7 +13,16 @@ import { GalleryThumbnail, nextGalleryId } from './GalleryThumbnail';
 import { thumbUrl } from '../infra/image/bili_image';
 import { formatPlayCount } from './VideoCard';
 import { CommentItem, CommentPic } from '../service/video_service';
+import { CommentEmote } from '../model/emote';
 import { naraDate } from '../common/nara_date';
+import { InlineRichSpans } from './InlineRichText';
+
+/** 网络返回的正文/表情作为快照，只缓存当前可见评论的解析结果。 */
+class CommentTextCache {
+  message: string = '';
+  emotes: CommentEmote[] = [];
+  segments: RichSegment[] = [];
+}
 
 @Component
 export struct CommentItemView {
@@ -29,29 +38,60 @@ export struct CommentItemView {
   };
 
   private galleryId: string = nextGalleryId();
-  private messageCacheKey: string = '';
-  private messageCache: RichSegment[] = [];
+  private messageCacheRpid: number = -1;
+  private messageCache: CommentTextCache = new CommentTextCache();
+  private previewCache: Map<number, CommentTextCache> = new Map<number, CommentTextCache>();
+  private previewInlineHandled: boolean = false;
+  private previewTapTimer: number = -1;
+  private disposed: boolean = false;
+  private emoteLoadedReported: boolean = false;
+  private emoteFailedReported: boolean = false;
+
+  aboutToDisappear(): void {
+    this.disposed = true;
+    if (this.previewTapTimer >= 0) { clearTimeout(this.previewTapTimer); this.previewTapTimer = -1; }
+  }
+
+  aboutToAppear(): void { this.disposed = false; }
+
+  /** Text 的点击不冒泡；父级并行 Tap 兜住文字之外的空白，链接/昵称仍单独处理。 */
+  private openPreview(sub: CommentItem): void {
+    if (this.previewTapTimer >= 0) { clearTimeout(this.previewTapTimer); }
+    this.previewTapTimer = setTimeout((): void => {
+      this.previewTapTimer = -1;
+      const handled: boolean = this.previewInlineHandled;
+      this.previewInlineHandled = false;
+      if (!this.disposed && !handled) { this.onOpenSub(this.item, sub.rpid); }
+    }, 0);
+  }
+
+  /** 只记录一次成功/失败，不含表情URL、正文或账号，便于最终包真机定位。 */
+  private reportEmoteLoad(success: boolean): void {
+    if (success && !this.emoteLoadedReported) {
+      this.emoteLoadedReported = true;
+      console.info('[PiliMini-comment] imageLoaded=1');
+    } else if (!success && !this.emoteFailedReported) {
+      this.emoteFailedReported = true;
+      console.warn('[PiliMini-comment] imageFailed=1');
+    }
+  }
 
   /** 含链接/@时才分层渲染，普通评论保持单Text，不额外增加节点。 */
   private messageSegments(): RichSegment[] {
-    if (this.messageCacheKey !== this.item.message) {
-      this.messageCacheKey = this.item.message;
+    if (this.messageCacheRpid !== this.item.rpid || this.messageCache.message !== this.item.message ||
+      this.messageCache.emotes !== this.item.emotes) {
+      if (this.messageCacheRpid !== this.item.rpid) { this.previewCache.clear(); }
+      this.messageCacheRpid = this.item.rpid;
+      this.messageCache.message = this.item.message;
+      this.messageCache.emotes = this.item.emotes;
       const rich: boolean = RichText.isRich(this.item.message) || this.item.emotes.length > 0;
-      this.messageCache = rich ? RichText.parse(this.item.message, this.item.emotes) : [];
+      this.messageCache.segments = rich ? RichText.parse(this.item.message, this.item.emotes) : [];
+      if (this.item.emotes.length > 0 || this.item.message.indexOf('[') >= 0) {
+        const images: number = this.messageCache.segments.filter((segment: RichSegment): boolean => segment.kind === RichKind.Emote).length;
+        console.info('[PiliMini-comment] mapped=' + this.item.emotes.length.toString() + ' imageSegments=' + images.toString());
+      }
     }
-    return this.messageCache;
-  }
-
-  /** 表情占位符渲染尺寸（vp）：正文与楼中楼行高不同，大表情单独收一档。 */
-  private emoteSize(segment: RichSegment, sub: boolean): number {
-    if (segment.size >= 2) { return sub ? 22 : 34; }
-    return sub ? 18 : 20;
-  }
-
-  private segmentColor(segment: RichSegment): ResourceColor {
-    if (segment.kind === RichKind.Link) { return $r('app.color.link_blue'); }
-    if (segment.kind === RichKind.Mention) { return $r('app.color.brand_pink'); }
-    return $r('app.color.text_primary');
+    return this.messageCache.segments;
   }
 
   private tapSegment(segment: RichSegment, scope: CommentItem): void {
@@ -67,10 +107,18 @@ export struct CommentItemView {
 
   private hasSubFooter(): boolean { return this.item.expanded || this.item.rcount > this.item.replies.length; }
 
-  /** 子回复正文较短，逐行解析即可；空文本返回单段，避免空Text。 */
+  /** 预览只在正文/表情快照变化时解析；空文本返回单段，避免空Text。 */
   private subSegments(sub: CommentItem): RichSegment[] {
-    return sub.message.length > 0 ? RichText.parse(sub.message, sub.emotes)
-      : [new RichSegment(RichKind.Plain, ' ', '')];
+    let cached: CommentTextCache | undefined = this.previewCache.get(sub.rpid);
+    if (cached === undefined || cached.message !== sub.message || cached.emotes !== sub.emotes) {
+      cached = new CommentTextCache();
+      cached.message = sub.message;
+      cached.emotes = sub.emotes;
+      cached.segments = sub.message.length > 0 ? RichText.parse(sub.message, sub.emotes)
+        : [new RichSegment(RichKind.Plain, ' ', '')];
+      this.previewCache.set(sub.rpid, cached);
+    }
+    return cached.segments;
   }
   private pictureUrls(pics: CommentPic[]): string[] { return pics.map((p: CommentPic) => p.url); }
   private pictureThumbs(pics: CommentPic[]): string[] {
@@ -131,7 +179,6 @@ export struct CommentItemView {
         .borderRadius(4)
         .clip(true)
         .backgroundColor($r('app.color.btn_soft_bg'))
-        .onClick(() => { openMember(this.item.mid); })
       } else {
         ForEach(this.rowStarts(pics.length, this.perRowOf(pics.length)), (rowStart: number) => {
           Row({ space: 4 }) {
@@ -163,6 +210,7 @@ export struct CommentItemView {
   // ===== 子回复文本（14sp / 行高 1.6 / maxLines 2，名字 primary） =====
   @Builder
   SubLine(sub: CommentItem, first: boolean, last: boolean) {
+    Column() {
     Text() {
       if (this.upMid > 0 && sub.mid === this.upMid) {
         Span('UP ')
@@ -172,32 +220,17 @@ export struct CommentItemView {
       Span(sub.uname + '：')
         .fontColor($r('app.color.brand_pink'))
         .fontSize(14)
-        .onClick((): void => { openMember(sub.mid); })
-      ForEach(this.subSegments(sub), (segment: RichSegment) => {
-        // Text级onClick会吞掉Span点击，这里把「打开楼中楼」下沉到正文片段，昵称单独进空间。
-        if (segment.kind === RichKind.Emote) {
-          ImageSpan(segment.target)
-            .width(this.emoteSize(segment, true))
-            .height(this.emoteSize(segment, true))
-            .verticalAlign(ImageSpanAlignment.CENTER)
-            .objectFit(ImageFit.Contain)
-            .onClick((): void => { this.onOpenSub(this.item, sub.rpid); })
-        } else if (segment.kind === RichKind.Plain) {
-          Span(segment.text)
-            .fontColor($r('app.color.text_primary'))
-            .fontSize(14)
-            .onClick((): void => { this.onOpenSub(this.item, sub.rpid); })
-        } else {
-          Span(segment.text)
-            .fontColor(this.segmentColor(segment))
-            .fontSize(14)
-            .onClick((): void => { this.tapSegment(segment, sub); })
-        }
-      }, (segment: RichSegment, index: number) => index.toString() + '_' + segment.kind.toString())
+        .onClick((): void => { this.previewInlineHandled = true; openMember(sub.mid); })
+      // 不在Text上绑onClick；外层并行Tap覆盖整行，昵称/链接保持独立。
+      InlineRichSpans(this.subSegments(sub), 14, false, (segment: RichSegment): void => {
+        this.previewInlineHandled = true; this.tapSegment(segment, sub);
+      }, (success: boolean): void => { this.reportEmoteLoad(success); })
     }
     .lineHeight(22.4)
     .maxLines(2)
     .textOverflow({ overflow: TextOverflow.Ellipsis })
+    .width('100%')
+    }
     .width('100%')
     .padding({
       left: 8,
@@ -206,6 +239,10 @@ export struct CommentItemView {
       bottom: this.item.replies.length === 1 && !this.hasSubFooter() ? 5 : (last ? 8 : 4)
     })
     .id('comment_preview_' + sub.rpid.toString())
+    .onTouch((event: TouchEvent): void => {
+      if (event.type === TouchType.Down) { this.previewInlineHandled = false; }
+    })
+    .parallelGesture(TapGesture().onAction((): void => { this.openPreview(sub); }))
   }
 
   build() {
@@ -232,7 +269,6 @@ export struct CommentItemView {
               .maxLines(1)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
               .flexShrink(1)
-              .onClick(() => { openMember(this.item.mid); })
             if (this.upMid > 0 && this.item.mid === this.upMid) {
               Text('UP')
                 .fontSize(9)
@@ -262,6 +298,8 @@ export struct CommentItemView {
         }
         .layoutWeight(1)
         .alignItems(HorizontalAlign.Start)
+        .id('comment_author_' + this.item.rpid.toString())
+        .parallelGesture(TapGesture().onAction((): void => { openMember(this.item.mid); }))
 
         Row({ space: 4 }) {
           Image($r('app.media.icon_thumbup'))
@@ -283,20 +321,9 @@ export struct CommentItemView {
         if (this.item.message.length > 0) {
           if (this.messageSegments().length > 0) {
             Text() {
-              ForEach(this.messageSegments(), (segment: RichSegment) => {
-                if (segment.kind === RichKind.Emote) {
-                  ImageSpan(segment.target)
-                    .width(this.emoteSize(segment, false))
-                    .height(this.emoteSize(segment, false))
-                    .verticalAlign(ImageSpanAlignment.CENTER)
-                    .objectFit(ImageFit.Contain)
-                } else if (segment.kind === RichKind.Plain) {
-                  Span(segment.text).fontColor($r('app.color.text_primary')).fontSize(14)
-                } else {
-                  Span(segment.text).fontColor(this.segmentColor(segment)).fontSize(14)
-                    .onClick((): void => { this.tapSegment(segment, this.item); })
-                }
-              }, (segment: RichSegment, index: number) => index.toString() + '_' + segment.kind.toString())
+              InlineRichSpans(this.messageSegments(), 14, false, (segment: RichSegment): void => {
+                this.tapSegment(segment, this.item);
+              }, (success: boolean): void => { this.reportEmoteLoad(success); })
             }
             .fontSize(14)
             .lineHeight(24.5)

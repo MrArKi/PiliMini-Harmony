@@ -25,6 +25,7 @@
     "pages/debug/SpikePlayer",
     "pages/debug/SpikeWbi",
     "pages/debug/SpikeAudio",
-    "pages/debug/Spec01"
+    "pages/debug/Spec01",
+    "pages/debug/HeroSpike"
   ]
 }

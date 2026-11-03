@@ -7,6 +7,7 @@ import { originalUrl } from '../infra/image/bili_image';
 import { image } from '@kit.ImageKit';
 import { peekCachedImage } from '../infra/image/image_loader';
 import { curves } from '@kit.ArkUI';
+import displaySync from '@ohos.graphics.displaySync';
 
 export class PreviewRect {
   tag: string = '';
@@ -78,7 +79,13 @@ export struct ImageViewer {
   private dismissDragging: boolean = false;
   private pinchX: number = 0;
   private pinchY: number = 0;
-  private flingTimer: number = -1;
+  private flingSync: displaySync.DisplaySync | undefined = undefined;
+  private flingVx: number = 0;
+  private flingVy: number = 0;
+  private flingSpeed: number = 1;
+  private flingFriction: number = 0.01;
+  private flingStart: number = 0;
+  private flingDistance: number = 0;
   private zoomUntil: number = 0;
   private lastMultiAt: number = 0;
   private pinchBaseX: number = 0;
@@ -258,29 +265,51 @@ export struct ImageViewer {
   }
 
   private stopFling(): void {
-    if (this.flingTimer !== -1) { clearInterval(this.flingTimer); this.flingTimer = -1; }
+    const sync: displaySync.DisplaySync | undefined = this.flingSync;
+    this.flingSync = undefined;
+    if (sync !== undefined) {
+      try { sync.stop(); } catch (_) {}
+      try { sync.off('frame', this.flingFrame); } catch (_) {}
+    }
   }
 
-  /** 与Nara FrictionSimulation同一指数衰减，边界按图片实际contain尺寸。 */
+  /**
+   * 惯性滑动：与 VSYNC 对齐的官方帧回调（displaySync），同一套 Nara 指数衰减公式。
+   * 原实现是 setInterval(16) + 每帧写 @State，主线程定时器与渲染不同步，缩放拖动时必抖。
+   */
   private startFling(vx: number, vy: number): void {
     this.stopFling();
     const velocity: number = Math.sqrt(vx * vx + vy * vy);
     if (velocity < 200) { return; }
-    const friction: number = velocity > 5000 ? 0.03 : velocity > 3000 ? 0.02 : 0.01;
-    const started: number = Date.now();
-    let lastDistance: number = 0;
-    this.flingTimer = setInterval(() => {
-      if (this.destroyed || this.closing) { this.stopFling(); return; }
-      const t: number = (Date.now() - started) / 1000;
-      const distance: number = velocity * (Math.pow(friction, t) - 1) / Math.log(friction);
-      const delta: number = distance - lastDistance;
-      lastDistance = distance;
-      const x: number = this.clampOffset(this.offX + vx / velocity * delta, true);
-      const y: number = this.clampOffset(this.offY + vy / velocity * delta, false);
-      if (delta < 0.1 || (x === this.offX && y === this.offY)) { this.stopFling(); return; }
-      this.offX = x; this.offY = y;
-    }, 16);
+    this.flingVx = vx;
+    this.flingVy = vy;
+    this.flingSpeed = velocity;
+    this.flingFriction = velocity > 5000 ? 0.03 : velocity > 3000 ? 0.02 : 0.01;
+    this.flingStart = Date.now();
+    this.flingDistance = 0;
+    try {
+      const sync: displaySync.DisplaySync = displaySync.create();
+      this.flingSync = sync;
+      sync.setExpectedFrameRateRange({ min: 1, max: 120, expected: 120 });
+      sync.on('frame', this.flingFrame);
+      sync.start();
+    } catch (_) {
+      this.flingSync = undefined;
+    }
   }
+
+  private readonly flingFrame = (): void => {
+    if (this.destroyed || this.closing) { this.stopFling(); return; }
+    const t: number = (Date.now() - this.flingStart) / 1000;
+    const distance: number = this.flingSpeed * (Math.pow(this.flingFriction, t) - 1) / Math.log(this.flingFriction);
+    const delta: number = distance - this.flingDistance;
+    this.flingDistance = distance;
+    const x: number = this.clampOffset(this.offX + this.flingVx / this.flingSpeed * delta, true);
+    const y: number = this.clampOffset(this.offY + this.flingVy / this.flingSpeed * delta, false);
+    if (delta < 0.1 || (x === this.offX && y === this.offY)) { this.stopFling(); return; }
+    this.offX = x;
+    this.offY = y;
+  };
 
   private doubleTap(e: GestureEvent): void {
     if (this.closing || this.opening || Date.now() < this.zoomUntil || Date.now() - this.lastMultiAt < 555) { return; }

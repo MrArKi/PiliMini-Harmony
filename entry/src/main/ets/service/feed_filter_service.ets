@@ -1,4 +1,4 @@
-/** 首页本机规则。仅存有限文本元数据；不发送App反馈、不影响其他内容列表。 */
+/** 首页本机屏蔽与单视频隐藏；仅存有限文本元数据，不提供 B 站云端「不感兴趣」反馈。 */
 import { prefsGet, prefsPut } from '../infra/storage/prefs';
 import { VideoItem } from '../model/video_item';
 import { CookieStore } from '../infra/cookie/cookie_store';
@@ -113,18 +113,24 @@ export class FeedFilterService {
     if (revision !== CookieStore.sessionRevision()) { FeedFilterService.dropExpiredSessionBlocks(); return; }
     const users: SessionBlockedUser[] = FeedFilterService.sessionBlocked.slice();
     let changed: boolean = false;
-    for (let i: number = 0; i < users.length; i++) {
-      const user: SessionBlockedUser = users[i];
-      let relation: MemberRelation;
-      try { relation = await MemberService.relationForSession(user.mid, session); }
-      catch (_) {
-        if (revision !== CookieStore.sessionRevision()) { FeedFilterService.dropExpiredSessionBlocks(); return; }
-        continue;
-      }
+    // 并发复核：原来逐个 mid 串行，拉黑 N 人就是 N 次串行往返（回首页明显发卡）。
+    // 按 6 路分批（再高容易触发关系接口频控），每批结束后仍校验账号代际。
+    const BATCH: number = 6;
+    for (let start: number = 0; start < users.length; start += BATCH) {
       if (revision !== CookieStore.sessionRevision()) { FeedFilterService.dropExpiredSessionBlocks(); return; }
-      if (relation.attribute !== 128) {
-        const index: number = FeedFilterService.sessionBlocked.indexOf(user);
-        if (index >= 0) { FeedFilterService.sessionBlocked.splice(index, 1); changed = true; }
+      const slice: SessionBlockedUser[] = users.slice(start, start + BATCH);
+      const relations: Array<MemberRelation | undefined> = await Promise.all(
+        slice.map((user: SessionBlockedUser): Promise<MemberRelation | undefined> =>
+          MemberService.relationForSession(user.mid, session)
+            .catch((): MemberRelation | undefined => undefined)));
+      if (revision !== CookieStore.sessionRevision()) { FeedFilterService.dropExpiredSessionBlocks(); return; }
+      for (let i: number = 0; i < slice.length; i++) {
+        const relation: MemberRelation | undefined = relations[i];
+        if (relation === undefined) { continue; }
+        if (relation.attribute !== 128) {
+          const index: number = FeedFilterService.sessionBlocked.indexOf(slice[i]);
+          if (index >= 0) { FeedFilterService.sessionBlocked.splice(index, 1); changed = true; }
+        }
       }
     }
     if (changed) { FeedFilterService.notify(); }

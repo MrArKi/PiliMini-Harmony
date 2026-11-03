@@ -15,6 +15,7 @@ import { SeekPreview } from './SeekPreview';
 import { CastPanel } from './CastPanel';
 import { CastSnapshot, DlnaDevice } from '../../model/cast';
 import { PlayPauseIcon } from './PlayPauseIcon';
+import { PlayerStatusInfo } from './PlayerStatusInfo';
 import { DanmakuLayer } from './DanmakuLayer';
 import { DanmakuPanel } from './DanmakuPanel';
 import { DanmakuSelectionMenu } from './DanmakuSelectionMenu';
@@ -53,9 +54,15 @@ export struct PlayerView {
   /** 选集跨BV/分P一次提交源，避免分别更新bvid/cid造成混合取流。 */
   @Prop @Watch('onPlaybackSourceChange') playbackSource: PlaybackSource | undefined = undefined;
   @Prop cover: string = '';
+  /** 自动入场用黑底；独立于退出期间会变化的autoPlay运行许可。 */
+  @Prop showIdleCover: boolean = true;
   @Prop sourceWidth: number = 0;
   @Prop sourceHeight: number = 0;
   onVideoSize: (w: number, h: number) => void = () => {};
+  /** 当前源原生VO已配置且具备正尺寸，宿主仍需等待自己的像素交接绘制。 */
+  onVideoOutputReady: () => void = () => {};
+  private videoOutputSourceKey: string = '';
+  private videoOutputNotified: boolean = false;
   onInitialLayout: () => void = () => {};
   private initialLayoutNotified: boolean = false;
   registerRelease: (release: () => Promise<void>) => void = () => {};
@@ -107,11 +114,15 @@ export struct PlayerView {
   /** 播放状态回调（idle/loading/playing/paused/error），供详情页驱动收窄逻辑 */
   onStateChange: (state: string) => void = () => {
   };
-  /** 每次状态变化时通知宿主 */
-  private notifyState(): void {
-    if (!this.destroyed) {
-      this.onStateChange(this.state);
-    }
+  private notifiedStateSourceKey: string = '';
+  private notifiedState: string = '';
+  /** 仅向当前源宿主通知；去重不依赖可能已被旧源快照更新的内部状态。 */
+  private notifyState(sourceKey: string): void {
+    this.syncVideoOutputSource();
+    if (this.destroyed || sourceKey !== this.videoOutputSourceKey ||
+      (sourceKey === this.notifiedStateSourceKey && this.state === this.notifiedState)) { return; }
+    this.notifiedStateSourceKey = sourceKey; this.notifiedState = this.state;
+    this.onStateChange(this.state);
   }
 
   private onResumeTick(): void {
@@ -138,6 +149,10 @@ export struct PlayerView {
 
   @State state: string = 'idle'; // idle | loading | playing | paused | completed | error
   @State controlsVisible: boolean = true;
+  /** 仅记录本源已进入播放/暂停态，不代表媒体首帧已出屏。 */
+  @State sourceHasPlayed: boolean = false;
+  @State userExplicitControls: boolean = false;
+  private controlsSourceKey: string = '';
   @State posMs: number = 0;
   @State durMs: number = 0;
   @State speed: number = 1.0;
@@ -175,6 +190,15 @@ export struct PlayerView {
   private toastTimer: number = -1;
   private controlTimer: number = -1;
   private longPressActive: boolean = false;
+  /** TapGesture在第二次Up才触发；Nara要求第二次Down就切换，且该按压不能再加速。 */
+  private doublePressConsumed: boolean = false;
+  private firstTapAt: number = -1;
+  private firstTapX: number = 0;
+  private firstTapY: number = 0;
+  private touchDownAt: number = 0;
+  private touchDownX: number = 0;
+  private touchDownY: number = 0;
+  private touchMoved: boolean = false;
   private speedLocked: boolean = false;
   private speedBeforePress: number = 1;
   private panSeeking: boolean = false;
@@ -191,6 +215,8 @@ export struct PlayerView {
   private volumeTarget: number = 0;
   private volumeLastDy: number = 0;
   private volumeRequests: number[] = [];
+  private volumeReadbackTimer: number = -1;
+  private volumeReadbackRevision: number = 0;
   private systemVolumeReady: boolean = false;
   private systemVolumeMin: number = 0;
   private systemVolumeMax: number = 0;
@@ -243,7 +269,7 @@ export struct PlayerView {
       if (this.destroyed) { return; }
       this.settingsLoaded = true;
       if (this.ready && this.visible && this.autoPlay) { this.start(this.qn); }
-    }).catch((): void => { if (!this.destroyed) { this.errorText = '播放器设置初始化失败'; this.state = 'error'; this.notifyState(); } });
+    }).catch((): void => { if (!this.destroyed) { this.errorText = '播放器设置初始化失败'; this.state = 'error'; this.notifyState(this.currentVideoOutputSourceKey()); } });
     window.getLastWindow(getContext(this)).then((win: window.Window): void => {
       if (this.destroyed) { return; }
       this.mainWin = win;
@@ -255,8 +281,10 @@ export struct PlayerView {
 
   private receive(snapshot: PlaybackSnapshot): void {
     if (this.destroyed) { return; }
+    this.syncVideoOutputSource();
     const changed: boolean = this.state !== snapshot.state;
     this.state = snapshot.state; this.posMs = snapshot.position; this.durMs = snapshot.duration;
+    if (this.state === 'playing' || this.state === 'paused' || this.state === 'completed') { this.sourceHasPlayed = true; }
     this.speed = snapshot.speed; this.speedText = this.speed.toString() + 'X';
     this.qn = snapshot.quality; this.qualities = snapshot.qualities; this.bufferPercent = snapshot.bufferPercent;
     this.wanted = snapshot.wanted; this.started = snapshot.loaded;
@@ -264,29 +292,31 @@ export struct PlayerView {
     this.receiveCast(snapshot.cast);
     this.brightnessControl.setBackground(snapshot.background);
     if (snapshot.background) {
+      this.cancelVolumeReadback();
       this.requestedSystemLevel = -1; this.volumeRequests = [];
       if (this.seekPreviewMs >= 0 || this.seekCancelHint || this.panMode !== 'none') { this.onPanEnd(true); }
     }
     this.receiveSystemVolume(snapshot);
     const source: PlaybackSource | undefined = this.playbackSource || this.localSource;
     this.danmakuFeed.publish({ cid: (source ? source.localPath : this.localPath).length > 0 ? 0 : (source ? source.cid : this.cid),
-      duration: snapshot.duration, position: snapshot.position, speed: snapshot.speed,
+      duration: snapshot.duration, position: snapshot.position, positionObserved: snapshot.positionObserved, speed: snapshot.speed,
       running: snapshot.state === 'playing' && snapshot.loaded && !snapshot.background && !snapshot.seeking,
       timeRevision: snapshot.timeRevision, sampledAt: snapshot.sampledAt, seeking: snapshot.seeking || !snapshot.loaded });
     if (snapshot.background) {
       this.danmakuPanelShown = false; this.danmakuSelected = false; this.closeCastPanel();
     }
-    if (snapshot.width > 0 && snapshot.height > 0) {
+    if (snapshot.videoSourceKey === this.videoOutputSourceKey && snapshot.width > 0 && snapshot.height > 0) {
       const ratio: number = snapshot.width / snapshot.height;
       if (Math.abs(ratio - this.actualRatio) > 0.0001) { this.actualRatio = ratio; this.onVideoSize(snapshot.width, snapshot.height); }
       if (snapshot.loaded && snapshot.state !== 'loading') { this.showPausedFrame = false; this.pausedFrame = undefined; }
     }
+    this.notifyVideoOutputReady(snapshot);
     this.syncSession(); this.updateScreenOn();
     if (changed) {
       if (this.state === 'playing') { this.armControls(); }
       else if (this.state === 'paused' || this.state === 'completed' || this.state === 'error') { this.controlsVisible = true; }
-      this.notifyState();
     }
+    this.notifyState(snapshot.videoSourceKey);
   }
 
   private surfaceReady(surface: string): void {
@@ -332,6 +362,7 @@ export struct PlayerView {
 
   onCidChange(): void {
     if (this.destroyed || this.localPath.length > 0 || this.playbackSource !== undefined) { return; }
+    this.syncVideoOutputSource();
     this.danmakuPanelShown = false; this.danmakuSelected = false;
     this.closeCastPanel();
     this.onPanEnd(true);
@@ -341,6 +372,7 @@ export struct PlayerView {
 
   private onLocalSourceChange(): void {
     if (!this.localSource || this.destroyed) { return; }
+    this.syncVideoOutputSource();
     this.danmakuSelected = false; this.danmakuPanelShown = false;
     this.closeCastPanel();
     this.onPanEnd(true);
@@ -350,11 +382,37 @@ export struct PlayerView {
 
   private onPlaybackSourceChange(): void {
     if (!this.playbackSource || this.destroyed) { return; }
+    this.syncVideoOutputSource();
     this.danmakuPanelShown = false; this.danmakuSelected = false;
     this.closeCastPanel();
     this.onPanEnd(true);
     this.actualRatio = 0; this.pausedFrame = undefined; this.showPausedFrame = false; this.controlsVisible = true;
     if (this.ready && this.settingsLoaded && this.visible) { this.start(this.qn, false); }
+  }
+
+  private currentVideoOutputSourceKey(): string {
+    const source: PlaybackSource | undefined = this.playbackSource || this.localSource;
+    return source ? source.bvid + ':' + source.cid.toString() + '|' + source.localPath + '|' + (source.localAudioPath || '')
+      : this.bvid + ':' + this.cid.toString() + '|' + this.localPath + '|';
+  }
+
+  private syncVideoOutputSource(): void {
+    const key: string = this.currentVideoOutputSourceKey();
+    if (key !== this.videoOutputSourceKey) {
+      this.videoOutputSourceKey = key;
+      this.videoOutputNotified = false;
+      this.notifiedStateSourceKey = ''; this.notifiedState = '';
+    }
+  }
+
+  private notifyVideoOutputReady(snapshot: PlaybackSnapshot): void {
+    this.syncVideoOutputSource();
+    if (this.videoOutputNotified || this.destroyed || this.exiting || !this.visible || snapshot.background ||
+      !snapshot.loaded || !snapshot.videoOutputReady || snapshot.videoSourceKey !== this.videoOutputSourceKey ||
+      snapshot.width <= 0 || snapshot.height <= 0 ||
+      (snapshot.state !== 'playing' && snapshot.state !== 'paused' && snapshot.state !== 'completed')) { return; }
+    this.videoOutputNotified = true;
+    this.onVideoOutputReady();
   }
 
   private start(quality: number, preserve: boolean = true): void {
@@ -363,6 +421,11 @@ export struct PlayerView {
     const source: PlaybackSource = this.playbackSource || this.localSource || { bvid: this.bvid, cid: this.cid, localPath: this.localPath,
       title: this.partText || this.title, artist: this.artist, cover: this.cover,
       localDuration: this.localDuration, offlineScope: this.offlineScope, offlineKey: this.offlineKey };
+    const controlsKey: string = source.bvid + ':' + source.cid.toString() + '|' + source.localPath + '|' + (source.localAudioPath || '');
+    this.syncVideoOutputSource();
+    if (controlsKey !== this.controlsSourceKey) {
+      this.controlsSourceKey = controlsKey; this.sourceHasPlayed = false; this.userExplicitControls = false;
+    }
     this.controller.start(source, quality, preserve);
   }
   private togglePlay(): void {
@@ -492,6 +555,7 @@ export struct PlayerView {
     this.xcController.created = () => {}; this.xcController.removed = () => {}; this.xcController.resized = () => {};
     if (this.controller !== undefined) { this.controller.dispose(); this.controller = undefined; }
     this.danmakuFeed.clear();
+    this.cancelVolumeReadback();
     this.requestedSystemLevel = -1; this.brightnessControl.dispose();
     if (this.mainWin !== undefined) {
       PlayerScreen.update(this.mainWin, this.surfaceBase, false);
@@ -499,6 +563,7 @@ export struct PlayerView {
   }
 
   private onSingleTap(event: GestureEvent): void {
+    if (this.doublePressConsumed) { return; }
     if (this.castControlsRemote()) { this.openCastPanel(); return; }
     if (this.panConsumed) { return; }
     if (!this.isFullscreen && this.collapseRatio > 0 && this.state !== 'playing') { this.togglePlay(); return; }
@@ -607,7 +672,9 @@ export struct PlayerView {
       this.start(this.qn);
       return;
     }
-    this.controlsVisible = !this.controlsVisible;
+    const initialLoadingHidden: boolean = this.state === 'loading' && !this.sourceHasPlayed && !this.userExplicitControls;
+    this.userExplicitControls = true;
+    this.controlsVisible = initialLoadingHidden || !this.controlsVisible;
     if (this.controlsVisible) { this.armControls(); }
   }
 
@@ -625,11 +692,43 @@ export struct PlayerView {
     this.showToast(pause ? '已暂停' : completed ? '重新播放' : initial ? '开始播放' : '继续播放');
   }
 
+  private onCanvasTouch(event: TouchEvent): void {
+    const touch: TouchObject | undefined = event.changedTouches.length > 0 ? event.changedTouches[0] : undefined;
+    if (touch === undefined) { return; }
+    const now: number = event.timestamp / 1000000;
+    if (event.type === TouchType.Down) {
+      this.panConsumed = false; this.doublePressConsumed = false;
+      this.touchDownAt = now; this.touchDownX = touch.x; this.touchDownY = touch.y;
+      this.touchMoved = event.touches.length > 1;
+      const isSecond: boolean = event.touches.length === 1 && this.firstTapAt >= 0 &&
+        now - this.firstTapAt >= 0 && now - this.firstTapAt <= 300 &&
+        Math.hypot(touch.x - this.firstTapX, touch.y - this.firstTapY) <= 60;
+      this.firstTapAt = -1;
+      if (isSecond) {
+        this.doublePressConsumed = true;
+        this.onDoubleTap();
+      }
+    } else if (event.type === TouchType.Move) {
+      if (Math.hypot(touch.x - this.touchDownX, touch.y - this.touchDownY) > 6 || event.touches.length > 1) {
+        this.touchMoved = true; this.firstTapAt = -1;
+      }
+    } else if (event.type === TouchType.Up) {
+      if (!this.doublePressConsumed && !this.touchMoved && !this.panConsumed && !this.longPressActive &&
+        now - this.touchDownAt < 400 && event.touches.length <= 1) {
+        this.firstTapAt = now; this.firstTapX = touch.x; this.firstTapY = touch.y;
+      }
+    } else if (event.type === TouchType.Cancel) {
+      this.firstTapAt = -1; this.touchMoved = true;
+    }
+  }
+
   private onLongPressStart(): void {
+    if (this.doublePressConsumed || this.panConsumed) { return; }
     if (this.castControlsRemote()) { return; }
     if (this.state === 'idle' || this.state === 'error') {
       return;
     }
+    this.panConsumed = true; this.firstTapAt = -1;
     if (!this.speedLocked) { this.speedBeforePress = this.speed; }
     this.longPressActive = true;
     this.applySpeed(LONG_PRESS_SPEED);
@@ -649,9 +748,11 @@ export struct PlayerView {
   }
 
   private onPanStart(startX: number): void {
+    if (this.doublePressConsumed) { return; }
     if (!this.visible || this.appInBackground || this.exiting || this.castControlsRemote()) {
       return;
     }
+    this.cancelVolumeReadback();
     this.panMode = 'none';
     this.panConsumed = true;
     this.requestedSystemLevel = -1;
@@ -666,6 +767,7 @@ export struct PlayerView {
   }
 
   private onPanUpdate(dx: number, dy: number, x: number, y: number): void {
+    if (this.doublePressConsumed) { return; }
     if (!this.visible || this.appInBackground || this.exiting || this.castControlsRemote()) {
       return;
     }
@@ -770,7 +872,8 @@ export struct PlayerView {
     if (own >= 0) { this.volumeRequests.splice(0, own + 1); }
     else if (this.panMode === 'volume') { this.volumeTarget = this.curVolume; this.volumeRequests = []; }
     if (snapshot.systemVolumeShowUi && this.visible && !this.appInBackground && !this.exiting) {
-      if (this.panMode !== 'volume') { this.requestedSystemLevel = -1; }
+      // 较早的自身ACK可能先于末次目标到达；不能把尚未提交的末次Prop清空。
+      if (this.panMode !== 'volume' && own < 0) { this.requestedSystemLevel = -1; }
       this.showToast('音量 ' + Math.round(this.curVolume * 100) + '%');
     }
   }
@@ -798,7 +901,28 @@ export struct PlayerView {
     this.panSeeking = false;
     this.seekPreviewMs = -1;
     this.seekCancelHint = false;
-    if (syncVolume) { this.controller?.syncSystemVolume(); }
+    if (cancelled) {
+      this.cancelVolumeReadback();
+      if (syncVolume) { this.requestedSystemLevel = -1; this.volumeRequests = []; }
+    } else if (syncVolume) {
+      // Prop先随本帧提交；立即同步会只读到旧档位。结束后仅补一次真实读回。
+      this.cancelVolumeReadback();
+      const revision: number = this.volumeReadbackRevision;
+      this.volumeReadbackTimer = setTimeout((): void => {
+        this.volumeReadbackTimer = -1;
+        if (revision !== this.volumeReadbackRevision || this.destroyed || !this.visible || this.appInBackground ||
+          this.exiting || this.panMode !== 'none') { return; }
+        this.controller?.syncSystemVolume();
+        if (this.systemVolumeReady && this.toast.startsWith('音量 ')) {
+          this.showToast('音量 ' + Math.round(this.curVolume * 100) + '%');
+        }
+      }, 180);
+    }
+  }
+
+  private cancelVolumeReadback(): void {
+    this.volumeReadbackRevision++;
+    if (this.volumeReadbackTimer !== -1) { clearTimeout(this.volumeReadbackTimer); this.volumeReadbackTimer = -1; }
   }
 
   // ===== 控制层 =====
@@ -876,6 +1000,9 @@ export struct PlayerView {
       .layoutWeight(1)
       .alignItems(HorizontalAlign.Start)
 
+      if (this.isFullscreen && this.visible && !this.appInBackground && !this.exiting) {
+        PlayerStatusInfo()
+      }
       Row() {
         if (!this.isFullscreen && this.localPath.length === 0 &&
           (!this.playbackSource || this.playbackSource.localPath.length === 0) &&
@@ -1109,11 +1236,11 @@ export struct PlayerView {
 
       // 画布独占手势；上层菜单、进度条与按钮保持独立命中。
       Column().width('100%').height('100%')
-        .onTouch((event: TouchEvent): void => { if (event.type === TouchType.Down) { this.panConsumed = false; } })
+        .onTouch((event: TouchEvent): void => { this.onCanvasTouch(event); })
     .gesture(
       GestureGroup(GestureMode.Parallel,
         GestureGroup(GestureMode.Exclusive,
-          TapGesture({ count: 2 }).onAction(() => { this.onDoubleTap(); }),
+          TapGesture({ count: 2 }).onAction(() => { if (!this.doublePressConsumed) { this.onDoubleTap(); } }),
           TapGesture({ count: 1 }).onAction((event: GestureEvent): void => { this.onSingleTap(event); })
         ),
         LongPressGesture({ repeat: false, duration: 400 })
@@ -1153,8 +1280,8 @@ export struct PlayerView {
             } })
       }
 
-      // ② 封面遮罩（未起播）
-      if (this.state === 'idle') {
+      // ② 手动播放入口的未起播封面；自动入场保持黑底，不再二次切封面。
+      if (this.showIdleCover && this.state === 'idle') {
         Stack({ alignContent: Alignment.Center }) {
           AsyncImage({ src: this.cover, w: 640, h: 640, fit: ImageFit.Contain })
           Column() {
@@ -1177,15 +1304,12 @@ export struct PlayerView {
       }
 
       // ③ 加载 / 错误
-      if (this.state === 'loading') {
-        Column({ space: 8 }) {
+      if (this.state === 'loading' || (this.state === 'idle' && !this.showIdleCover)) {
+        Column() {
           LoadingProgress()
             .width(36)
             .height(36)
             .color('#FFFFFF')
-          Text('取流中…')
-            .fontSize(12)
-            .fontColor('#FFFFFF')
         }
         .width('100%')
         .height('100%')
@@ -1217,7 +1341,8 @@ export struct PlayerView {
       }
 
       // ④ 控制层
-      if (this.controlsVisible && this.state !== 'idle') {
+      if (this.controlsVisible && this.state !== 'idle' &&
+        (this.state !== 'loading' || this.sourceHasPlayed || this.userExplicitControls)) {
         Column() {
           this.TopBar()
           Blank().hitTestBehavior(HitTestMode.None)
@@ -1284,9 +1409,11 @@ export struct PlayerView {
       }
 
       // ⑦ toast / 拖动时间提示
-      if (this.requestedSystemLevel >= 0 && this.toast.startsWith('音量 ') &&
-        this.visible && !this.appInBackground && !this.exiting) {
-        AVVolumePanel({ volumeLevel: this.requestedSystemLevel, volumeParameter: { position: { x: -1, y: -1 } } })
+      // 保持官方组件先挂载；首次手势必须改变已有Prop，而不是仅作为创建初值。
+      // 无用户命令时undefined是可选参数，不传合法档位、不自动调音。
+      if (this.visible && !this.appInBackground && !this.exiting) {
+        AVVolumePanel({ volumeLevel: this.requestedSystemLevel >= 0 ? this.requestedSystemLevel : undefined,
+          volumeParameter: { position: { x: -1, y: -1 } } })
           .width(1).height(1).hitTestBehavior(HitTestMode.None)
       }
       if (this.toast.length > 0 && this.seekPreviewMs < 0 && !this.seekCancelHint) {

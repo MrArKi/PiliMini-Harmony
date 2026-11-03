@@ -53,6 +53,8 @@ export struct MineTab {
   /** 已加载数据的账号 mid（相同则返回页面时不重拉收藏/观看记录） */
   private loadedMid: number = 0;
   private accountRequest: number = 0;
+  /** Tabs会预建隐藏页；首次可见才加载，并合并成对生命周期触发。 */
+  private accountCheck: Promise<void> | undefined = undefined;
   private folderRequest: number = 0;
   private historyDs: BasicDataSource<HistoryItem> = new BasicDataSource<HistoryItem>();
   private folderDs: BasicDataSource<FavFolder> = new BasicDataSource<FavFolder>();
@@ -65,13 +67,13 @@ export struct MineTab {
   ];
 
   aboutToAppear(): void {
-    this.refresh();
+    if (this.active) { this.refreshIfAccountChanged(); }
     // 旧版逐夹补封面的URL缓存已不再需要，仅在确实存在时清除。
     prefsGet('fav_covers_cache', '').then((raw: string): void => {
       if (raw.length > 0) { prefsDelete('fav_covers_cache').catch(() => {}); }
     }).catch(() => {});
     this.offAuth = onAuthLogout(() => {
-      this.refresh();
+      if (this.active) { this.refresh(); }
     });
     this.offHistory = onHistoryChanged((): void => {
       this.historyDirty = true;
@@ -97,23 +99,31 @@ export struct MineTab {
 
   /** 主壳从其它页面返回（登录态可能变化） */
   onShown(): void {
-    this.refreshIfAccountChanged();
+    if (this.active) { this.refreshIfAccountChanged(); }
   }
 
-  private async refreshIfAccountChanged(): Promise<void> {
+  private refreshIfAccountChanged(): Promise<void> {
+    if (this.accountCheck !== undefined) { return this.accountCheck; }
+    const operation: Promise<void> = this.checkAccount().finally((): void => {
+      if (this.accountCheck === operation) { this.accountCheck = undefined; }
+    });
+    this.accountCheck = operation;
+    return operation;
+  }
+
+  private async checkAccount(): Promise<void> {
     const mid: string = await CookieStore.get('DedeUserID');
-    if (this.destroyed) { return; }
+    if (this.destroyed || !this.active) { return; }
     if (this.user !== null && mid === this.loadedMid.toString()) {
       if (this.historyDirty) { this.loadHistory(); }
       if (this.active && this.statDirty) { this.loadStat(this.loadedMid); }
       return;
     }
-    this.refresh();
+    await this.refresh();
   }
 
   onActive(): void {
-    if (this.active && this.historyDirty) { this.loadHistory(); }
-    if (this.active && this.statDirty && this.loadedMid > 0) { this.loadStat(this.loadedMid); }
+    if (this.active) { this.refreshIfAccountChanged(); }
   }
 
   private async refresh(): Promise<void> {
@@ -123,7 +133,7 @@ export struct MineTab {
     // 只在首次读取时显示骨架；同账号刷新保留已经呈现的资料和卡片。
     try {
       const u: UserInfo | null = await AuthService.fetchNav(true);
-      if (this.destroyed || request !== this.accountRequest) { return; }
+      if (this.destroyed || request !== this.accountRequest || !this.active) { return; }
       this.user = u;
       this.checked = true;
       if (u === null) {

@@ -8,6 +8,7 @@ import { CookieStore } from '../infra/cookie/cookie_store';
 @CustomDialog
 export struct FeedFilterDialog {
   controller: CustomDialogController;
+  // dislike 仅为旧调用的兼容标识，对外语义统一为本机「隐藏此视频」。
   mode: string = 'manage';
   model: VideoItem | undefined = undefined;
   @State rules: FeedFilterRule[] = [];
@@ -141,7 +142,7 @@ export struct FeedFilterDialog {
   build() {
     Column() {
       Text(this.mode === 'manage' ? '屏蔽管理' : this.mode === 'block' ? '本地屏蔽' :
-        this.mode === 'dislike' ? '不感兴趣' : '拉黑用户')
+        this.mode === 'dislike' ? '隐藏此视频' : '拉黑用户')
         .fontSize(20).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
         .width('100%').margin({ bottom: 20 })
       if (this.mode === 'manage') {

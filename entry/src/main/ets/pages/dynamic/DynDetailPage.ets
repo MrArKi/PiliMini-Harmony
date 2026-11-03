@@ -12,12 +12,14 @@ import { FrameCallback } from '@ohos.arkui.UIContext';
 import { AsyncImage } from '../../components/AsyncImage';
 import { GalleryThumbnail, nextGalleryId } from '../../components/GalleryThumbnail';
 import { DynamicVideoCard } from '../../components/dynamic/DynamicVideoCard';
+import { InlineRichText } from '../../components/InlineRichText';
 import { CommentItemView, CommentSkeleton } from '../../components/CommentItem';
 import { SubReplyArgs } from '../../service/sub_reply_ctx';
 import { BasicDataSource } from '../../common/list_data_source';
 import { formatPlayCount } from '../../components/VideoCard';
 import { DynamicService, DynItem, DynPic, DynParagraph, DynTextNode } from '../../service/dynamic_service';
 import { VideoService, CommentItem, ReplyPage, SubReplyPage } from '../../service/video_service';
+import { onAppBackground, onAppForeground } from '../../infra/event/app_events';
 
 const GRID_SPACE: number = 5;
 const IMG_MAX_RATIO: number = 2.6;
@@ -48,30 +50,40 @@ struct DynDetailPage {
   private detailGeneration: number = 0;
   private detailGallery: string = nextGalleryId();
   @StorageProp('statusBarHeight') statusBarH: number = 0;
-  private cardW: number = 340;
+  @StorageProp('navBarHeight') navBarH: number = 0;
+  @State cardW: number = 340;
 
   // ===== 评论（spec-08 V2，type=17 动态评论）=====
   private dynId: string = '';
-  private ds: BasicDataSource<CommentItem> = new BasicDataSource<CommentItem>();
+  private ds: BasicDataSource<CommentItem> = new BasicDataSource<CommentItem>(true);
+  private commentIds: Set<number> = new Set<number>();
+  private replyRetryReset: boolean = true;
   @State topItems: CommentItem[] = [];
   @State replyTotal: number = 0;
   @State sortMode: number = 3; // 3=按热度 2=按时间
   @State firstLoading: boolean = false;
   @State replyErr: string = '';
   @State replyEnd: boolean = false;
-  @State tick: number = 0; // 楼中楼就地刷新用（LazyForEach key 带 tick）
   /** 楼中楼面板 */
   private nextOffset: string = '';
   private loadingMore: boolean = false;
   private destroyed: boolean = false;
+  private pageVisible: boolean = true;
+  private listVisible: boolean = false;
+  private appForeground: boolean = true;
+  private routeIndex: number = 0;
+  private offBg: () => void = () => {};
+  private offFg: () => void = () => {};
   private commentGeneration: number = 0;
   private commentScroller: Scroller = new Scroller();
   private viewCommentRequested: boolean = false;
   private commentLocated: boolean = false;
   private commentAnchorPending: boolean = false;
-  @State detailViewportHeight: number = 0;
 
   aboutToAppear(): void {
+    this.routeIndex = router.getState().index;
+    this.offBg = onAppBackground(() => { this.appForeground = false; });
+    this.offFg = onAppForeground(() => { this.appForeground = true; });
     try {
       const disp = display.getDefaultDisplaySync();
       this.cardW = px2vp(disp.width) - 24;
@@ -106,6 +118,7 @@ struct DynDetailPage {
 
   aboutToDisappear(): void {
     this.destroyed = true;
+    this.offBg(); this.offFg();
     this.commentGeneration++;
     this.detailGeneration++;
   }
@@ -141,16 +154,10 @@ struct DynDetailPage {
     Column({ space: 12 }) {
       ForEach(blocks, (block: DynParagraph, index: number) => {
         if (block.text.length > 0) {
-          Text() {
-            ForEach(block.text, (node: DynTextNode) => {
-              Span(node.text).fontSize(block.heading ? 20 : Math.max(13, Math.min(24, node.size)))
-                .fontWeight(node.bold || block.heading ? FontWeight.Bold : FontWeight.Normal)
-                .fontStyle(node.italic ? FontStyle.Italic : FontStyle.Normal)
-                .decoration({ type: node.strike ? TextDecorationType.LineThrough : TextDecorationType.None })
-                .fontColor(node.link || node.mid > 0 ? $r('app.color.brand_pink') : $r('app.color.text_primary'))
-                .onClick(() => { this.openRich(node); })
-            })
-          }.width('100%').lineHeight(28)
+          InlineRichText({ segments: block.segments || [],
+            text: block.text.map((node: DynTextNode): string => node.text).join(''),
+            textSize: block.heading ? 20 : 16, textLineHeight: 28, bold: block.heading })
+            .width('100%')
             .padding(block.quote ? 10 : 0).backgroundColor(block.quote ? $r('app.color.btn_soft_bg') : Color.Transparent)
         }
         if (block.divider) { Divider().color($r('app.color.divider')) }
@@ -187,6 +194,28 @@ struct DynDetailPage {
     return this.item !== undefined ? this.item.commentType : 17;
   }
 
+  private uniqueComments(items: CommentItem[]): CommentItem[] {
+    return items.filter((item: CommentItem): boolean => {
+      if (this.commentIds.has(item.rpid)) { return false; }
+      this.commentIds.add(item.rpid);
+      return true;
+    });
+  }
+
+  onPageShow(): void { this.pageVisible = true; }
+  onPageHide(): void { this.pageVisible = false; }
+
+  private canPrefetchComments(): boolean {
+    return !this.destroyed && this.pageVisible && this.listVisible && this.appForeground &&
+      router.getState().index === this.routeIndex;
+  }
+
+  private prefetchComments(start: number, end: number): void {
+    const screenCount: number = Math.max(1, end - start + 1);
+    if (this.canPrefetchComments() && !this.firstLoading && this.replyErr.length === 0 && this.ds.size() > 0 &&
+      end >= 3 + this.topItems.length + this.ds.size() - 1 - screenCount) { this.loadComments(false); }
+  }
+
   private async loadComments(reset: boolean): Promise<void> {
     if (this.destroyed || (!reset && this.loadingMore) || this.dynId.length === 0) {
       return;
@@ -195,6 +224,7 @@ struct DynDetailPage {
       return;
     }
     this.loadingMore = true;
+    this.replyRetryReset = reset;
     const generation: number = reset ? ++this.commentGeneration : this.commentGeneration;
     this.replyErr = '';
     if (reset) {
@@ -203,25 +233,26 @@ struct DynDetailPage {
       this.replyEnd = false;
     }
     try {
-      const r: ReplyPage = await VideoService.dynReply(this.commentOid(), this.commentType(), this.nextOffset, this.sortMode);
+      const requestedOffset: string = reset ? '' : this.nextOffset;
+      const r: ReplyPage = await VideoService.dynReply(this.commentOid(), this.commentType(), requestedOffset, this.sortMode);
       if (this.destroyed || generation !== this.commentGeneration) {
         return;
       }
       if (reset) {
-        this.ds.reload(r.items);
-        this.topItems = r.topItems;
+        this.commentIds.clear();
+        this.topItems = this.uniqueComments(r.topItems);
+        this.ds.reload(this.uniqueComments(r.items));
       } else {
-        this.ds.append(r.items);
+        this.ds.append(this.uniqueComments(r.items));
       }
       this.nextOffset = r.nextOffset;
-      this.replyEnd = r.isEnd;
+      this.replyEnd = r.isEnd || r.nextOffset === requestedOffset;
       if (r.total > 0) {
         this.replyTotal = r.total;
       }
     } catch (e) {
       if (!this.destroyed && generation === this.commentGeneration) {
         this.replyErr = '评论加载失败，点击重试';
-        this.replyEnd = true;
       }
     }
     if (!this.destroyed && generation === this.commentGeneration) {
@@ -232,7 +263,6 @@ struct DynDetailPage {
 
   private switchSort(): void {
     this.sortMode = this.sortMode === 3 ? 2 : 3;
-    this.tick = this.tick + 1;
     this.loadComments(true);
   }
 
@@ -260,16 +290,16 @@ struct DynDetailPage {
 
   // ===== 图片网格（Nara _calcGridInfo 同规则） =====
 
-  private cellW(n: number): number {
-    const w: number = this.cardW > 0 ? this.cardW : 340;
+  private cellW(n: number, availableWidth: number): number {
+    const w: number = Math.max(1, availableWidth);
     if (n === 2) {
       return (w - GRID_SPACE) / 2;
     }
     return (w - 2 * GRID_SPACE) / 3;
   }
 
-  private singleW(p: DynPic): number {
-    const w: number = this.cardW > 0 ? this.cardW : 340;
+  private singleW(p: DynPic, availableWidth: number): number {
+    const w: number = Math.max(1, availableWidth);
     const cell: number = (w - 2 * GRID_SPACE) / 3;
     const rw: number = p.width > 0 && p.height > 0 ? p.width / p.height : 1.6;
     const rh: number = p.width > 0 && p.height > 0 ? p.height / p.width : 0.625;
@@ -316,14 +346,14 @@ struct DynDetailPage {
   }
 
   @Builder
-  PicsGrid(pics: DynPic[]) {
+  PicsGrid(pics: DynPic[], availableWidth: number) {
     Column({ space: GRID_SPACE }) {
       if (pics.length === 1) {
         Column() {
           GalleryThumbnail({ urls: this.pictureUrls(pics), thumbs: this.pictureUrls(pics), index: 0,
             groupId: this.galleryId + pics[0].src, w: 720, h: 720 })
         }
-        .width(this.singleW(pics[0]))
+        .width(this.singleW(pics[0], availableWidth))
         .aspectRatio(this.singleRatio(pics[0]))
         .borderRadius(6)
         .clip(true)
@@ -352,7 +382,7 @@ struct DynDetailPage {
         }, (rowStart: number) => 'r' + rowStart.toString())
       }
     }
-    .width(pics.length === 4 ? (2 * this.cellW(4) + GRID_SPACE) : '100%')
+    .width(pics.length === 4 ? (2 * this.cellW(4, availableWidth) + GRID_SPACE) : '100%')
     .alignItems(HorizontalAlign.Start)
   }
 
@@ -394,6 +424,7 @@ struct DynDetailPage {
     .width('100%')
     .height(46)
     .margin({ top: 6 })
+    .border({ width: { bottom: 1 }, color: $r('app.color.dynamic_tab_divider') })
   }
 
   /** 排序头：最热评论 / 最新评论 + 切换 */
@@ -429,11 +460,7 @@ struct DynDetailPage {
         .fontWeight(FontWeight.Medium)
         .fontColor($r('app.color.text_primary'))
       if (orig.text.length > 0) {
-        Text(orig.text)
-          .fontSize(15)
-          .lineHeight(24)
-          .fontColor($r('app.color.text_primary'))
-          .width('100%')
+        InlineRichText({ text: orig.text, segments: orig.segments || [], textSize: 15, textLineHeight: 24 })
       }
       if (orig.kind === 'av' && orig.archive !== undefined) {
         Column() {
@@ -444,12 +471,12 @@ struct DynDetailPage {
           if (orig.archive !== undefined) { this.openVideo(orig.archive.bvid); }
         })
       } else if (orig.pics !== undefined && orig.pics.length > 0) {
-        this.PicsGrid(orig.pics)
+        this.PicsGrid(orig.pics, this.cardW - 6)
       }
     }
     .width('100%')
     .padding({ left: 15, right: 15, top: 8, bottom: 8 })
-    .backgroundColor($r('app.color.btn_soft_bg'))
+    .backgroundColor($r('app.color.dynamic_forward_bg'))
     .alignItems(HorizontalAlign.Start)
   }
 
@@ -525,31 +552,33 @@ struct DynDetailPage {
                   .onClick(() => { if (this.item) { openMember(this.item.author.mid); } })
                 }
                 .width('100%')
+                .padding({ left: 12, right: 12 })
 
                 // 正文（完整）
                 if (this.item.text.length > 0) {
-                  Text(this.item.text)
-                    .fontSize(15)
-                    .lineHeight(26)
-                    .fontColor($r('app.color.text_primary'))
+                  InlineRichText({ text: this.item.text, segments: this.item.segments || [], textSize: 15, textLineHeight: 26 })
                     .width('100%')
+                    .padding({ left: 12, right: 12 })
                 }
 
                 // 类型内容
                 if (this.item.paragraphs) {
-                  this.Paragraphs(this.item.paragraphs)
+                  Column() { this.Paragraphs(this.item.paragraphs) }
+                    .width('100%').padding({ left: 12, right: 12 })
                 } else if (this.item.kind === 'av' && this.item.archive !== undefined) {
                   Column() {
                     DynamicVideoCard({ archive: this.item.archive, detail: true })
                   }
-                  .width('100%').id('dynamic_detail_video')
+                  .width('100%').padding({ left: 12, right: 12 }).id('dynamic_detail_video')
                   .onClick(() => {
                     if (this.item !== undefined && this.item.archive !== undefined) {
                       this.openVideo(this.item.archive.bvid);
                     }
                   })
                 } else if (this.item.pics !== undefined && this.item.pics.length > 0) {
-                  this.PicsGrid(this.item.pics)
+                  Column() { this.PicsGrid(this.item.pics, this.cardW) }
+                    .width('100%').padding({ left: 12, right: 12 })
+                    .alignItems(HorizontalAlign.Start)
                 } else if (this.item.kind === 'forward' && this.item.orig !== undefined) {
                   this.ForwardBlock(this.item.orig)
                 }
@@ -560,11 +589,12 @@ struct DynDetailPage {
                     .fontSize(13)
                     .fontColor($r('app.color.text_secondary'))
                     .width('100%')
+                    .padding({ left: 12, right: 12 })
                 }
 
               }
               .width('100%')
-              .padding({ left: 12, right: 12, top: 12, bottom: 0 })
+              .padding({ top: 12 })
               .alignItems(HorizontalAlign.Start)
             }
             .width('100%')
@@ -626,7 +656,7 @@ struct DynDetailPage {
                 }
                 .width('100%')
               }, (c: CommentItem) => c.rpid.toString() + '_' + c.subPage.toString()
-                + (c.expanded ? 'e' : 'c') + '_' + this.tick.toString())
+                + (c.expanded ? 'e' : 'c'))
             }
 
             // 页脚
@@ -637,7 +667,7 @@ struct DynDetailPage {
                     .fontSize(12)
                     .fontColor($r('app.color.brand_pink'))
                     .onClick(() => {
-                      this.loadComments(true);
+                      this.loadComments(this.replyRetryReset);
                     })
                 } else if (this.replyEnd && this.ds.size() === 0 && this.topItems.length === 0) {
                   Text('还没有评论，快来抢沙发吧')
@@ -654,22 +684,25 @@ struct DynDetailPage {
                 }
               }
               .width('100%')
-              .height(this.viewCommentRequested ? Math.max(110, this.detailViewportHeight - 46) : 110)
+              .height(48)
+              .margin({ bottom: this.navBarH })
               .justifyContent(FlexAlign.Center)
             }
             .width('100%')
           }
           .cachedCount(3)
+          .scrollBar(BarState.Off)
+          .onVisibleAreaChange([0], (visible: boolean) => { this.listVisible = visible; })
           .layoutWeight(1)
           .width('100%')
           .onAreaChange((_old: Area, area: Area) => {
-            this.detailViewportHeight = Number(area.height);
             this.locateComment();
           })
           .divider({ strokeWidth: 0.3, color: '#14000000', startMargin: 55, endMargin: 15 })
           .onReachEnd(() => {
-            this.loadComments(false);
+            if (this.canPrefetchComments() && !this.firstLoading && this.replyErr.length === 0) { this.loadComments(false); }
           })
+          .onScrollIndex((start: number, end: number) => { this.prefetchComments(start, end); })
         } else {
           Column() {
             Text('内容已失效')
@@ -688,5 +721,10 @@ struct DynDetailPage {
     .width('100%')
     .height('100%')
     .backgroundColor($r('app.color.bg_page'))
+    // 分屏/折叠屏下屏宽 ≠ 容器宽，九宫格按实测宽重算
+    .onAreaChange((_old: Area, area: Area): void => {
+      const w: number = Number(area.width) - 24;
+      if (w > 0 && Math.abs(w - this.cardW) > 0.5) { this.cardW = w; }
+    })
   }
 }

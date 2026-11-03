@@ -6,6 +6,8 @@ import { VideoCard } from '../VideoCard';
 import { DynamicCard } from '../dynamic/DynamicCard';
 import { NARA_SCROLL_FRICTION } from '../../common/nara_motion';
 import { MemberCollectionCard, MemberOpusCard } from './MemberCards';
+import { router } from '@kit.ArkUI';
+import { onAppBackground, onAppForeground } from '../../infra/event/app_events';
 
 export const MEMBER_NESTED: NestedScrollOptions = {
   scrollForward: NestedScrollMode.PARENT_FIRST, scrollBackward: NestedScrollMode.SELF_FIRST
@@ -35,11 +37,29 @@ export struct MemberFeed {
   private page: number = 1;
   private generation: number = 0;
   private destroyed: boolean = false;
+  private feedVisible: boolean = false;
+  private appForeground: boolean = true;
+  private routeIndex: number = 0;
+  private offBg: () => void = () => {};
+  private offFg: () => void = () => {};
   private keys: Set<string> = new Set<string>();
   private cursors: Set<string> = new Set<string>();
 
-  aboutToAppear(): void { this.destroyed = false; this.load(true); }
-  aboutToDisappear(): void { this.destroyed = true; this.generation++; }
+  aboutToAppear(): void {
+    this.destroyed = false; this.routeIndex = router.getState().index;
+    this.offBg = onAppBackground(() => { this.appForeground = false; });
+    this.offFg = onAppForeground(() => { this.appForeground = true; });
+    this.load(true);
+  }
+  aboutToDisappear(): void { this.destroyed = true; this.generation++; this.offBg(); this.offFg(); }
+  private canPrefetch(): boolean {
+    return !this.destroyed && this.feedVisible && this.appForeground && this.error.length === 0 &&
+      router.getState().index === this.routeIndex;
+  }
+  private prefetch(start: number, end: number, headerCount: number): void {
+    const screenCount: number = Math.max(1, end - start + 1);
+    if (this.canPrefetch() && this.count > 0 && end >= headerCount + this.count - 1 - screenCount) { this.load(false); }
+  }
   private reloadQuery(): void { this.load(true); }
   private async fetch(): Promise<MemberResult> {
     if (this.kind === 'like' || this.kind === 'coin') { return MemberService.recent(this.mid, this.kind); }
@@ -54,7 +74,7 @@ export struct MemberFeed {
       return { items: data.items.map((v: VideoItem): MemberEntry => ({ key: v.key, video: v })),
         next: (this.page + 1).toString(), hasMore: data.hasMore, total: 0 };
     }
-    return MemberService.videos(this.mid, this.page, this.order, this.keyword, this.ascending);
+    return MemberService.videos(this.mid, this.page, this.order, this.keyword);
   }
   private async load(reset: boolean): Promise<void> {
     if (this.destroyed || (!reset && (this.busy || this.end))) { return; }
@@ -86,17 +106,19 @@ export struct MemberFeed {
   SortRow() {
     if (this.kind === 'video' || this.kind === 'season' || this.kind === 'series') {
       Row({ space: 6 }) {
-        Text(this.kind === 'video' ? (this.order === 'pubdate' ? '最新发布' : '最多播放') : '视频列表')
+        Text(this.total > 0 ? '共' + this.total.toString() + '视频' : '视频列表')
           .fontSize(13).fontColor($r('app.color.text_secondary'))
-          .onClick(() => { if (this.kind === 'video') {
-            this.order = this.order === 'pubdate' ? 'click' : 'pubdate'; this.load(true);
-          } })
-        Text(this.total > 0 ? this.total.toString() : '').fontSize(12).fontColor($r('app.color.text_secondary'))
         Blank()
         Row({ space: 4 }) {
           Image($r('app.media.icon_sort')).width(16).height(16).fillColor($r('app.color.text_secondary'))
-          Text(this.ascending ? '正序' : '倒序').fontSize(13).fontColor($r('app.color.text_secondary'))
-        }.height(40).onClick(() => { this.ascending = !this.ascending; this.load(true); })
+          Text(this.kind === 'video' ? (this.order === 'pubdate' ? '最新发布' : '最多播放') :
+            (this.ascending ? '正序' : '倒序')).fontSize(13).fontColor($r('app.color.text_secondary'))
+        }.height(40).onClick(() => {
+          if (this.busy) { return; }
+          if (this.kind === 'video') { this.order = this.order === 'pubdate' ? 'click' : 'pubdate'; }
+          else { this.ascending = !this.ascending; }
+          this.load(true);
+        })
       }.width('100%').height(45).padding({ left: 14, right: 8, top: 2.5, bottom: 2.5 })
         .backgroundColor($r('app.color.bg_page'))
     }
@@ -121,7 +143,9 @@ export struct MemberFeed {
         }.columnsTemplate('1fr 1fr').columnsGap(12).rowsGap(12).padding({ left: 12, right: 12 })
           .width('100%').height('100%').nestedScroll(MEMBER_NESTED).edgeEffect(EdgeEffect.None, { alwaysEnabled: true })
           .friction(NARA_SCROLL_FRICTION)
-          .onReachEnd(() => { if (!this.error) { this.load(false); } })
+          .scrollBar(BarState.Off)
+          .onScrollIndex((start: number, end: number) => { this.prefetch(start, end, 0); })
+          .onReachEnd(() => { if (this.canPrefetch()) { this.load(false); } })
       } else {
         List({ scroller: this.listScroller }) {
           ListItem() { this.SortRow() }
@@ -143,9 +167,11 @@ export struct MemberFeed {
         }.width('100%').height('100%').cachedCount(3).scrollBar(BarState.Off)
           .nestedScroll(MEMBER_NESTED).edgeEffect(EdgeEffect.None, { alwaysEnabled: true })
           .friction(NARA_SCROLL_FRICTION)
-          .onReachEnd(() => { if (!this.error) { this.load(false); } })
+          .onScrollIndex((start: number, end: number) => { this.prefetch(start, end, 1); })
+          .onReachEnd(() => { if (this.canPrefetch()) { this.load(false); } })
       }
     }.width('100%').height('100%').onRefreshing(() => { this.refreshing = true; this.load(true); })
+      .onVisibleAreaChange([0], (visible: boolean) => { this.feedVisible = visible; })
       .onAreaChange((_old: Area, area: Area) => { this.feedWidth = Number(area.width); })
   }
 }

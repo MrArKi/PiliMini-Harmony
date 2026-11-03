@@ -19,6 +19,26 @@
       "value": "#1E1E1E"
     },
     {
+      "name": "card_shadow",
+      "value": "#00000000"
+    },
+    {
+      "name": "dynamic_separator",
+      "value": "#0DFFFFFF"
+    },
+    {
+      "name": "dynamic_forward_bg",
+      "value": "#14FFFFFF"
+    },
+    {
+      "name": "soft_overlay",
+      "value": "#14FFFFFF"
+    },
+    {
+      "name": "interact_line",
+      "value": "#4D9BA0A5"
+    },
+    {
       "name": "text_primary",
       "value": "#E8E8E8"
     },
@@ -29,6 +49,14 @@
     {
       "name": "divider",
       "value": "#2A2A2A"
+    },
+    {
+      "name": "tab_divider",
+      "value": "#1AFFFFFF"
+    },
+    {
+      "name": "dynamic_tab_divider",
+      "value": "#1A9E8C8F"
     },
     {
       "name": "brand_pink",

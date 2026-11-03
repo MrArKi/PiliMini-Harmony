@@ -10,7 +10,9 @@
     {
       "name": "release",
       "externalNativeOptions": {
-        "abiFilters": ["arm64-v8a"]
+        // 2026-10-28 用户决定：release 也带 x86_64，便于直接在模拟器上验收。
+        // 实测代价：HAP 增大约 5.6MiB（x86_64 的 libmpv 未压缩 11.9MiB，包内压缩后 5.1MiB）。
+        "abiFilters": ["arm64-v8a", "x86_64"]
       },
       "arkOptions": {
         "obfuscation": {

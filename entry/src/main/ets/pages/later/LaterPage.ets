@@ -25,8 +25,17 @@ struct LaterPage {
   }
 
   private async init(): Promise<void> {
-    const u = await AuthService.fetchNav();
-    this.loggedIn = u !== null;
+    this.err = '';
+    this.loading = true;
+    // strict：网络失败不能折叠成"未登录"
+    try {
+      const u = await AuthService.fetchNav(true);
+      this.loggedIn = u !== null;
+    } catch (e) {
+      this.loading = false;
+      this.err = '网络异常，请检查网络后重试';
+      return;
+    }
     if (!this.loggedIn) {
       this.loading = false;
       return;
@@ -43,6 +52,27 @@ struct LaterPage {
     } finally {
       this.loading = false;
       this.refreshing = false;
+    }
+  }
+
+  /** 清空：逐条删（接口无批量），失败的必须留在列表里，不能谎报已清空 */
+  private async clearAll(): Promise<void> {
+    const all: VideoItem[] = this.items.slice();
+    const remain: VideoItem[] = [];
+    for (let i: number = 0; i < all.length; i++) {
+      const aid: number = all[i].aid ?? 0;
+      if (aid <= 0) { remain.push(all[i]); continue; }
+      try {
+        await FavService.laterRemove(aid);
+      } catch (e) {
+        remain.push(all[i]);
+      }
+    }
+    this.items = remain;
+    if (remain.length === 0) {
+      promptAction.showToast({ message: '已清空' });
+    } else {
+      promptAction.showToast({ message: '还有 ' + remain.length.toString() + ' 条未能移除，请重试' });
     }
   }
 
@@ -96,19 +126,17 @@ struct LaterPage {
             .fontSize(13)
             .fontColor($r('app.color.brand_pink'))
             .padding({ left: 8, right: 8 })
-            .onClick(async (): Promise<void> => {
-              // 逐条删除（接口无批量）
-              const all: VideoItem[] = this.items.slice();
-              for (let i = 0; i < all.length; i++) {
-                try {
-                  const aid: number = all[i].aid ?? -1;
-                  await FavService.laterRemove(aid);
-                } catch (e) {
-                  // 忽略单条失败
+            .onClick((): void => {
+              if (this.items.length === 0) { return; }
+              AlertDialog.show({
+                title: '清空稍后再看',
+                message: '将从 B 站账号移除全部 ' + this.items.length.toString() + ' 个视频，此操作不可撤销。',
+                primaryButton: { value: '取消', action: (): void => {} },
+                secondaryButton: {
+                  value: '清空', fontColor: '#E54D42',
+                  action: (): void => { this.clearAll(); }
                 }
-              }
-              this.items = [];
-              promptAction.showToast({ message: '已清空' });
+              });
             })
         }
       }
@@ -116,7 +144,17 @@ struct LaterPage {
       .padding({ left: 8, right: 12, top: 10 + this.statusBarH, bottom: 10 })
       .backgroundColor($r('app.color.card_bg'))
 
-      if (!this.loggedIn && !this.loading) {
+      if (this.loading) {
+        Column() {
+          LoadingProgress().width(40).height(40)
+        }
+        .layoutWeight(1)
+        .justifyContent(FlexAlign.Center)
+      } else if (this.err.length > 0) {
+        ErrorRetry({ text: this.err, onRetry: (): void => {
+          this.init();
+        } })
+      } else if (!this.loggedIn) {
         Column({ space: 12 }) {
           Text('未登录')
             .fontSize(14)
@@ -130,16 +168,6 @@ struct LaterPage {
         }
         .layoutWeight(1)
         .justifyContent(FlexAlign.Center)
-      } else if (this.loading) {
-        Column() {
-          LoadingProgress().width(40).height(40)
-        }
-        .layoutWeight(1)
-        .justifyContent(FlexAlign.Center)
-      } else if (this.err.length > 0) {
-        ErrorRetry({ text: this.err, onRetry: (): void => {
-          this.load();
-        } })
       } else {
         Refresh({ refreshing: $$this.refreshing }) {
           List() {

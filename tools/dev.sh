@@ -3,7 +3,7 @@ set -eu
 # PiliMini 开发辅助脚本（CLI 全流程：构建 / 安装 / 启动 / 交互 / 截图 / 日志）
 # 用法:
 #   tools/dev.sh build              编译 HAP（debug，双架构，模拟器用）
-#   tools/dev.sh release            编译 arm64-only 包（真机侧载，输出 release/PiliMini-arm64-unsigned.hap）
+#   tools/dev.sh release            编译 release 包（双架构，输出 release/PiliMini-universal-unsigned.hap）
 #   tools/dev.sh install            安装到已连接设备
 #   tools/dev.sh start              启动 App
 #   tools/dev.sh stop               停止 App
@@ -33,8 +33,8 @@ case "$1" in
   release)
     cd "$PILIMINI_ROOT" && ./hvigorw assembleHap --no-daemon -p buildMode=release
     mkdir -p "$PILIMINI_ROOT/release"
-    cp "$PILIMINI_ROOT/entry/build/default/outputs/default/entry-default-unsigned.hap" "$PILIMINI_ROOT/release/PiliMini-arm64-unsigned.hap"
-    ls -la "$PILIMINI_ROOT/release/PiliMini-arm64-unsigned.hap"
+    cp "$PILIMINI_ROOT/entry/build/default/outputs/default/entry-default-unsigned.hap" "$PILIMINI_ROOT/release/PiliMini-universal-unsigned.hap"
+    ls -la "$PILIMINI_ROOT/release/PiliMini-universal-unsigned.hap"
     echo "arm64-only 包已输出（需自行签名后侧载真机）"
     ;;
   install)

@@ -1,6 +1,6 @@
 /**
  * 下载服务（spec-09；2026-10-11 第二批改造：文件夹 / 批量删除 / 进度修复）
- *  - @ohos.request.downloadFile 驱动（header 带 UA/Referer 防盗链）
+ *  - 官方 request.agent 后台任务驱动（header 带 UA/Referer 防盗链）
  *  - 状态机：queued → downloading → done / paused / failed
  *  - 持久化：任务元数据 + 文件夹存 preferences（不含 url，重启后重新取流）
  *  - 文件：沙箱 filesDir/download/<bvid>_<cid>.mp4
@@ -9,6 +9,7 @@ import request from '@ohos.request';
 import { http } from '@kit.NetworkKit';
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { common } from '@kit.AbilityKit';
+import { BusinessError } from '@kit.BasicServicesKit';
 import { prefsGet, prefsPut } from '../infra/storage/prefs';
 import { VideoService, DownloadUrl, DashDownloadUrl } from './video_service';
 import { UA_PC, BILI_REFERER } from '../config/constants';
@@ -60,12 +61,27 @@ export class DownloadService {
   private static tasks: DownloadTask[] = [];
   private static loaded: boolean = false;
   private static loading: Promise<void> | undefined = undefined;
-  private static launching: boolean = false;
+  private static writes: Promise<void> = Promise.resolve();
+
   private static frozen: boolean = false;
   private static versions: Map<string, number> = new Map<string, number>();
   private static inFlight: Map<string, Promise<void>> = new Map<string, Promise<void>>();
+  /**
+   * 阶段收尾钩子：native 任务被删除/判失败时显式解挂，避免 Promise 悬挂。
+   * （迁 request.agent 后仍保留，用于 remove 这类必须立刻收尾的路径。）
+   */
+  private static stageAbort: Map<string, () => void> = new Map<string, () => void>();
+  /** 文件轮询仅确认当前阶段完整，不直接跳过尚未下载的另一轨。 */
+  private static stageComplete: Map<string, () => void> = new Map<string, () => void>();
   private static cancelling: Map<string, Promise<void>> = new Map<string, Promise<void>>();
-  private static reqTasks: Map<string, request.DownloadTask> = new Map<string, request.DownloadTask>();
+  /** 只串行同一任务的原生控制命令，不占住完整下载协程。 */
+  private static controls: Map<string, Promise<void>> = new Map<string, Promise<void>>();
+  /**
+   * 官方 request.agent 任务（`Mode.BACKGROUND`：切后台不受影响，顺带解决后台下载）。
+   * 取代原 `request.downloadFile` —— 后者暂停后不再回调 complete/fail，导致 stage Promise 永挂、
+   * 队列被 launching 卡死、暂停的条目也删不掉。
+   */
+  private static agentTasks: Map<string, request.agent.Task> = new Map<string, request.agent.Task>();
   private static pollTimers: Map<string, number> = new Map<string, number>();
   private static ctx: common.Context | undefined = undefined;
   private static listeners: Array<() => void> = [];
@@ -159,6 +175,8 @@ export class DownloadService {
           (t.upMid !== undefined && (!Number.isSafeInteger(t.upMid) || t.upMid < 0)) ||
           (t.seasonId !== undefined && typeof t.seasonId !== 'string') ||
           (t.seasonTitle !== undefined && typeof t.seasonTitle !== 'string') ||
+          (t.agentTid !== undefined && typeof t.agentTid !== 'string') ||
+          (t.agentStage !== undefined && !['', 'single', 'video', 'audio'].includes(t.agentStage)) ||
           !['done', 'downloading', 'paused', 'queued', 'failed'].includes(t.status)) {
           throw new Error('下载任务数据损坏，原数据已保留');
         }
@@ -182,6 +200,8 @@ export class DownloadService {
         task.videoDone = t.videoDone === true;
         task.videoSize = t.videoSize !== undefined && Number.isSafeInteger(t.videoSize) && t.videoSize > 0 ? t.videoSize : 0;
         task.audioSize = t.audioSize !== undefined && Number.isSafeInteger(t.audioSize) && t.audioSize > 0 ? t.audioSize : 0;
+        task.agentTid = t.agentTid || '';
+        task.agentStage = t.agentStage || '';
         task.folderId = t.folderId !== undefined ? t.folderId : '';
         if (t.status === 'done') {
           // 校验文件是否还在
@@ -191,10 +211,11 @@ export class DownloadService {
           } catch (e) {
             exists = false;
           }
-          task.status = exists && DownloadService.fileBytes(task) > 0 ? 'done' : 'failed';
+          task.totalSize = t.totalSize || 0;
+          task.status = exists && DownloadService.filesComplete(task) ? 'done' : 'failed';
           task.errMsg = task.status === 'failed' ? '本地文件缺失，请重试下载' : '';
-          task.progress = exists ? 100 : 0;
-          if (exists) {
+          task.progress = task.status === 'done' ? 100 : 0;
+          if (task.status === 'done') {
             const sz: number = DownloadService.fileBytes(task);
             if (sz > 0) {
               task.totalSize = sz;
@@ -204,7 +225,7 @@ export class DownloadService {
         } else if (t.status === 'downloading' || t.status === 'paused' || t.status === 'queued' || t.status === 'failed') {
           task.receivedSize = DownloadService.fileBytes(task); task.totalSize = t.totalSize || 0;
           task.progress = task.totalSize > 0 ? Math.min(99, Math.round(task.receivedSize * 100 / task.totalSize)) : 0;
-          // request 会话无法跨进程恢复；失败原因仍保留，不伪装成暂停。
+          // 跨进程先关闭旧系统写入者，未完成阶段重新取流；失败原因保留。
           task.status = t.status === 'failed' ? 'failed' : 'paused';
           task.errMsg = t.errMsg || '';
         } else {
@@ -212,7 +233,9 @@ export class DownloadService {
         }
         out.push(task);
       }
+      await DownloadService.recoverNativeTasks(out);
       DownloadService.tasks = out;
+      await DownloadService.persistStrict();
     } catch (e) {
       throw new Error('下载资料恢复失败，原数据已保留：' + (e as Error).message);
     }
@@ -220,16 +243,106 @@ export class DownloadService {
     DownloadService.notify();
   }
 
+  /** 每次调用时取快照并按顺序落盘，旧状态不能晚写覆盖新的系统tid。 */
+  private static persistStrict(): Promise<void> {
+    const raw: string = JSON.stringify(DownloadService.tasks);
+    const write: Promise<void> = DownloadService.writes.catch((): void => {}).then((): Promise<void> => prefsPut(KEY_TASKS, raw));
+    DownloadService.writes = write;
+    return write;
+  }
+
   private static async persist(): Promise<void> {
-    try {
-      const arr: DownloadTask[] = [];
-      for (let i = 0; i < DownloadService.tasks.length; i++) {
-        const t = DownloadService.tasks[i];
-        arr.push(t);
+    try { await DownloadService.persistStrict(); } catch (_) { console.warn('[PiliMini-dl] 下载状态保存失败'); }
+  }
+
+  private static notFound(error: Object): boolean { return (error as BusinessError).code === 21900006; }
+
+  /** remove成功才允许覆盖/删文件；仅官方“已不存在”错误可视为已关闭。 */
+  private static async removeNative(tid: string): Promise<void> {
+    try { await request.agent.remove(tid); } catch (e) {
+      if (!DownloadService.notFound(e)) { throw new Error('系统下载任务未能停止，请稍后重试'); }
+    }
+  }
+
+  private static async closeNative(task: DownloadTask, key: string): Promise<void> {
+    const agent: request.agent.Task | undefined = DownloadService.agentTasks.get(key);
+    const tid: string = agent !== undefined ? agent.tid : task.agentTid;
+    if (tid.length === 0) { return; }
+    await DownloadService.removeNative(tid);
+    if (DownloadService.agentTasks.get(key) === agent) { DownloadService.detachAgent(key); }
+    if (task.agentTid === tid) { task.agentTid = ''; task.agentStage = ''; }
+    await DownloadService.persistStrict();
+  }
+
+  /** 进程重启后系统后台任务仍可能写文件；关闭后再允许重新取流。 */
+  private static async recoverNativeTasks(tasks: DownloadTask[]): Promise<void> {
+    const ctx = DownloadService.ctx;
+    const dir: string = DownloadService.dir();
+    if (ctx === undefined || dir.length === 0) { throw new Error('下载目录未初始化'); }
+    const ids: string[] = await request.agent.search({ after: 0, before: Date.now(),
+      action: request.agent.Action.DOWNLOAD, mode: request.agent.Mode.BACKGROUND });
+    for (const task of tasks) {
+      if (task.agentTid.length > 0 && ids.indexOf(task.agentTid) < 0) { ids.push(task.agentTid); }
+    }
+    for (const tid of ids) {
+      let native: request.agent.Task;
+      try { native = await request.agent.getTask(ctx, tid); } catch (e) {
+        if (DownloadService.notFound(e)) { continue; }
+        throw new Error('无法核对系统下载任务，请稍后重试');
       }
-      await prefsPut(KEY_TASKS, JSON.stringify(arr));
-    } catch (e) {
-      // 忽略
+      const config: request.agent.Config = native.config;
+      const path: string = config.saveas || '';
+      const owned: boolean = config.action === request.agent.Action.DOWNLOAD && config.mode === request.agent.Mode.BACKGROUND &&
+        path.startsWith(dir) && /^BV[0-9A-Za-z]+_[0-9]+\.(mp4|video\.m4s|audio\.m4s)$/.test(path.substring(dir.length));
+      const recorded: DownloadTask | undefined = tasks.find((t: DownloadTask): boolean => t.agentTid === tid);
+      const stagePath: string = recorded !== undefined && recorded.agentStage === 'audio' ? recorded.audioPath :
+        recorded !== undefined ? recorded.filePath : '';
+      if (!owned || (recorded !== undefined && (path !== recorded.filePath && path !== recorded.audioPath ||
+        recorded.agentStage.length > 0 && path !== stagePath))) {
+        if (recorded !== undefined) { throw new Error('系统下载路径与资料不一致，已保留文件'); }
+        continue;
+      }
+      let completed: boolean = false;
+      try { completed = (await request.agent.show(tid)).progress.state === request.agent.State.COMPLETED; } catch (e) {
+        if (!DownloadService.notFound(e)) { throw new Error('无法核对系统下载状态，请稍后重试'); }
+      }
+      await DownloadService.removeNative(tid);
+      const task: DownloadTask | undefined = tasks.find((t: DownloadTask): boolean => {
+        const base: string = dir + DownloadService.key(t);
+        return path === t.filePath || path === t.audioPath || t.status !== 'done' &&
+          (path === base + '.video.m4s' || path === base + '.audio.m4s');
+      });
+      // 旧版在创建DASH后才保存路径，可能只留下mp4元数据；按精确BV/cid找回阶段。
+      if (task !== undefined && task.audioPath.length === 0 && !path.endsWith('.mp4')) {
+        const base: string = dir + DownloadService.key(task);
+        task.filePath = base + '.video.m4s'; task.audioPath = base + '.audio.m4s';
+        task.totalSize = 0; task.videoSize = 0; task.audioSize = 0; task.videoDone = false;
+      }
+      if (task !== undefined && completed) {
+        let size: number = 0;
+        try { size = fs.statSync(path).size; } catch (_) {}
+        if (size > 0) {
+          if (path === task.filePath && task.audioPath.length > 0 && (task.videoSize <= 0 || size >= task.videoSize)) {
+            task.videoDone = true; if (task.videoSize <= 0) { task.videoSize = size; }
+          }
+          if (path === task.audioPath && task.audioSize <= 0) { task.audioSize = size; }
+          if ((task.audioPath.length === 0 || path === task.audioPath && task.videoDone) && DownloadService.filesComplete(task)) {
+            task.status = 'done'; task.progress = 100; task.errMsg = '';
+            task.receivedSize = DownloadService.fileBytes(task); task.totalSize = task.receivedSize;
+          }
+        }
+      }
+    }
+    for (const task of tasks) {
+      task.agentTid = ''; task.agentStage = '';
+      if (task.audioPath.length > 0 && task.videoSize > 0) {
+        try { if (fs.statSync(task.filePath).size >= task.videoSize) { task.videoDone = true; } } catch (_) {}
+      }
+      const knownComplete: boolean = task.audioPath.length > 0 ? task.videoDone && task.videoSize > 0 && task.audioSize > 0 : task.totalSize > 0;
+      if (knownComplete && DownloadService.filesComplete(task)) {
+        task.status = 'done'; task.progress = 100; task.errMsg = '';
+        task.receivedSize = DownloadService.fileBytes(task); task.totalSize = task.receivedSize;
+      }
     }
   }
 
@@ -280,23 +393,53 @@ export class DownloadService {
       DownloadService.versions.get(DownloadService.key(t)) === generation;
   }
 
+  private static control(key: string, action: () => Promise<void>): Promise<void> {
+    const previous: Promise<void> | undefined = DownloadService.controls.get(key);
+    const work: Promise<void> = (previous || Promise.resolve()).catch((): void => {}).then(action);
+    DownloadService.controls.set(key, work);
+    return work.finally((): void => {
+      if (DownloadService.controls.get(key) === work) { DownloadService.controls.delete(key); }
+    });
+  }
+
   private static async startNext(): Promise<void> {
-    if (DownloadService.frozen || DownloadService.launching ||
+    // 串行只靠"是否已有 downloading"判定：状态在同一个同步块里置位，不会被并发重入挑中。
+    // （原 launching 布尔门是全局的，任务一暂停就永久为 true，把整条队列焊死。）
+    if (DownloadService.frozen ||
       DownloadService.tasks.some((t: DownloadTask): boolean => t.status === 'downloading')) { return; }
     const next: DownloadTask | undefined = DownloadService.tasks.find((t: DownloadTask): boolean => t.status === 'queued');
     if (next === undefined) { return; }
     const key: string = DownloadService.key(next);
-    const generation: number = (DownloadService.versions.get(key) || 0) + (DownloadService.reqTasks.has(key) ? 0 : 1);
+    const owner: Promise<void> | undefined = DownloadService.inFlight.get(key);
+    if (owner !== undefined) {
+      // 阶段交界/取流尚未退出时，交给原owner的finally重新排队，禁止第二次launch。
+      if (!DownloadService.agentTasks.has(key) || !DownloadService.stageAbort.has(key)) { return; }
+      const generation: number = DownloadService.versions.get(key) || 0;
+      next.status = 'downloading'; next.errMsg = ''; DownloadService.notify();
+      DownloadService.control(key, async (): Promise<void> => {
+        const agent: request.agent.Task | undefined = DownloadService.agentTasks.get(key);
+        if (agent === undefined || !DownloadService.valid(next, generation) || next.status !== 'downloading') { return; }
+        try {
+          await agent.resume();
+          if (DownloadService.valid(next, generation) && next.status === 'downloading' &&
+            DownloadService.agentTasks.get(key) === agent) { DownloadService.startPoll(next, key, generation); }
+        } catch (_) {
+          if (DownloadService.agentTasks.get(key) === agent) {
+            await DownloadService.failTask(next, key, generation, '恢复失败，请重试');
+          }
+        }
+      }).catch((): void => {});
+      return;
+    }
+    const generation: number = (DownloadService.versions.get(key) || 0) + (DownloadService.agentTasks.has(key) ? 0 : 1);
     DownloadService.versions.set(key, generation);
-    DownloadService.launching = true;
     next.status = 'downloading';
     next.errMsg = '';
     DownloadService.notify();
     const work: Promise<void> = DownloadService.launch(next, generation);
     DownloadService.inFlight.set(key, work);
     try { await work; } finally {
-      DownloadService.inFlight.delete(key);
-      DownloadService.launching = false;
+      if (DownloadService.inFlight.get(key) === work) { DownloadService.inFlight.delete(key); }
       DownloadService.startNext();
     }
   }
@@ -304,30 +447,33 @@ export class DownloadService {
   private static async launch(next: DownloadTask, generation: number): Promise<void> {
     const key: string = DownloadService.key(next);
     try {
-      await DownloadService.persist();
+      // 失败取消曾报错时，保留的tid必须先关闭，才可删除残片/覆盖同一路径。
+      if (next.agentTid.length > 0) { await DownloadService.closeNative(next, key); }
+      await DownloadService.persistStrict();
       if (!DownloadService.valid(next, generation) || next.status !== 'downloading') { return; }
-      const rt: request.DownloadTask | undefined = DownloadService.reqTasks.get(key);
-      if (rt !== undefined) {
-        await rt.resume();
-        if (DownloadService.valid(next, generation) && next.status === 'downloading') {
-          // 原事件处理保持同一代际；原生任务 resume 不重建文件。
-          DownloadService.startPoll(next, key, generation);
-        } else { await rt.pause(); }
-        return;
-      }
-      DownloadService.deleteFile(next);
-      next.receivedSize = 0;
-      next.progress = 0;
       // 优先 DASH（固定最高画质，spec-17 2026-10-27）；没有可用 DASH 时降级 durl 单文件。
       const dash: DashDownloadUrl | undefined = await VideoService.dashForDownload(next.bvid, next.cid);
       if (!DownloadService.valid(next, generation) || next.status !== 'downloading') { return; }
       if (dash !== undefined && dash.audioUrl.length > 0) {
+        let reuseVideo: boolean = false;
+        if (next.audioPath.length > 0 && next.videoDone && next.quality === dash.quality && next.videoSize > 0) {
+          try { reuseVideo = fs.statSync(next.filePath).size >= next.videoSize; } catch (_) {}
+        }
+        if (reuseVideo) {
+          // 音频可能只下载了一部分，不能让旧残片参与新阶段的完成判定。
+          if (next.audioPath.startsWith(DownloadService.dir())) {
+            try { if (fs.accessSync(next.audioPath)) { fs.unlinkSync(next.audioPath); } } catch (_) {}
+          }
+        } else { DownloadService.deleteFile(next); }
         const dir: string = DownloadService.dir();
         next.filePath = dir + next.bvid + '_' + next.cid.toString() + '.video.m4s';
         next.audioPath = dir + next.bvid + '_' + next.cid.toString() + '.audio.m4s';
-        next.videoDone = false;
-        next.videoSize = 0;
+        next.videoDone = reuseVideo;
+        if (!reuseVideo) { next.videoSize = 0; }
+        // 重新取流后音轨可能已换档，旧音轨长度不能用于新文件完成判定。
         next.audioSize = 0;
+        next.receivedSize = reuseVideo ? next.videoSize : 0;
+        next.progress = 0;
         next.quality = dash.quality;
         if (dash.durationMs > 0) { next.duration = dash.durationMs / 1000; }
         await DownloadService.runDash(next, dash, generation);
@@ -335,6 +481,10 @@ export class DownloadService {
       }
       const u: DownloadUrl = await VideoService.durlForDownload(next.bvid, next.cid, next.quality);
       if (!DownloadService.valid(next, generation) || next.status !== 'downloading') { return; }
+      DownloadService.deleteFile(next);
+      next.filePath = DownloadService.dir() + key + '.mp4'; next.audioPath = '';
+      next.videoDone = false; next.videoSize = 0; next.audioSize = 0;
+      next.receivedSize = 0; next.totalSize = 0; next.progress = 0;
       next.quality = u.quality;
       if (u.durationMs > 0) { next.duration = u.durationMs / 1000; }
       await DownloadService.doDownload(next, u, generation);
@@ -345,8 +495,7 @@ export class DownloadService {
   }
 
   private static async doDownload(task: DownloadTask, u: DownloadUrl, generation: number): Promise<void> {
-    const ctx = DownloadService.ctx;
-    if (ctx === undefined) {
+    if (DownloadService.ctx === undefined) {
       throw new Error('context 未初始化');
     }
     if (u.size > 0) {
@@ -364,47 +513,9 @@ export class DownloadService {
     } catch (e) {
       // 目录已存在
     }
-    const config: request.DownloadConfig = {
-      url: u.url,
-      header: {
-        'User-Agent': UA_PC,
-        'Referer': BILI_REFERER
-      },
-      filePath: task.filePath,
-      enableMetered: true,
-      enableRoaming: true,
-      title: task.title
-    };
-    const rtask = await request.downloadFile(ctx, config);
-    const key: string = DownloadService.key(task);
-    if (!DownloadService.valid(task, generation)) {
-      await rtask.delete();
-      DownloadService.deleteFile(task);
-      return;
-    }
-    DownloadService.reqTasks.set(key, rtask);
-    rtask.on('progress', (received: number, total: number): void => {
-      if (!DownloadService.valid(task, generation) || task.status !== 'downloading') { return; }
-      if (received > task.receivedSize) { DownloadService.stallCounts.set(key, 0); }
-      task.receivedSize = received;
-      if (total > 0) {
-        task.totalSize = total;
-        task.progress = Math.round(received * 100 / total);
-      }
-      DownloadService.notify(false);
-    });
-    rtask.on('complete', (): void => {
-      if (DownloadService.valid(task, generation) && task.status === 'downloading') { DownloadService.finish(task, key); }
-    });
-    rtask.on('fail', (err: number): void => {
-      if (!DownloadService.valid(task, generation) || task.status !== 'downloading') { return; }
-      if (task.totalSize > 0 && DownloadService.fileBytes(task) >= task.totalSize) {
-        DownloadService.finish(task, key);
-      } else { DownloadService.failTask(task, key, generation, '下载失败(' + err.toString() + ')'); }
-    });
-    const statusAfterCreate: string = DownloadService.currentStatus(task);
-    if (statusAfterCreate === 'paused') { await rtask.pause(); }
-    else if (statusAfterCreate === 'downloading') { DownloadService.startPoll(task, key, generation); }
+    const ok: boolean = await DownloadService.downloadStage(task, u.url, task.filePath, true, generation);
+    if (!ok || !DownloadService.valid(task, generation)) { return; }
+    DownloadService.finish(task, DownloadService.key(task));
   }
 
   /** DASH 串行下载（spec-17 2026-10-27）：先视频后音频，两份都到齐才 finish。 */
@@ -413,89 +524,149 @@ export class DownloadService {
     // 预取两份总字节：进度从一开始就是合并口径（HEAD 失败则退化为各阶段独立）
     if (task.videoSize <= 0) { task.videoSize = await DownloadService.fetchContentLength(dash.videoUrl); }
     if (task.audioSize <= 0) { task.audioSize = await DownloadService.fetchContentLength(dash.audioUrl); }
-    task.totalSize = task.videoSize + task.audioSize;
+    // 任一轨未知时不能把另一轨长度当成双轨总长。
+    task.totalSize = task.videoSize > 0 && task.audioSize > 0 ? task.videoSize + task.audioSize : 0;
     if (!DownloadService.valid(task, generation) || task.status !== 'downloading') { return; }
 
     if (!task.videoDone) {
       const videoOk: boolean = await DownloadService.downloadStage(task, dash.videoUrl, task.filePath, true, generation);
       if (!videoOk) { return; }
+      if (!DownloadService.valid(task, generation)) { return; }
       task.videoDone = true;
       if (task.videoSize <= 0) {
         try { task.videoSize = fs.statSync(task.filePath).size; } catch (e) {}
       }
       await DownloadService.persist();
     }
+    if (!DownloadService.valid(task, generation) || task.status !== 'downloading') { return; }
     const audioOk: boolean = await DownloadService.downloadStage(task, dash.audioUrl, task.audioPath, false, generation);
-    if (!audioOk) { return; }
+    if (!audioOk || !DownloadService.valid(task, generation)) { return; }
     DownloadService.finish(task, key);
   }
 
   /**
-   * 单阶段下载：完成 resolve(true)；失败由 failTask 收尾后 resolve(false)。
-   * 暂停会让 Promise 挂起（任务 status=paused，事件不再处理），resume 后原生任务继续推事件。
+   * 单阶段下载（官方 request.agent）：完成 resolve(true)；失败 resolve(false) 并交给 failTask。
+   * 暂停**不解挂**：原生任务仍在，resume 后同一个 Promise 会被 completed 事件收尾，
+   * 所以 DASH 的"视频完成→自动接音频"续接在暂停前后都不会丢。
    */
   private static async downloadStage(task: DownloadTask, url: string, path: string, isVideo: boolean,
     generation: number): Promise<boolean> {
     const ctx = DownloadService.ctx;
     const key: string = DownloadService.key(task);
-    if (ctx === undefined) { return false; }
+    if (ctx === undefined || !DownloadService.valid(task, generation) || task.status !== 'downloading') { return false; }
+    // 先记录阶段路径和大小，create后即使进程退出也能按目录找回系统任务。
+    task.agentStage = task.audioPath.length === 0 ? 'single' : isVideo ? 'video' : 'audio';
+    await DownloadService.persistStrict();
+    if (!DownloadService.valid(task, generation) || task.status !== 'downloading') { return false; }
     try { fs.mkdirSync(DownloadService.dir(), true); } catch (e) {}
-    const config: request.DownloadConfig = {
-      url: url,
-      header: {
-        'User-Agent': UA_PC,
-        'Referer': BILI_REFERER
-      },
-      filePath: path,
-      enableMetered: true,
-      enableRoaming: true,
-      title: task.title
+    const headers: Record<string, string> = {
+      'User-Agent': UA_PC,
+      'Referer': BILI_REFERER
     };
-    let rtask: request.DownloadTask;
+    const config: request.agent.Config = {
+      action: request.agent.Action.DOWNLOAD,
+      url: url,
+      title: task.title,
+      // Background：切后台/熄屏不受影响（前台任务在后台一段时间后会失败或暂停）
+      mode: request.agent.Mode.BACKGROUND,
+      method: 'GET',
+      headers: headers,
+      saveas: path,
+      overwrite: true,
+      network: request.agent.Network.ANY,
+      metered: true,
+      roaming: true,
+      // 断线重试与 30x 跟随都交给系统引擎
+      retry: true,
+      redirect: true,
+      gauge: true
+    };
+    let agent: request.agent.Task;
     try {
-      rtask = await request.downloadFile(ctx, config);
+      agent = await request.agent.create(ctx, config);
     } catch (e) {
       await DownloadService.failTask(task, key, generation, '下载启动失败');
       return false;
     }
-    if (!DownloadService.valid(task, generation) || task.status !== 'downloading') {
-      await rtask.delete().catch((): void => {});
+    task.agentTid = agent.tid;
+    try {
+      // 不在持久化前启动：系统后台任务能活过应用进程。
+      await DownloadService.persistStrict();
+    } catch (_) {
+      await DownloadService.failTask(task, key, generation, '下载状态保存失败，请重试');
       return false;
     }
-    DownloadService.reqTasks.set(key, rtask);
+    if (!DownloadService.valid(task, generation) || task.status !== 'downloading') {
+      try { await DownloadService.closeNative(task, key); } catch (_) {
+        task.status = 'failed'; task.errMsg = '系统下载任务未能停止，请稍后重试';
+        DownloadService.notify(); await DownloadService.persist();
+      }
+      return false;
+    }
+    DownloadService.agentTasks.set(key, agent);
     return new Promise<boolean>((resolve: (value: boolean) => void): void => {
-      rtask.on('progress', (received: number, total: number): void => {
+      let settled: boolean = false;
+      const settle = (ok: boolean): void => {
+        if (settled) { return; }
+        settled = true;
+        DownloadService.stageAbort.delete(key);
+        DownloadService.stageComplete.delete(key);
+        // 成功的前一阶段先解绑，防止迟到事件干扰下一轨的收尾钩子。
+        // 失败/删除仍由 failTask/remove 持有原生任务，等待其取消后再清理文件。
+        if (ok) {
+          // 完成依据与清tid同一快照保存，关闭原生后杀进程也不丢完整视频标识。
+          let size: number = 0;
+          try { size = fs.statSync(path).size; } catch (_) {}
+          if (task.audioPath.length > 0) {
+            if (isVideo && size > 0 && (task.videoSize <= 0 || size >= task.videoSize)) {
+              task.videoDone = true; if (task.videoSize <= 0) { task.videoSize = size; }
+            } else if (!isVideo && task.audioSize <= 0) { task.audioSize = size; }
+          } else if (task.totalSize <= 0) { task.totalSize = size; }
+          if (DownloadService.agentTasks.get(key) === agent) { DownloadService.detachAgent(key); }
+          DownloadService.stopPoll(key);
+          // 轮询可能先于completed观察到全部字节；先关闭原生写入者，再进入下一轨。
+          DownloadService.closeNative(task, key).then((): void => resolve(true), async (): Promise<void> => {
+            await DownloadService.failTask(task, key, generation, '系统下载任务未能停止，请稍后重试');
+            resolve(false);
+          });
+        } else { resolve(false); }
+      };
+      const expectedSize = (): number => task.audioPath.length > 0 ?
+        (isVideo ? task.videoSize : task.audioSize) : task.totalSize;
+      // 删除/判失败这类必须立刻收尾的路径从这里解挂
+      DownloadService.stageAbort.set(key, (): void => settle(false));
+      DownloadService.stageComplete.set(key, (): void => {
         if (!DownloadService.valid(task, generation) || task.status !== 'downloading') { return; }
-        if (received > task.receivedSize) { DownloadService.stallCounts.set(key, 0); }
-        if (isVideo) {
-          if (total > 0) { task.videoSize = total; }
-          task.receivedSize = received;
-        } else {
-          if (total > 0) { task.audioSize = total; }
-          task.receivedSize = task.videoSize + received;
-        }
-        task.totalSize = task.videoSize + task.audioSize;
-        if (task.totalSize > 0) {
-          task.progress = Math.min(99, Math.round(task.receivedSize * 100 / task.totalSize));
-        }
-        DownloadService.notify(false);
+        const expect: number = expectedSize();
+        if (expect <= 0) { return; }
+        try { if (fs.statSync(path).size >= expect) { settle(true); } } catch (_) {}
       });
-      rtask.on('complete', (): void => {
-        if (!DownloadService.valid(task, generation)) { resolve(false); return; }
-        resolve(true);
+      agent.on('completed', (): void => {
+        settle(DownloadService.valid(task, generation));
       });
-      rtask.on('fail', (err: number): void => {
-        if (!DownloadService.valid(task, generation) || task.status !== 'downloading') { resolve(false); return; }
+      agent.on('failed', (): void => {
+        if (settled) { return; }
+        if (!DownloadService.valid(task, generation)) { settle(false); return; }
+        // 引擎报错但文件已齐（部分 CDN 收尾异常）按成功处理
         let size: number = 0;
         try { size = fs.statSync(path).size; } catch (e) {}
-        const expect: number = isVideo ? task.videoSize : task.audioSize;
-        if (size > 0 && (expect <= 0 || size >= expect)) { resolve(true); return; }
-        DownloadService.failTask(task, key, generation, '下载失败(' + err.toString() + ')');
-        resolve(false);
+        const expect: number = expectedSize();
+        if (expect > 0 && size >= expect) { settle(true); return; }
+        DownloadService.failTask(task, key, generation, '下载失败，请重试');
+        settle(false);
       });
-      const statusAfterCreate: string = DownloadService.currentStatus(task);
-      if (statusAfterCreate === 'paused') { rtask.pause(); }
-      else if (statusAfterCreate === 'downloading') { DownloadService.startPoll(task, key, generation); }
+      agent.start().catch(async (): Promise<void> => {
+        if (settled) { return; }
+        if (DownloadService.valid(task, generation) && task.status === 'downloading') {
+          await DownloadService.failTask(task, key, generation, '下载启动失败');
+        }
+        settle(false);
+      });
+      if (task.status === 'paused') {
+        agent.pause().catch((): void => {});
+      } else {
+        DownloadService.startPoll(task, key, generation);
+      }
     });
   }
 
@@ -514,7 +685,7 @@ export class DownloadService {
       if (fb > task.receivedSize) {
         task.receivedSize = fb;
         if (task.totalSize > 0) {
-          task.progress = Math.min(100, Math.round(fb * 100 / task.totalSize));
+          task.progress = Math.min(99, Math.round(fb * 100 / task.totalSize));
         }
         DownloadService.stallCounts.set(key, 0);
         DownloadService.notify(false);
@@ -530,9 +701,8 @@ export class DownloadService {
           return;
         }
       }
-      if (task.totalSize > 0 && fb >= task.totalSize) {
-        DownloadService.finish(task, key);
-      }
+      const complete: (() => void) | undefined = DownloadService.stageComplete.get(key);
+      if (complete !== undefined) { complete(); }
     }, 1000);
     DownloadService.pollTimers.set(key, timer);
   }
@@ -571,36 +741,58 @@ export class DownloadService {
     return 0;
   }
 
+  /** 每一轨独立校验，避免某轨大小未知时拿另一轨冒充完整双轨。 */
+  private static filesComplete(task: DownloadTask): boolean {
+    try {
+      const video: number = fs.statSync(task.filePath).size;
+      if (video <= 0 || (task.videoSize > 0 && video < task.videoSize)) { return false; }
+      let audio: number = 0;
+      if (task.audioPath.length > 0) {
+        audio = fs.statSync(task.audioPath).size;
+        if (audio <= 0 || (task.audioSize > 0 && audio < task.audioSize)) { return false; }
+      }
+      return task.totalSize <= 0 || video + audio >= task.totalSize;
+    } catch (_) { return false; }
+  }
+
   private static finish(task: DownloadTask, key: string): void {
     if (task.status === 'done') {
       return;
     }
     const sz: number = DownloadService.fileBytes(task);
-    if (sz <= 0 || (task.totalSize > 0 && sz < task.totalSize)) {
+    if (!DownloadService.filesComplete(task)) {
       DownloadService.failTask(task, key, DownloadService.versions.get(key) || 0, '下载文件不完整，请重试');
       return;
     }
     task.status = 'done';
     task.progress = 100;
-    if (task.totalSize <= 0 && sz > 0) {
-      // 完成时用文件实际大小补齐（此前大小未知导致"已完成 0B"）
-      task.totalSize = sz;
-    }
-    task.receivedSize = task.totalSize > 0 ? task.totalSize : sz;
-    DownloadService.detachRequest(key);
+    // 完成后统一使用实际占用，包含任一轨 HEAD 未提供长度的情况。
+    task.totalSize = sz;
+    task.receivedSize = sz;
+    DownloadService.abortStage(key);
+    DownloadService.detachAgent(key);
     DownloadService.stopPoll(key);
     DownloadService.notify();
     DownloadService.persist();
     DownloadService.startNext();
   }
 
-  private static detachRequest(key: string): void {
-    const rt = DownloadService.reqTasks.get(key);
-    if (rt) {
-      try { rt.off('progress'); } catch (_) {}
-      try { rt.off('complete'); } catch (_) {}
-      try { rt.off('fail'); } catch (_) {}
-      DownloadService.reqTasks.delete(key);
+  /** 摘掉事件监听并释放引用；原生任务对象本身由调用方决定 resume/remove */
+  private static detachAgent(key: string): void {
+    const task = DownloadService.agentTasks.get(key);
+    if (task) {
+      try { task.off('completed'); } catch (_) {}
+      try { task.off('failed'); } catch (_) {}
+      DownloadService.agentTasks.delete(key);
+    }
+  }
+
+  /** 解开在途 stage 的 Promise（失败/删除路径用），避免 launch 的 finally 拉不回来 */
+  private static abortStage(key: string): void {
+    const abort = DownloadService.stageAbort.get(key);
+    if (abort !== undefined) {
+      DownloadService.stageAbort.delete(key);
+      abort();
     }
   }
 
@@ -618,11 +810,14 @@ export class DownloadService {
     t.status = 'failed';
     t.errMsg = message;
     DownloadService.versions.set(key, generation + 1);
+    // 代际已推进，旧事件不会再被处理；必须先解挂 stage，否则 Promise 永远挂着
+    DownloadService.abortStage(key);
     DownloadService.stopPoll(key);
-    const rt: request.DownloadTask | undefined = DownloadService.reqTasks.get(key);
-    if (rt !== undefined) {
-      DownloadService.detachRequest(key);
-      const closing: Promise<void> = rt.delete().then((): void => {}, (): void => { console.warn('[PiliMini-dl] 取消失败'); });
+    if (t.agentTid.length > 0 || DownloadService.agentTasks.has(key)) {
+      const closing: Promise<void> = DownloadService.closeNative(t, key).catch((): void => {
+        // 保留tid与文件，下一次重试仍须先关闭旧写入者。
+        t.errMsg = '系统下载任务未能停止，请稍后重试';
+      });
       DownloadService.cancelling.set(key, closing);
       try { await closing; } finally {
         if (DownloadService.cancelling.get(key) === closing) { DownloadService.cancelling.delete(key); }
@@ -647,22 +842,27 @@ export class DownloadService {
     await DownloadService.load();
     const t: DownloadTask | undefined = DownloadService.tasks.find((x: DownloadTask): boolean => x.cid === cid && x.status === 'downloading');
     if (t === undefined) { return; }
+    await DownloadService.control(DownloadService.key(t), (): Promise<void> => DownloadService.pauseTask(t));
+  }
+
+  private static async pauseTask(t: DownloadTask): Promise<void> {
+    if (DownloadService.tasks.indexOf(t) < 0 || t.status !== 'downloading') { return; }
     t.status = 'paused';
     const key: string = DownloadService.key(t);
     DownloadService.stopPoll(key);
     DownloadService.notify();
-    const rt: request.DownloadTask | undefined = DownloadService.reqTasks.get(key);
-    if (rt !== undefined) {
-      try { await rt.pause(); } catch (e) {
-        if (t.totalSize > 0 && DownloadService.fileBytes(t) >= t.totalSize) {
-          DownloadService.finish(t, key);
-        } else {
-          await DownloadService.failTask(t, key, DownloadService.versions.get(key) || 0, '暂停失败，已取消传输，请重试');
-        }
+    const agent: request.agent.Task | undefined = DownloadService.agentTasks.get(key);
+    if (agent !== undefined) {
+      try {
+        await agent.pause();
+      } catch (e) {
+        if (DownloadService.currentStatus(t) === 'done' || DownloadService.agentTasks.get(key) !== agent) { return; }
+        await DownloadService.failTask(t, key, DownloadService.versions.get(key) || 0, '暂停失败，请重试');
         return;
       }
     }
     await DownloadService.persist();
+    // 暂停的任务已不是 downloading，这里让队列继续跑下一个（原实现被全局 launching 挡住）
     DownloadService.startNext();
   }
 
@@ -671,11 +871,21 @@ export class DownloadService {
     const t: DownloadTask | undefined = DownloadService.tasks.find((x: DownloadTask): boolean =>
       x.cid === cid && (x.status === 'paused' || x.status === 'failed'));
     if (t === undefined) { return; }
-    const pending: Promise<void> | undefined = DownloadService.inFlight.get(DownloadService.key(t));
-    if (pending !== undefined) { await pending; }
-    const closing: Promise<void> | undefined = DownloadService.cancelling.get(DownloadService.key(t));
+    await DownloadService.control(DownloadService.key(t), (): Promise<void> => DownloadService.resumeTask(t));
+  }
+
+  private static async resumeTask(t: DownloadTask): Promise<void> {
+    if (DownloadService.tasks.indexOf(t) < 0 || (t.status !== 'paused' && t.status !== 'failed')) { return; }
+    const key: string = DownloadService.key(t);
+    const closing: Promise<void> | undefined = DownloadService.cancelling.get(key);
     if (closing !== undefined) { await closing; }
     if (DownloadService.tasks.indexOf(t) < 0) { return; }
+    if ((!DownloadService.inFlight.has(key) || !DownloadService.stageAbort.has(key)) && t.agentTid.length > 0) {
+      try { await DownloadService.closeNative(t, key); } catch (_) {
+        t.status = 'failed'; t.errMsg = '系统下载任务未能停止，请稍后重试';
+        DownloadService.notify(); await DownloadService.persist(); return;
+      }
+    }
     t.status = 'queued';
     t.errMsg = '';
     DownloadService.notify();
@@ -687,16 +897,24 @@ export class DownloadService {
     await DownloadService.load();
     const t: DownloadTask | undefined = DownloadService.tasks.find((x: DownloadTask): boolean => x.cid === cid);
     if (t === undefined) { return; }
+    await DownloadService.control(DownloadService.key(t), (): Promise<void> => DownloadService.removeTask(t));
+  }
+
+  private static async removeTask(t: DownloadTask): Promise<void> {
+    if (DownloadService.tasks.indexOf(t) < 0) { return; }
     const key: string = DownloadService.key(t);
     DownloadService.versions.set(key, (DownloadService.versions.get(key) || 0) + 1);
+    DownloadService.abortStage(key);
     t.status = 'paused';
     DownloadService.stopPoll(key);
     const pending: Promise<void> | undefined = DownloadService.inFlight.get(key);
     if (pending !== undefined) { await pending; }
     const closing: Promise<void> | undefined = DownloadService.cancelling.get(key);
     if (closing !== undefined) { await closing; }
-    const rt: request.DownloadTask | undefined = DownloadService.reqTasks.get(key);
-    if (rt !== undefined) { DownloadService.detachRequest(key); await rt.delete(); }
+    try { await DownloadService.closeNative(t, key); } catch (e) {
+      t.status = 'failed'; t.errMsg = '系统下载任务未能停止，文件已保留';
+      DownloadService.notify(); await DownloadService.persist(); throw new Error('系统下载任务未能停止，文件已保留');
+    }
     DownloadService.deleteFile(t);
     DownloadService.tasks = DownloadService.tasks.filter((x: DownloadTask): boolean => x !== t);
     DownloadService.versions.delete(key);
@@ -723,7 +941,7 @@ export class DownloadService {
       if (dir.length > 0 && fs.accessSync(dir)) {
         const files: string[] = fs.listFileSync(dir);
         for (let i: number = 0; i < files.length; i++) {
-          if (/^BV[0-9A-Za-z]+_[0-9]+\.mp4$/.test(files[i])) { fs.unlinkSync(dir + files[i]); }
+          if (/^BV[0-9A-Za-z]+_[0-9]+\.(mp4|video\.m4s|audio\.m4s)$/.test(files[i])) { fs.unlinkSync(dir + files[i]); }
         }
       }
       await DownloadService.persist();

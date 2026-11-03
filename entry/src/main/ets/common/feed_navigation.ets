@@ -1,3 +1,11 @@
+import { FrameCallback, UIContext } from '@ohos.arkui.UIContext';
+
+class FeedLayoutCallback extends FrameCallback {
+  private callback: () => void;
+  constructor(callback: () => void) { super(); this.callback = callback; }
+  onIdle(_timeLeftInNano: number): void { this.callback(); }
+}
+
 /** Nara底部导航：单击回顶/顶端刷新，500ms内再次点击直接刷新。 */
 export class FeedNavRequest {
   serial: number;
@@ -15,6 +23,19 @@ export class FeedNavigation {
   viewportHeight: number = 0;
   private returningToTop: boolean = false;
   private lastRefreshAt: number = 0;
+  private layoutCheckPending: boolean = false;
+
+  /** 合并数据提交/解锁通知，待官方布局完成再检查，不需要滚动事件再次触发。 */
+  afterLayout(ui: UIContext, check: () => void): void {
+    if (this.layoutCheckPending) { return; }
+    this.layoutCheckPending = true;
+    try {
+      ui.postFrameCallback(new FeedLayoutCallback((): void => {
+        this.layoutCheckPending = false;
+        check();
+      }));
+    } catch (_) { this.layoutCheckPending = false; }
+  }
 
   shouldRefresh(request: FeedNavRequest, canScroll: boolean): boolean {
     if (request.serial <= 0) { return false; }

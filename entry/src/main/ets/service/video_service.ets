@@ -2,7 +2,7 @@
  * 视频接口服务（spec-04/05）：推荐流 / 热门 / 搜索 / 详情 / 评论
  */
 import { getJson, buildQuery, parseEnvelope, ensureOk } from '../infra/http/http';
-import { wbiSign } from '../infra/sign/wbi';
+import { wbiSign, invalidateMixinKey } from '../infra/sign/wbi';
 import { API_BASE } from '../config/constants';
 import { AppError } from '../infra/error/app_error';
 import { MemberService } from './member_service';
@@ -263,6 +263,8 @@ interface ReplyEmoteMetaRaw {
 
 interface ReplyEmoteRaw {
   url?: string;
+  webp_url?: string;
+  gif_url?: string;
   meta?: ReplyEmoteMetaRaw;
 }
 
@@ -549,7 +551,7 @@ function mapComment(raw: ReplyItemRaw): CommentItem {
     for (let i: number = 0; i < keys.length; i++) {
       const entry: ReplyEmoteRaw | undefined = table[keys[i]];
       if (entry === undefined || entry === null) { continue; }
-      const path: string = entry.url === undefined ? '' : (entry.url as string);
+      const path: string = entry.webp_url || entry.gif_url || entry.url || '';
       if (path.length === 0) { continue; }
       const emote: CommentEmote = new CommentEmote();
       emote.key = keys[i];
@@ -648,7 +650,7 @@ export class VideoService {
   }
 
   /** 首页推荐流（wbi 签名） */
-  static async rcmd(freshIdx: number, ps: number): Promise<PageResult> {
+  static async rcmd(freshIdx: number, ps: number, keyRetried: boolean = false): Promise<PageResult> {
     // fresh_idx 是服务端去重游标：重复同一个值会拿到完全相同的 20 条（实测 20/20 重复）；
     // brush/fresh_idx_1h 跟随刷新序号，与网页版/Nara 的请求形状一致。
     const idx: string = Math.max(1, Math.floor(freshIdx)).toString();
@@ -669,6 +671,10 @@ export class VideoService {
     const signed: Record<string, string> = await wbiSign(params);
     const raw: string = await getJson(API_BASE + '/x/web-interface/wbi/index/top/feed/rcmd?' + buildQuery(signed));
     const resp = parseEnvelope<RcmdData>(raw);
+    if (resp.code === -403 && !keyRetried) {
+      await invalidateMixinKey();
+      return VideoService.rcmd(freshIdx, ps, true);
+    }
     ensureOk(resp);
     const data: RcmdData | undefined = resp.data;
     if (data === undefined) {

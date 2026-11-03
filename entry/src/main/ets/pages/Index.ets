@@ -1,7 +1,12 @@
-/** 启动校验：自动进入主壳/扫码页，网络异常保留重试入口。 */
+/**
+ * 启动分流：只读本地登录态，不联网。
+ *  - 旧实现 await /x/web-interface/nav 才进主壳，弱网/接口抖动时冷启动被整个网络往返拖住。
+ *  - 现在：有 SESSDATA → 直接进主壳（头像/昵称由主壳后台补），无 → 登录页。
+ *  - Cookie 失效由 http 层 -101 全局登出兜底（MainShell 已监听）。
+ */
 import { router } from '@kit.ArkUI';
-import { AuthService, UserInfo } from '../service/auth_service';
-import { AppError } from '../infra/error/app_error';
+import { CookieStore } from '../infra/cookie/cookie_store';
+import { markStartup } from '../infra/startup_trace';
 
 @Entry
 @Component
@@ -10,7 +15,7 @@ struct Index {
   private destroyed: boolean = false;
   private entering: boolean = false;
 
-  aboutToAppear(): void { this.enter(); }
+  aboutToAppear(): void { markStartup('indexAppear'); this.enter(); }
   aboutToDisappear(): void { this.destroyed = true; }
 
   private async enter(): Promise<void> {
@@ -18,18 +23,14 @@ struct Index {
     this.entering = true;
     this.error = '';
     try {
-      const user: UserInfo | null = await AuthService.fetchNav(true);
+      const logged: boolean = await CookieStore.isLogin();
+      markStartup('localSessionReady');
       if (this.destroyed) { return; }
-      await router.replaceUrl({ url: user !== null ? 'pages/main/MainShell' : 'pages/login/LoginPage' });
+      await router.replaceUrl({ url: logged ? 'pages/main/MainShell' : 'pages/login/LoginPage' });
+      markStartup('indexRouted');
     } catch (e) {
-      if (this.destroyed) { return; }
-      const err: AppError = e as AppError;
-      if (err.type === 'auth') {
-        try {
-          await AuthService.logout();
-          if (!this.destroyed) { await router.replaceUrl({ url: 'pages/login/LoginPage' }); }
-        } catch (clearError) { this.error = (clearError as Error).message; }
-      } else { this.error = '连接失败，请检查网络后重试'; }
+      markStartup('indexRouteFailed');
+      if (!this.destroyed) { this.error = '启动失败，请重试'; }
     } finally { this.entering = false; }
   }
 

@@ -18,6 +18,21 @@ import { VideoService, PageResult } from '../../service/video_service';
 import { AuthService, UserInfo } from '../../service/auth_service';
 import { VideoItem } from '../../model/video_item';
 import { FeedNavigation, FeedNavRequest } from '../../common/feed_navigation';
+import { CookieStore } from '../../infra/cookie/cookie_store';
+import { HomeCache, HomeCacheScope, HomeSnapshot } from '../../service/home_cache';
+import { markStartup } from '../../infra/startup_trace';
+import { AppError } from '../../infra/error/app_error';
+
+let snapshotStartupMarked: boolean = false;
+let networkStartupMarked: boolean = false;
+
+/** 在临时数据源中完成分页，验证代际后才提交实际列表。 */
+class FeedScan {
+  added: VideoItem[] = [];
+  nextCursor: number = 1;
+  hasMore: boolean = true;
+  exhausted: boolean = false;
+}
 
 @Component
 struct FeedList {
@@ -34,7 +49,10 @@ struct FeedList {
   @Prop @Watch('onTopTick') topTick: number = 0;
   @Prop @Watch('onNavRequest') navRequest: FeedNavRequest = new FeedNavRequest();
   private navigation: FeedNavigation = new FeedNavigation();
-  private ds: BasicDataSource<VideoItem> = new BasicDataSource<VideoItem>();
+  private ds: BasicDataSource<VideoItem> = new BasicDataSource<VideoItem>(true);
+  private feedVisible: boolean = false;
+  private visibleFirst: number = 0;
+  private visibleLast: number = -1;
   @State pager: Pager<VideoItem> = new Pager<VideoItem>();
   @State refreshing: boolean = false;
   @State refreshPullOffset: number = 0;
@@ -44,11 +62,17 @@ struct FeedList {
   private refreshRunning: boolean = false;
   private rawItems: VideoItem[] = [];
   private fetchGeneration: number = 0;
-  /** 推荐流 fresh_idx：只增不减；同一值重复请求会拿到完全相同的一页（实测 20/20 重复）。 */
-  private rcmdFresh: number = 1;
-  private refreshSerial: number = 0;
-  /** 本次会话已展示过的 bvid，用于刷新后过滤服务端仍返回的旧条目。 */
+  /** 已成功扫描的推荐高水位；首屏、翻页、刷新沿同一条递增链。 */
+  private rcmdNext: number = 1;
   private sessionSeen: Set<string> = new Set<string>();
+  private seenOrder: string[] = [];
+  private sessionRevision: number = CookieStore.sessionRevision();
+  private cacheScope: HomeCacheScope | undefined = undefined;
+  private started: boolean = false;
+  private bootstrapping: boolean = false;
+  private initialNetworkDone: boolean = false;
+  private stableCursor: string = '1';
+  @State recommendationNotice: string = '';
   @State hiddenPageCount: number = 0;
   @State visibleCount: number = 0;
   private filtersChanged: () => void = (): void => {
@@ -59,7 +83,7 @@ struct FeedList {
   };
 
   private onNavRequest(): void {
-    if (!this.selected || this.destroyed || this.pager.loading || this.refreshRunning) { return; }
+    if (!this.selected || this.destroyed || this.bootstrapping || this.pager.loading || this.refreshRunning) { return; }
     if (this.navigation.shouldRefresh(this.navRequest, this.pager.firstLoaded)) { this.refresh(); }
   }
 
@@ -80,12 +104,26 @@ struct FeedList {
 
   aboutToAppear(): void {
     FeedFilterService.subscribe(this.filtersChanged);
-    if (this.selected) { this.reload(); }
+    if (this.selected) { this.start(); }
   }
 
   /** 首次切到该流时才拉第一页（Nara 也是按需首载）。 */
   private onSelected(): void {
-    if (this.selected && !this.destroyed && !this.pager.firstLoaded && !this.pager.loading) { this.reload(); }
+    if (this.destroyed) { return; }
+    if (!this.selected) {
+      // 进入详情时立即冻结源列表；迟到首载不得销毁一镜到底的原卡片。
+      if (this.bootstrapping || this.pager.loading || this.pager.loadingMore) {
+        this.fetchGeneration++; this.pager.cancel(); this.pager.cursor = this.stableCursor;
+        if (this.bootstrapping) { this.started = false; }
+        this.bootstrapping = false; this.initialNetworkDone = false;
+        this.refreshRunning = false; this.refreshing = false;
+      }
+      return;
+    }
+    if (this.sessionRevision !== CookieStore.sessionRevision()) { this.restartSession(); return; }
+    if (!this.started) { this.start(); }
+    else if (!this.bootstrapping && !this.pager.loading && (!this.initialNetworkDone || !this.pager.firstLoaded)) { this.reload(); }
+    else { this.checkAfterLayout(); }
   }
 
   aboutToDisappear(): void {
@@ -93,83 +131,231 @@ struct FeedList {
     this.rawItems = [];
   }
 
-  private async fetchPage(cursor: string, generation: number): Promise<PageData<VideoItem>> {
+  private valid(generation: number, revision: number): boolean {
+    return !this.destroyed && generation === this.fetchGeneration && revision === CookieStore.sessionRevision();
+  }
+
+  private restartSession(): void {
+    this.fetchGeneration++; this.pager.cancel();
+    this.sessionRevision = CookieStore.sessionRevision();
+    this.rawItems = []; this.ds.reload([]); this.visibleCount = 0;
+    this.sessionSeen.clear(); this.seenOrder = []; this.rcmdNext = 1;
+    this.cacheScope = undefined; this.started = false; this.bootstrapping = false;
+    this.refreshRunning = false; this.refreshing = false;
+    this.initialNetworkDone = false; this.pager.firstLoaded = false;
+    this.stableCursor = '1';
+    this.pager.hasMore = true; this.pager.cursor = '1'; this.pager.error = ''; this.pager.footerText = '';
+    this.recommendationNotice = ''; this.hiddenPageCount = 0;
+    if (this.selected && !this.destroyed) { this.start(); }
+  }
+
+  private remember(items: VideoItem[]): void {
+    for (let i: number = 0; i < items.length; i++) {
+      const bvid: string = items[i].bvid;
+      if (this.sessionSeen.has(bvid)) { continue; }
+      this.sessionSeen.add(bvid); this.seenOrder.push(bvid);
+      if (this.seenOrder.length > 600) { this.sessionSeen.delete(this.seenOrder.shift() || ''); }
+    }
+  }
+
+  /** 本地快照不阻塞主壳；未选中流只读本地，不发推荐请求。 */
+  private async start(): Promise<void> {
+    if (this.started || this.destroyed) { return; }
+    this.started = true; this.bootstrapping = true; this.pager.loading = true;
+    const generation: number = this.fetchGeneration;
+    const revision: number = this.sessionRevision;
+    try {
+      await FeedFilterService.ready();
+      if (this.source !== 'hot') {
+        const scope: HomeCacheScope | undefined = await HomeCache.scope(revision);
+        const snapshot: HomeSnapshot | undefined = scope !== undefined ? await HomeCache.read(scope) : undefined;
+        if (!this.valid(generation, revision)) { return; }
+        this.cacheScope = scope;
+        if (snapshot !== undefined) {
+          this.rawItems = snapshot.items; this.rcmdNext = snapshot.nextCursor;
+          this.remember(snapshot.items); this.pager.cursor = snapshot.nextCursor.toString();
+          this.stableCursor = this.pager.cursor;
+          this.pager.firstLoaded = true; this.filtersChanged();
+          if (!snapshotStartupMarked) { snapshotStartupMarked = true; markStartup('homeSnapshotReady'); }
+        }
+      }
+    } catch (_) {
+      // 快照与屏蔽存储暂不可用时仍可进入正常请求错误/重试路径。
+    } finally {
+      if (this.valid(generation, revision)) {
+        this.bootstrapping = false; this.pager.loading = false;
+        if (this.selected) { this.reload(); }
+      } else if (!this.destroyed && this.sessionRevision !== CookieStore.sessionRevision()) { this.restartSession(); }
+    }
+  }
+
+  private async fetchPage(cursor: string, generation: number, revision: number,
+    replace: boolean, scan: FeedScan): Promise<PageData<VideoItem>> {
     await FeedFilterService.ready();
-    const pn: number = parseInt(cursor, 10);
-    const r: PageResult = this.source === 'hot'
-      ? await VideoService.hot(pn, 20)
-      : await VideoService.rcmd(pn, 12);
-    const firstPage: boolean = cursor === this.pager.initialCursor;
     const seen: Set<string> = new Set<string>();
-    if (!firstPage) { this.rawItems.forEach((item: VideoItem): void => { seen.add(item.bvid); }); }
-    const added: VideoItem[] = [];
-    const repeated: VideoItem[] = [];
-    const dedupeAgainstSession: boolean = firstPage && this.source !== 'hot' && this.refreshSerial > 0;
-    for (let i: number = 0; i < r.items.length; i++) {
-      const item: VideoItem = r.items[i];
-      if (item.bvid.length === 0 || seen.has(item.bvid)) { continue; }
-      seen.add(item.bvid);
-      if (dedupeAgainstSession && this.sessionSeen.has(item.bvid)) {
-        repeated.push(item);
-        continue;
+    if (!replace || this.source !== 'hot') {
+      this.rawItems.forEach((item: VideoItem): void => { seen.add(item.bvid); });
+    }
+    let pn: number = parseInt(cursor, 10);
+    const limit: number = this.source === 'hot' ? 1 : 3;
+    for (let page: number = 0; page < limit; page++) {
+      if (!this.valid(generation, revision)) { throw new Error('推荐请求已失效'); }
+      if (page > 0 && !this.selected) { throw new Error('推荐流已切到后台'); }
+      const r: PageResult = this.source === 'hot'
+        ? await VideoService.hot(pn, 20) : await VideoService.rcmd(pn, 12);
+      if (!this.valid(generation, revision)) { throw new Error('推荐请求已失效'); }
+      for (let i: number = 0; i < r.items.length; i++) {
+        const item: VideoItem = r.items[i];
+        if (item.bvid.length === 0 || seen.has(item.bvid) ||
+          (this.source !== 'hot' && this.sessionSeen.has(item.bvid))) { continue; }
+        seen.add(item.bvid); scan.added.push(item);
       }
-      added.push(item);
-    }
-    // 整页都刷到过时宁可复用旧页也不让用户看到空列表
-    if (added.length === 0 && repeated.length > 0) {
-      for (let i: number = 0; i < repeated.length; i++) { added.push(repeated[i]); }
-    }
-    if (firstPage && this.source !== 'hot') {
-      for (let i: number = 0; i < added.length; i++) {
-        this.sessionSeen.add(added[i].bvid);
+      scan.nextCursor = this.source === 'hot' ? r.nextCursor : Math.max(pn + 1, r.nextCursor);
+      scan.hasMore = r.hasMore && scan.nextCursor !== pn;
+      const visible: VideoItem[] = scan.added.filter((item: VideoItem): boolean => !FeedFilterService.matches(item));
+      if (visible.length > 0 || this.source === 'hot') {
+        return { items: visible, hasMore: scan.hasMore, nextCursor: scan.nextCursor.toString() };
       }
-      if (this.sessionSeen.size > 600) { this.sessionSeen.clear(); }
+      if (!scan.hasMore) { break; }
+      pn = scan.nextCursor;
     }
-    const visible: VideoItem[] = added.filter((item: VideoItem): boolean => !FeedFilterService.matches(item));
-    if (!this.destroyed && generation === this.fetchGeneration) {
-      this.rawItems = firstPage ? added : this.rawItems.concat(added);
-      this.hiddenPageCount = visible.length === 0 ? this.hiddenPageCount + 1 : 0;
-      this.visibleCount = this.rawItems.filter((item: VideoItem): boolean => !FeedFilterService.matches(item)).length;
+    // 网络成功但没有新可见视频：不能把刷新误报成功，也不能回填旧推荐。
+    scan.exhausted = true;
+    throw new Error('暂时没有新推荐');
+  }
+
+  private saveSnapshot(): void {
+    if (this.source !== 'hot' && this.cacheScope !== undefined) {
+      HomeCache.save(this.cacheScope, this.rawItems.filter((item: VideoItem): boolean =>
+        !FeedFilterService.matches(item)), this.rcmdNext);
     }
-    const out: PageData<VideoItem> = {
-      items: visible,
-      hasMore: r.hasMore && r.nextCursor.toString() !== cursor,
-      nextCursor: r.nextCursor.toString()
-    };
-    return out;
+  }
+
+  private accept(scan: FeedScan, replace: boolean): void {
+    this.rawItems = replace ? scan.added : this.rawItems.concat(scan.added);
+    if (this.source !== 'hot') { this.rcmdNext = scan.nextCursor; this.remember(scan.added); }
+    this.hiddenPageCount = scan.added.some((item: VideoItem): boolean => !FeedFilterService.matches(item))
+      ? 0 : this.hiddenPageCount + 1;
+    const visible: VideoItem[] = this.rawItems.filter((item: VideoItem): boolean => !FeedFilterService.matches(item));
+    this.visibleCount = visible.length;
+    this.stableCursor = this.pager.cursor;
+    if (replace) { this.ds.reload(visible); }
+    else { this.ds.append(scan.added.filter((item: VideoItem): boolean => !FeedFilterService.matches(item))); }
+    this.recommendationNotice = ''; this.saveSnapshot();
+    if (this.source !== 'hot' && !networkStartupMarked) {
+      networkStartupMarked = true; markStartup('homeNetworkReady');
+    }
+  }
+
+  private exhausted(scan: FeedScan): void {
+    this.rcmdNext = scan.nextCursor; this.pager.cursor = scan.nextCursor.toString();
+    this.pager.hasMore = scan.hasMore; this.pager.firstLoaded = true; this.pager.error = '';
+    this.stableCursor = this.pager.cursor;
+    this.hiddenPageCount = 3;
+    this.recommendationNotice = this.rawItems.length > 0
+      ? '暂时没有新推荐，已保留当前列表' : '暂时没有可展示的新推荐';
+    this.pager.footerText = this.recommendationNotice;
+    this.saveSnapshot();
   }
 
   private async reload(): Promise<void> {
-    if (this.destroyed || this.pager.loading) { return; }
-    this.hiddenPageCount = 0;
-    // 推荐流每次重新加载都从当前 fresh_idx 起算；热门是普通分页，始终从第 1 页
-    this.pager.initialCursor = this.source === 'hot' ? '1' : this.rcmdFresh.toString();
+    if (this.destroyed || !this.selected || this.bootstrapping || this.pager.loading) { return; }
+    if (this.sessionRevision !== CookieStore.sessionRevision()) { this.restartSession(); return; }
+    const oldCursor: string = this.pager.cursor;
+    this.pager.initialCursor = this.source === 'hot' ? '1' : this.rcmdNext.toString();
     const generation: number = ++this.fetchGeneration;
-    await this.pager.reload(this.ds, (cursor: string): Promise<PageData<VideoItem>> => this.fetchPage(cursor, generation));
+    const revision: number = this.sessionRevision;
+    const scan: FeedScan = new FeedScan();
+    const staged: BasicDataSource<VideoItem> = new BasicDataSource<VideoItem>();
+    this.initialNetworkDone = true;
+    const accepted: boolean = await this.pager.reload(staged, (cursor: string): Promise<PageData<VideoItem>> =>
+      this.fetchPage(cursor, generation, revision, true, scan));
+    if (!this.valid(generation, revision)) {
+      if (!this.destroyed && this.sessionRevision !== CookieStore.sessionRevision()) { this.restartSession(); }
+      return;
+    }
+    if (accepted) { this.accept(scan, true); this.checkAfterLayout(); }
+    else if (scan.exhausted) { this.exhausted(scan); }
+    else { this.pager.cursor = oldCursor; }
   }
 
   private async refresh(): Promise<void> {
-    if (this.destroyed || this.refreshRunning || this.pager.loading) { return; }
-    this.refreshRunning = true;
-    // 下拉刷新必须换一个 fresh_idx，否则服务端原样返回上一批
-    if (this.source !== 'hot') { this.rcmdFresh++; this.refreshSerial++; }
-    console.info('[PiliMini-feed] refresh source=' + this.source + ' fresh=' + this.rcmdFresh.toString());
-    this.refreshing = true;
+    if (this.destroyed || !this.selected || this.bootstrapping || this.refreshRunning || this.pager.loading) { return; }
+    this.refreshRunning = true; this.refreshing = true;
+    const generation: number = this.fetchGeneration + 1;
     try { await this.reload(); }
     finally {
-      this.refreshRunning = false;
-      if (!this.destroyed) { this.refreshing = false; }
+      if (!this.destroyed && generation === this.fetchGeneration) {
+        this.refreshRunning = false; this.refreshing = false;
+        this.checkAfterLayout();
+      }
     }
   }
 
   private async loadMore(automatic: boolean = false): Promise<void> {
-    if (this.destroyed || (automatic && this.hiddenPageCount >= 3)) { return; }
+    if (this.destroyed || !this.selected || this.bootstrapping || this.refreshRunning || this.pager.loading || this.pager.loadingMore ||
+      !this.pager.hasMore || !this.pager.firstLoaded ||
+      (automatic && (!this.feedVisible || this.pager.lastError.length > 0 || this.hiddenPageCount >= 3))) { return; }
+    if (this.sessionRevision !== CookieStore.sessionRevision()) { this.restartSession(); return; }
     const generation: number = this.fetchGeneration;
-    await this.pager.loadMore(this.ds, (cursor: string): Promise<PageData<VideoItem>> => this.fetchPage(cursor, generation));
+    const revision: number = this.sessionRevision;
+    const scan: FeedScan = new FeedScan();
+    const staged: BasicDataSource<VideoItem> = new BasicDataSource<VideoItem>();
+    const accepted: boolean = await this.pager.loadMore(staged, (cursor: string): Promise<PageData<VideoItem>> =>
+      this.fetchPage(cursor, generation, revision, false, scan));
+    if (!this.valid(generation, revision)) {
+      if (!this.destroyed && this.sessionRevision !== CookieStore.sessionRevision()) { this.restartSession(); }
+      return;
+    }
+    if (accepted) { this.accept(scan, false); this.checkAfterLayout(); }
+    else if (scan.exhausted) { this.exhausted(scan); }
+  }
+
+  private prefetchVisible(): void {
+    if (this.ds.size() === 0) { return; }
+    let atEnd: boolean = false;
+    try { atEnd = this.navigation.scroller.isAtEnd(); } catch (_) {}
+    if (atEnd) { this.loadMore(true); return; }
+    if (this.visibleLast < 0) { return; }
+    const ahead: number = Math.max(this.source === 'hot' ? 3 : 6, this.visibleLast - this.visibleFirst + 1);
+    // Grid首项是跨列顶栏占位，最后一条卡片索引等于数据源大小。
+    if (this.ds.size() - this.visibleLast <= ahead) { this.loadMore(true); }
+  }
+
+  private checkAfterLayout(): void {
+    if (this.destroyed || !this.selected) { return; }
+    this.navigation.afterLayout(this.getUIContext(), (): void => { this.prefetchVisible(); });
   }
 
   @Builder
   EmptyRefreshIndicator() { Row().width('100%').height(0) }
+
+  /** Nara HotPage 的横卡骨架：首载从第一帧保留列表几何，不先显示空态。 */
+  @Builder
+  HotInitialSkeleton() {
+    Column() {
+      Column().width('100%').height(this.topInset + 7)
+      ForEach([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], (index: number) => {
+        Row({ space: 10 }) {
+          Column().width(160).height(100).borderRadius(10)
+            .backgroundColor($r('app.color.btn_soft_bg'))
+          Column({ space: 5 }) {
+            Column().width('100%').height(13).backgroundColor($r('app.color.btn_soft_bg'))
+            Column().width('75%').height(13).backgroundColor($r('app.color.btn_soft_bg'))
+            Blank()
+            Column().width('60%').height(13).backgroundColor($r('app.color.btn_soft_bg'))
+            Row({ space: 8 }) {
+              Column().width(40).height(13).backgroundColor($r('app.color.btn_soft_bg'))
+              Column().width(40).height(13).backgroundColor($r('app.color.btn_soft_bg'))
+            }.width('100%')
+          }.layoutWeight(1).height(100).padding({ top: 4, bottom: 4, right: 6 })
+            .alignItems(HorizontalAlign.Start)
+        }.width('100%').height(110).padding({ left: 12, right: 12, top: 5, bottom: 5 })
+          .margin({ bottom: 2 })
+      }, (index: number) => index.toString())
+    }.width('100%').height('100%').clip(true).alignItems(HorizontalAlign.Start)
+      .accessibilityText('热门正在加载').id('home_hot_initial_skeleton')
+  }
 
   /** 原生Refresh推进卡片；圆环在顶栏下方新增的下拉空白内居中。 */
   @Builder
@@ -190,7 +376,9 @@ struct FeedList {
 
   build() {
     Column() {
-      if (this.pager.loading && !this.pager.firstLoaded) {
+      if (this.source === 'hot' && !this.pager.firstLoaded && this.pager.error.length === 0) {
+        this.HotInitialSkeleton()
+      } else if (this.pager.loading && !this.pager.firstLoaded) {
         Column() {
           LoadingFooter({ text: '正在加载…' })
         }
@@ -228,7 +416,7 @@ struct FeedList {
 
             GridItem() {
               Column() {
-                if (this.visibleCount === 0 && !this.pager.loadingMore) {
+                if (this.visibleCount === 0 && this.recommendationNotice.length === 0 && !this.pager.loadingMore) {
                   Text('暂无可展示内容，可在屏蔽管理中解除规则')
                     .fontSize(12).fontColor($r('app.color.text_secondary')).margin({ bottom: 12 })
                 }
@@ -242,6 +430,7 @@ struct FeedList {
                   Text(this.pager.footerText)
                     .fontSize(12)
                     .fontColor($r('app.color.text_secondary'))
+                    .onClick(() => { if (this.pager.lastError.length > 0) { this.loadMore(); } })
                 } else if (this.pager.loadingMore) {
                   LoadingFooter({ text: '加载中…' })
                 }
@@ -257,12 +446,19 @@ struct FeedList {
           .rowsGap(this.source === 'hot' ? 2 : 8)
           .padding({ left: this.source === 'hot' ? 0 : 12, right: this.source === 'hot' ? 0 : 12 })
           .scrollBar(BarState.Off)
-          .cachedCount(6)
+          .cachedCount(2)
           .width('100%')
           .height('100%')
           .id('home_feed_' + this.source)
-          .onAreaChange((_old: Area, area: Area): void => { this.navigation.viewportHeight = Number(area.height); })
+          .backToTop(this.selected)
+          .onAreaChange((_old: Area, area: Area): void => {
+            this.navigation.viewportHeight = Number(area.height); this.checkAfterLayout();
+          })
           .onScrollStop((): void => { this.navigation.onScrollStop(); })
+          .onVisibleAreaChange([0], (visible: boolean): void => {
+            this.feedVisible = visible;
+            if (visible) { this.checkAfterLayout(); }
+          })
           .onScrollIndex((first: number, last: number) => {
             // 首行（占位后的第一排卡片）进入视口 → 收起顶栏（Nara：上滑收起搜索行）
             const collapsed: boolean = first >= 1;
@@ -270,10 +466,10 @@ struct FeedList {
               this.collapsedLocal = collapsed;
               this.onCollapse(collapsed);
             }
-            if (last >= this.ds.totalCount() - 4) {
-              this.loadMore(true);
-            }
+            this.visibleFirst = first; this.visibleLast = last;
+            this.prefetchVisible();
           })
+          .onReachEnd((): void => { this.loadMore(true); })
         }
         .refreshOffset(64)
         .onOffsetChange((offset: number): void => { this.refreshPullOffset = Math.max(0, offset); })
@@ -293,7 +489,10 @@ struct FeedList {
 
 @Component
 export struct HomeTab {
+  @Prop active: boolean = true;
   @State mode: number = 0; // 0=推荐 1=热门
+  /** 滑动确定目标时放行首载，Tabs索引仍由实际切换回调维护。 */
+  @State requestMode: number = 0;
   @State categoryProgress: number = 0;
   private feedTabs: TabsController = new TabsController();
   private feedCollapsed: boolean[] = [false, false];
@@ -313,6 +512,8 @@ export struct HomeTab {
   };
   private destroyed: boolean = false;
   private feedbackDialog: CustomDialogController | undefined = undefined;
+  private userRequest: number = 0;
+  private userSessionRevision: number = CookieStore.sessionRevision();
 
   private openFeedback(mode: string, item: VideoItem | undefined = undefined): void {
     if (this.destroyed) { return; }
@@ -331,32 +532,49 @@ export struct HomeTab {
   }
 
   aboutToAppear(): void {
-    this.loadUser();
+    this.destroyed = false;
+    this.loadUser().catch((): void => { console.warn('[PiliMini-home] user refresh unavailable'); });
     FeedFilterService.refreshSessionBlocks().catch((): void => {});
   }
 
   aboutToDisappear(): void {
-    this.destroyed = true;
+    this.destroyed = true; this.userRequest++;
     if (this.feedbackDialog !== undefined) { this.feedbackDialog.close(); this.feedbackDialog = undefined; }
   }
 
   /** 主壳从其它页面返回（登录态/材质等级可能变化） */
   onShown(): void {
-    this.loadUser();
+    this.loadUser().catch((): void => { console.warn('[PiliMini-home] user refresh unavailable'); });
     FeedFilterService.refreshSessionBlocks().catch((): void => {});
   }
 
   private async loadUser(): Promise<void> {
-    const u: UserInfo | null = await AuthService.fetchNav();
-    if (this.destroyed) {
-      return;
+    const request: number = ++this.userRequest;
+    const revision: number = CookieStore.sessionRevision();
+    const current: () => boolean = (): boolean => !this.destroyed && request === this.userRequest &&
+      revision === CookieStore.sessionRevision();
+    if (!current()) { return; }
+    if (this.userSessionRevision !== revision) {
+      this.userSessionRevision = revision; this.loggedIn = false; this.face = '';
     }
-    if (u !== null) {
-      this.loggedIn = true;
-      this.face = u.face;
-    } else {
-      this.loggedIn = false;
-      this.face = '';
+    try {
+      // 本地展示先行；网络失败保留同一会话资料，不能误当作退出登录。
+      if (!this.loggedIn) {
+        const cached: UserInfo | null = await AuthService.cachedUser();
+        if (!current()) { return; }
+        if (cached !== null) { this.loggedIn = true; this.face = cached.face; }
+      }
+      const u: UserInfo | null = await AuthService.fetchNav(true);
+      if (!current()) { return; }
+      this.loggedIn = u !== null; this.face = u !== null ? u.face : '';
+    } catch (e) {
+      if (!current()) { return; }
+      const err: AppError = e as AppError;
+      if (err !== null && err !== undefined && err.type === 'auth') {
+        // fetchNav已通过ensureOk触发-101全局登出，不能保留已失效的账号展示。
+        this.loggedIn = false; this.face = '';
+      }
+      console.warn('[PiliMini-home] user refresh unavailable');
     }
   }
 
@@ -512,7 +730,7 @@ export struct HomeTab {
           FeedList({
             source: 'rcmd',
             onFeedback: (mode: string, item: VideoItem): void => { this.openFeedback(mode, item); },
-            selected: this.mode === 0,
+            selected: this.active && this.requestMode === 0,
             navRequest: this.feedNavRequests[0],
             topInset: this.feedTopInset(),
             topTick: this.topTick,
@@ -526,7 +744,7 @@ export struct HomeTab {
           FeedList({
             source: 'hot',
             onFeedback: (mode: string, item: VideoItem): void => { this.openFeedback(mode, item); },
-            selected: this.mode === 1,
+            selected: this.active && this.requestMode === 1,
             navRequest: this.feedNavRequests[1],
             topInset: this.feedTopInset(),
             topTick: this.topTick,
@@ -544,9 +762,16 @@ export struct HomeTab {
       .onContentDidScroll((_selected: number, index: number, position: number): void => {
         this.categoryProgress = Math.max(0, Math.min(1, index - position));
       })
-      .onAnimationEnd((index: number): void => { this.categoryProgress = index; })
+      .onAnimationStart((_index: number, targetIndex: number): void => {
+        this.requestMode = targetIndex;
+      })
+      .onAnimationEnd((index: number): void => {
+        this.categoryProgress = index;
+        this.requestMode = index;
+      })
       .onChange((index: number) => {
         this.mode = index;
+        this.requestMode = index;
         this.collapsed = this.feedCollapsed[index];
       })
 

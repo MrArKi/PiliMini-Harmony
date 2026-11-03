@@ -5,6 +5,7 @@ import { getJson, buildQuery, parseEnvelope, ensureOk } from '../infra/http/http
 import { wbiSign } from '../infra/sign/wbi';
 import { API_BASE } from '../config/constants';
 import { AppError } from '../infra/error/app_error';
+import { RichSegment, RichSourceNode, RichText } from '../common/rich_text';
 
 // ===== 映射后的模型 =====
 
@@ -37,6 +38,8 @@ export interface DynItem {
   kind: string;
   author: DynAuthor;
   text: string;
+  /** 接口节点映射后的行内正文；与评论共用 RichSegment。 */
+  segments?: RichSegment[];
   archive?: DynArchive;
   pics?: DynPic[];
   orig?: DynItem;
@@ -56,12 +59,13 @@ export interface DynItem {
 
 export interface DynTextNode {
   text: string; link: string; mid: number; bold: boolean; italic: boolean; strike: boolean; size: number;
+  segments?: RichSegment[];
 }
-export interface DynParagraph { text: DynTextNode[]; pics: DynPic[]; heading: boolean; divider?: boolean; quote?: boolean; card?: DynLinkCard; }
+export interface DynParagraph { text: DynTextNode[]; segments?: RichSegment[]; pics: DynPic[]; heading: boolean; divider?: boolean; quote?: boolean; card?: DynLinkCard; }
 export interface DynLinkCard { title: string; cover: string; link: string; }
 interface OpusStyle { bold?: boolean; italic?: boolean; strikethrough?: boolean; }
 interface OpusWord { words?: string; font_size?: number; style?: OpusStyle; }
-interface OpusRich { text?: string; orig_text?: string; jump_url?: string; rid?: string; type?: string; style?: OpusStyle; }
+interface OpusRich extends RichSourceNode { style?: OpusStyle; }
 interface OpusNode { word?: OpusWord; rich?: OpusRich; formula?: OpusFormula; }
 interface OpusFormula { latex_content?: string; }
 interface OpusText { nodes?: OpusNode[]; }
@@ -102,15 +106,9 @@ export interface DynPageResult {
 
 // ===== 原始响应类型 =====
 
-interface RawRichNode {
-  type: string;
-  orig_text: string;
-  rid?: number;
-}
-
 interface RawDesc {
   text: string;
-  rich_text_nodes?: RawRichNode[];
+  rich_text_nodes?: RichSourceNode[];
 }
 
 interface RawAuthor {
@@ -162,6 +160,7 @@ interface RawMajorDraw {
 
 interface RawOpusSummary {
   text?: string;
+  rich_text_nodes?: RichSourceNode[];
 }
 
 interface RawMajorOpus {
@@ -246,7 +245,7 @@ function cleanText(s: string): string {
   const out: string[] = [];
   for (let i = 0; i < lines.length; i++) {
     const t: string = lines[i].trim();
-    if (t === '[图片]' || t === '[视频]' || t === '[表情]') {
+    if (t === '[图片]' || t === '[视频]') {
       continue;
     }
     out.push(lines[i]);
@@ -272,6 +271,32 @@ function kindOf(rawType: string): string {
   }
 }
 
+function mapOpusNode(node: OpusNode): DynTextNode {
+  const style: OpusStyle | undefined = node.word?.style || node.rich?.style;
+  const text: string = node.word?.words || node.rich?.orig_text || node.rich?.text || node.formula?.latex_content || '';
+  const size: number = node.word?.font_size || 16;
+  const segments: RichSegment[] = node.rich ? RichText.parseNodes(text, [node.rich]) : RichText.parse(text);
+  for (let i: number = 0; i < segments.length; i++) {
+    segments[i].bold = style?.bold === true;
+    segments[i].italic = style?.italic === true;
+    segments[i].strike = style?.strikethrough === true;
+    segments[i].fontSize = Math.max(13, Math.min(24, size));
+  }
+  return { text: text, link: node.rich?.jump_url || '',
+    mid: node.rich?.type === 'RICH_TEXT_NODE_TYPE_AT' ? Number(node.rich.rid || 0) : 0,
+    bold: style?.bold === true, italic: style?.italic === true, strike: style?.strikethrough === true,
+    size: size, segments: segments };
+}
+
+function paragraphSegments(nodes: DynTextNode[]): RichSegment[] {
+  const out: RichSegment[] = [];
+  for (let i: number = 0; i < nodes.length; i++) {
+    const segments: RichSegment[] = nodes[i].segments || RichText.parse(nodes[i].text);
+    for (let j: number = 0; j < segments.length; j++) { out.push(segments[j]); }
+  }
+  return out;
+}
+
 function mapItem(raw: RawDynItem): DynItem {
   const modules: RawModules = raw.modules !== undefined && raw.modules !== null ? raw.modules : {};
   const authorRaw: RawAuthor | undefined = modules.module_author;
@@ -289,14 +314,17 @@ function mapItem(raw: RawDynItem): DynItem {
 
   // 正文：优先 desc.text（视频/转发类）；图文类（OPUS）正文在 major.opus
   let text: string = '';
+  let richNodes: RichSourceNode[] = [];
   if (dyn !== undefined && dyn !== null && dyn.desc !== undefined && dyn.desc !== null
-    && dyn.desc.text !== undefined && dyn.desc.text !== null && dyn.desc.text.length > 0) {
-    text = dyn.desc.text;
+    && ((dyn.desc.text?.length || 0) > 0 || (dyn.desc.rich_text_nodes?.length || 0) > 0)) {
+    richNodes = dyn.desc.rich_text_nodes || [];
+    text = dyn.desc.text || richNodes.map((node: RichSourceNode): string => node.orig_text || node.text || '').join('');
   } else if (major !== undefined && major.opus !== undefined && major.opus !== null) {
     const opus: RawMajorOpus = major.opus;
     const title: string = opus.title !== undefined && opus.title !== null ? opus.title : '';
-    const summary: string = (opus.summary !== undefined && opus.summary !== null
-      && opus.summary.text !== undefined && opus.summary.text !== null) ? opus.summary.text : '';
+    richNodes = opus.summary?.rich_text_nodes || [];
+    const summary: string = opus.summary?.text
+      || richNodes.map((node: RichSourceNode): string => node.orig_text || node.text || '').join('');
     if (title.length > 0 && summary.length > 0) {
       text = title + '\n' + summary;
     } else {
@@ -310,6 +338,7 @@ function mapItem(raw: RawDynItem): DynItem {
     kind: kindOf(raw.type),
     author: author,
     text: text,
+    segments: RichText.parseNodes(text, richNodes),
     interactText: '',
     forwardCount: 0,
     commentCount: 0,
@@ -344,7 +373,7 @@ function mapItem(raw: RawDynItem): DynItem {
     if (d !== undefined && d !== null && d.rich_text_nodes !== undefined && d.rich_text_nodes !== null) {
       const parts: string[] = [];
       for (let i = 0; i < d.rich_text_nodes.length; i++) {
-        parts.push(d.rich_text_nodes[i].orig_text);
+        parts.push(d.rich_text_nodes[i].orig_text || d.rich_text_nodes[i].text || '');
       }
       item.interactText = parts.join('');
     }
@@ -469,27 +498,23 @@ export class DynamicService {
       const content: OpusParagraph[] = m.module_content?.paragraphs || [];
       for (let j: number = 0; j < content.length; j++) {
         const p: OpusParagraph = content[j];
-        const nodes: DynTextNode[] = (p.text?.nodes || p.heading?.nodes || p.blockquote?.nodes || []).map((n: OpusNode): DynTextNode => {
-          const style: OpusStyle | undefined = n.word?.style || n.rich?.style;
-          return { text: n.word?.words || n.rich?.text || n.rich?.orig_text || n.formula?.latex_content || '',
-            link: n.rich?.jump_url || '', mid: n.rich?.type === 'RICH_TEXT_NODE_TYPE_AT' ? Number(n.rich.rid || 0) : 0,
-            bold: style?.bold === true, italic: style?.italic === true, strike: style?.strikethrough === true,
-            size: n.word?.font_size || 16 };
-        });
+        const nodes: DynTextNode[] = (p.text?.nodes || p.heading?.nodes || p.blockquote?.nodes || [])
+          .map((n: OpusNode): DynTextNode => mapOpusNode(n));
         if (p.code?.content) { nodes.push({ text: p.code.content, link: '', mid: 0,
           bold: false, italic: false, strike: false, size: 14 }); }
         const lists: OpusListItem[] = p.list?.items || [];
         for (let k: number = 0; k < lists.length; k++) {
           const row: OpusListItem = lists[k];
           const prefix: string = p.list?.style === 1 ? (row.order || k + 1).toString() + '. ' : '• ';
-          nodes.push({ text: (k > 0 ? '\n' : '') + '  '.repeat(Math.min(8, row.level || 0)) + prefix
-            + (row.nodes || []).map((n: OpusNode) => n.word?.words || n.rich?.text || n.formula?.latex_content || '').join(''),
+          nodes.push({ text: (k > 0 ? '\n' : '') + '  '.repeat(Math.min(8, row.level || 0)) + prefix,
             link: '', mid: 0, bold: false, italic: false, strike: false, size: 16 });
+          const rowNodes: OpusNode[] = row.nodes || [];
+          for (let n: number = 0; n < rowNodes.length; n++) { nodes.push(mapOpusNode(rowNodes[n])); }
         }
         const pictures: RawOpusPic[] = p.pic?.pics || [];
         if (p.line?.pic) { pictures.push(p.line.pic); }
         const contentCard: OpusCardContent | undefined = p.link_card?.card?.ugc || p.link_card?.card?.common || p.link_card?.card?.opus;
-        paragraphs.push({ text: nodes, heading: !!p.heading, quote: !!p.blockquote,
+        paragraphs.push({ text: nodes, segments: paragraphSegments(nodes), heading: !!p.heading, quote: !!p.blockquote,
           divider: !!p.line && !p.line.pic,
           card: contentCard ? { title: contentCard.title || '查看内容', cover: fixUrl(contentCard.cover || ''),
             link: contentCard.jump_url || '' } : undefined,

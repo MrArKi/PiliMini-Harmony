@@ -32,6 +32,8 @@ export class PlaybackSnapshot {
   position: number = 0;
   /** 与position同次采样的ACTIVE单调毫秒，供画面弹幕插值，不增加原生轮询。 */
   sampledAt: number = 0;
+  /** 原生位置实采才为true；控制边界估算不作弹幕跳变判断基线。 */
+  positionObserved: boolean = false;
   timeRevision: number = 0;
   seeking: boolean = false;
   duration: number = 0;
@@ -49,6 +51,10 @@ export class PlaybackSnapshot {
   bufferPercent: number = 0;
   width: number = 0;
   height: number = 0;
+  /** 来自同代原生VO快照，仅表示视频输出已配置；不等于ArkUI已完成上屏。 */
+  videoOutputReady: boolean = false;
+  /** 实际内核所载源身份；新props先到、start尚在await时不可借用旧源就绪状态。 */
+  videoSourceKey: string = '';
   wanted: boolean = true;
   loaded: boolean = false;
   audioOnly: boolean = false;
@@ -151,7 +157,7 @@ export class PlayController {
     this.syncSystemVolume();
   };
   private readonly volumeListener = (event: audio.StreamVolumeEvent): void => {
-    if (this.disposed || event.streamUsage !== audio.StreamUsage.STREAM_USAGE_MUSIC) { return; }
+    if (this.disposed || event.streamUsage !== audio.StreamUsage.STREAM_USAGE_MOVIE) { return; }
     this.readSystemVolume(event.volume, event.updateUi);
     this.emit();
   };
@@ -170,6 +176,8 @@ export class PlayController {
 
   private async initializeSettings(): Promise<void> {
     if (this.initialized || this.disposed) { return; }
+    // 与mpv ohaudio的AUDIOSTREAM_USAGE_MOVIE一致；冷启动不等偏好/取流才同步。
+    this.readSystemVolume(); this.emit();
     this.hardware = (await prefsGet('setting_enable_ha', '1')) !== '0';
     this.p1080 = (await prefsGet('setting_p1080', '1')) !== '0';
     const qn: number = parseInt(await prefsGet('setting_default_qn', '80'), 10);
@@ -188,7 +196,7 @@ export class PlayController {
     this.routing.on('deviceChange', audio.DeviceFlag.OUTPUT_DEVICES_FLAG, this.deviceListener);
     this.deviceSubscribed = true;
     try {
-      this.volumeManager.on('streamVolumeChange', audio.StreamUsage.STREAM_USAGE_MUSIC, this.volumeListener);
+      this.volumeManager.on('streamVolumeChange', audio.StreamUsage.STREAM_USAGE_MOVIE, this.volumeListener);
       this.volumeSubscribed = true;
     } catch (_) { console.warn('[PiliMini-volume] subscription unavailable'); }
     this.readSystemVolume();
@@ -359,7 +367,7 @@ export class PlayController {
         if (this.castHeld && cast.duration <= 0) { cast.duration = media.duration; }
         if (this.castHeld && Number.isFinite(cast.position)) {
           this.state.position = Math.max(0, cast.position);
-          this.state.sampledAt = systemDateTime.getUptime(systemDateTime.TimeType.ACTIVE);
+          this.state.sampledAt = systemDateTime.getUptime(systemDateTime.TimeType.ACTIVE); this.state.positionObserved = false;
           if (this.history !== undefined && cast.remote) {
             this.history.observe(cast.position, cast.phase === 'playing', false,
               cast.phase === 'paused' || cast.phase === 'ended', this.background);
@@ -493,7 +501,7 @@ export class PlayController {
       ' position=' + Math.floor(position).toString() + ' duration=' + Math.floor(duration).toString() +
       ' loaded=' + this.state.loaded.toString() + ' engine=' + (this.engine !== undefined).toString());
     this.state.position = position;
-    this.state.sampledAt = systemDateTime.getUptime(systemDateTime.TimeType.ACTIVE);
+    this.state.sampledAt = systemDateTime.getUptime(systemDateTime.TimeType.ACTIVE); this.state.positionObserved = false;
     this.state.timeRevision++;
     this.state.wanted = true;
     this.pendingEnd = false;
@@ -532,7 +540,7 @@ export class PlayController {
     const wasRemote: boolean = this.castHeld;
     if (wasRemote && Number.isFinite(this.state.cast.position)) {
       this.state.position = Math.max(0, this.state.cast.position);
-      this.state.sampledAt = systemDateTime.getUptime(systemDateTime.TimeType.ACTIVE);
+      this.state.sampledAt = systemDateTime.getUptime(systemDateTime.TimeType.ACTIVE); this.state.positionObserved = false;
       this.state.timeRevision++;
     }
     if (reset) { this.castHeld = false; this.state.cast = new CastSnapshot(); }
@@ -566,6 +574,7 @@ export class PlayController {
   private closeEngine(): Promise<void> {
     const old: MpvEngine | undefined = this.engine;
     this.engine = undefined;
+    this.state.videoOutputReady = false;
     return old === undefined ? Promise.resolve() : old.dispose();
   }
 
@@ -605,14 +614,16 @@ export class PlayController {
     this.clearBackgroundTimer(); this.clearRestore();
     this.prepareAt = Date.now();
     this.source = source;
+    this.state.videoSourceKey = source.bvid + ':' + source.cid.toString() + '|' + source.localPath + '|' + (source.localAudioPath || '');
     this.info = undefined;
     this.videoBackup = 0; this.audioBackup = 0; this.refreshed = false;
     this.state.wanted = wanted;
     this.state.position = position;
-    this.state.sampledAt = systemDateTime.getUptime(systemDateTime.TimeType.ACTIVE);
+    this.state.sampledAt = systemDateTime.getUptime(systemDateTime.TimeType.ACTIVE); this.state.positionObserved = false;
     this.state.timeRevision++;
     this.state.seeking = false;
     this.state.loaded = false;
+    this.state.videoOutputReady = false;
     this.state.audioOnly = false;
     this.state.error = '';
     this.state.bufferPercent = 0;
@@ -683,8 +694,9 @@ export class PlayController {
       this.pendingEnd = false;
       this.audioMissingAt = 0;
       this.state.loaded = false;
+      this.state.videoOutputReady = false;
       this.state.position = position;
-      this.state.sampledAt = systemDateTime.getUptime(systemDateTime.TimeType.ACTIVE);
+      this.state.sampledAt = systemDateTime.getUptime(systemDateTime.TimeType.ACTIVE); this.state.positionObserved = false;
       this.state.seeking = false;
       this.prepareAt = Date.now();
       if (this.surfaceW > 0 && this.surfaceH > 0) { engine.resize(this.surfaceW, this.surfaceH); }
@@ -712,6 +724,7 @@ export class PlayController {
     this.invalidateSnapshot();
     if (event.type === 'loaded') {
       this.state.loaded = true;
+      this.readSystemVolume();
       if (this.engine !== undefined) {
         if (this.state.wanted) { this.playAfterFocus(this.engine); }
         else { this.engine.pause(); if (this.background) { this.stopBackgroundVideo(); } }
@@ -759,6 +772,7 @@ export class PlayController {
       if (diagnostic) { this.lastDiagnosticAt = now; }
       const native: NativePlayerSnapshot = await engine.snapshot(diagnostic);
       if (!valid()) { return; }
+      this.state.videoOutputReady = native.videoEnabled && native.outputReady;
       const uptime: number = systemDateTime.getUptime(systemDateTime.TimeType.ACTIVE);
       const sampledAt: number = uptime - Math.min(uptime, Math.max(0, native.sampleAgeMs));
       if (this.pendingSeek >= 0 && this.seekStarted && !native.seeking &&
@@ -787,7 +801,11 @@ export class PlayController {
       }
       if (this.pendingSeek >= 0 && Date.now() - this.seekAt > 8000) { this.pendingSeek = -1; this.retry('定位播放进度超时'); return; }
       this.state.seeking = native.seeking || this.pendingSeek >= 0;
-      if (!this.state.seeking) { this.state.position = Math.max(0, native.position); this.state.sampledAt = sampledAt; }
+      // 倍速/播放切换已按当前ACTIVE时间提交连续锚点；异步原生采样不得倒写该边界。
+      // seek已单独发布target与timeRevision，完成后的较早采样同样不能覆盖目标。
+      if (!this.state.seeking && sampledAt >= this.state.sampledAt) {
+        this.state.position = Math.max(0, native.position); this.state.sampledAt = sampledAt; this.state.positionObserved = true;
+      }
       if (native.duration > 0) { this.state.duration = native.duration; }
       if (native.width > 0 && native.height > 0) { this.state.width = native.width; this.state.height = native.height; }
       this.state.bufferPercent = this.state.duration > 0 ? Math.min(100,
@@ -796,7 +814,8 @@ export class PlayController {
         this.pendingEnd = false; this.finishPlayback(!native.audioReady); return;
       }
       this.setState(!this.state.wanted ? 'paused' :
-        (native.paused || native.buffering || native.seeking || this.pendingSeek >= 0 || this.restoring ? 'loading' : 'playing'));
+        (native.buffering || native.seeking || this.pendingSeek >= 0 || this.restoring ? 'loading' :
+          native.paused ? this.state.state : 'playing'));
       if (this.history !== undefined) {
         this.history.observe(native.position, this.state.state === 'playing', native.seeking || this.pendingSeek >= 0,
           this.state.state === 'paused', this.background);
@@ -820,7 +839,7 @@ export class PlayController {
 
   private commitPosition(): void {
     this.state.position = this.position();
-    this.state.sampledAt = systemDateTime.getUptime(systemDateTime.TimeType.ACTIVE);
+    this.state.sampledAt = systemDateTime.getUptime(systemDateTime.TimeType.ACTIVE); this.state.positionObserved = false;
   }
 
   private invalidateSnapshot(): void {
@@ -857,7 +876,9 @@ export class PlayController {
     }
     if (!wanted && user) { this.releaseFocus(); }
     this.savePosition(true);
-    this.setState(wanted ? 'loading' : 'paused');
+    // 继续播放先保留已有画面；等待音频焦点不是重新取流，不应闪一次加载盖层。
+    this.setState(wanted && (!this.state.loaded || this.pendingSeek >= 0 || this.restoring) ? 'loading' :
+      wanted ? this.state.state : 'paused');
     this.refresh();
     if (!wanted && this.history !== undefined) { this.history.flush(); }
   }
@@ -872,7 +893,7 @@ export class PlayController {
       this.pendingSeek = target; this.seekStarted = false; this.seekAt = Date.now();
       this.engine.seek(target);
       this.state.position = target;
-      this.state.sampledAt = systemDateTime.getUptime(systemDateTime.TimeType.ACTIVE);
+      this.state.sampledAt = systemDateTime.getUptime(systemDateTime.TimeType.ACTIVE); this.state.positionObserved = false;
       this.state.timeRevision++; this.state.seeking = true;
       if (this.state.state === 'completed') { this.state.wanted = false; }
       this.setState(this.state.wanted ? 'loading' : 'paused');
@@ -887,6 +908,8 @@ export class PlayController {
     this.state.speed = value;
     if (this.engine !== undefined) { this.engine.speed(value); }
     this.syncSession(); this.emit();
+    // 倍速边界立即补一份原生锚点，不能等下一轮500ms再校正3倍速的媒体时间。
+    this.refresh();
   }
   /** 真实系统音量只读入口；用户调节由前台AVVolumePanel显式完成。 */
   syncSystemVolume(): void {
@@ -897,7 +920,7 @@ export class PlayController {
     this.state.systemVolumeRevision++;
     this.state.systemVolumeShowUi = false;
     try {
-      const usage: audio.StreamUsage = audio.StreamUsage.STREAM_USAGE_MUSIC;
+      const usage: audio.StreamUsage = audio.StreamUsage.STREAM_USAGE_MOVIE;
       const min: number = this.volumeManager.getMinVolumeByStream(usage);
       const max: number = this.volumeManager.getMaxVolumeByStream(usage);
       const current: number = level >= 0 ? level : this.volumeManager.getVolumeByStream(usage);
@@ -914,7 +937,7 @@ export class PlayController {
     if (info === undefined || this.disposed || !this.visible) { return; }
     const position: number = this.state.loaded ? this.position() : this.state.position;
     const generation: number = ++this.generation;
-    this.state.loaded = false; this.clearRestore();
+    this.state.loaded = false; this.state.videoOutputReady = false; this.clearRestore();
     this.prepareAt = Date.now();
     if (audioFailure && this.audioBackup < Math.min(2, info.audioBackup.length)) { info.audioUrl = info.audioBackup[this.audioBackup++]; }
     else if (!audioFailure && this.videoBackup < Math.min(2, info.videoBackup.length)) { info.videoUrl = info.videoBackup[this.videoBackup++]; }
@@ -952,7 +975,7 @@ export class PlayController {
     if (this.state.state === 'completed') { return; }
     this.clearFocusResume(); this.releaseFocus();
     this.state.wanted = false;
-    this.state.position = this.state.duration;
+    this.state.position = this.state.duration; this.state.positionObserved = false;
     if (this.history !== undefined) { this.history.complete(); }
     this.clearBackgroundTimer(); this.clearRestore();
     BgAudio.stop(this.owner); this.savePosition(true); this.setState('completed'); this.scheduleRefresh();
@@ -1034,6 +1057,11 @@ export class PlayController {
     try {
       this.invalidateSnapshot();
       engine.play();
+      this.readSystemVolume();
+      if (this.state.state === 'paused' && this.pendingSeek < 0) {
+        this.state.sampledAt = systemDateTime.getUptime(systemDateTime.TimeType.ACTIVE); this.state.positionObserved = false;
+        this.setState('playing');
+      }
       if (this.background) { this.startBackground(); }
       this.refresh();
     } catch (_) { this.fail('播放控制失败'); }
@@ -1081,7 +1109,7 @@ export class PlayController {
       !this.state.loaded || this.state.audioOnly) { return; }
     try {
       this.commitPosition(); this.invalidateSnapshot();
-      this.clearRestore(); this.engine.video(false); this.state.audioOnly = true; this.emit();
+      this.clearRestore(); this.engine.video(false); this.state.videoOutputReady = false; this.state.audioOnly = true; this.emit();
       console.info('[PiliMini-mpv] audio-only paused=' + (!this.state.wanted).toString());
     } catch (error) { console.warn('[PiliMini-mpv] audio-only unavailable'); }
   }
@@ -1138,7 +1166,7 @@ export class PlayController {
     this.clearFocusResume();
     this.visible = false; this.generation++; this.surface = '';
     this.scheduleRefresh();
-    this.clearBackgroundTimer(); this.clearRestore(); this.state.loaded = false;
+    this.clearBackgroundTimer(); this.clearRestore(); this.state.loaded = false; this.state.videoOutputReady = false;
     const released: Promise<void> = this.enqueue(async (): Promise<void> => { await castClosing; await this.closeEngine(); });
     BgAudio.release(this.owner);
     this.releaseFocus();
@@ -1158,6 +1186,7 @@ export class PlayController {
     if (this.history !== undefined) { this.history.flush(); this.history = undefined; }
     this.clearFocusResume();
     this.disposed = true; this.generation++;
+    this.state.videoOutputReady = false;
     this.clearBackgroundTimer(); this.clearRestore();
     if (this.timer !== -1) { clearTimeout(this.timer); this.timer = -1; }
     if (this.offBg !== undefined) { this.offBg(); this.offBg = undefined; }

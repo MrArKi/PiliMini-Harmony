@@ -10,6 +10,7 @@ import { GalleryThumbnail, nextGalleryId } from '../GalleryThumbnail';
 import { formatPlayCount } from '../VideoCard';
 import { DynItem, DynAuthor, DynPic, DynamicService } from '../../service/dynamic_service';
 import { DynamicVideoCard } from './DynamicVideoCard';
+import { DynamicFoldText } from './DynamicFoldText';
 
 function two(n: number): string {
   const s: string = n.toString();
@@ -26,8 +27,8 @@ export struct DynamicCard {
   @Prop model: DynItem;
   private galleryId: string = nextGalleryId();
   private pictureUrls(pics: DynPic[]): string[] { return pics.map((p: DynPic) => p.src); }
-  /** 卡片可用宽度（vp；图片网格按 Nara 规则计算，= 屏宽 - 左右 padding） */
-  private cardW: number = 340;
+  /** 卡片可用宽度（vp；图片网格按 Nara 规则计算）。以容器实测宽为准，首帧用屏宽兜底 */
+  @State cardW: number = 340;
 
   aboutToAppear(): void {
     try {
@@ -76,17 +77,13 @@ export struct DynamicCard {
   @Builder
   DescBlock(item: DynItem) {
     if (item.text.length > 0) {
-      Text(item.text)
-        .fontSize(15)
-        .lineHeight(24)
-        .fontColor($r('app.color.text_primary'))
-        .width('100%')
+      DynamicFoldText({ contentId: item.id, text: item.text, segments: item.segments || [], availableWidth: this.cardW })
     }
   }
 
   /** Nara pushDynDetail：转发外层与引用块各自按自己的类型分流。 */
-  private openItem(item: DynItem, viewComment: boolean = false): void {
-    if (!viewComment && item.kind === 'av' && item.archive !== undefined && item.archive.bvid.length > 0) {
+  private openItem(item: DynItem, viewComment: boolean = false, forceDetail: boolean = false): void {
+    if (!viewComment && !forceDetail && item.kind === 'av' && item.archive !== undefined && item.archive.bvid.length > 0) {
       const params: Record<string, string> = { 'bvid': item.archive.bvid };
       router.pushUrl({ url: 'pages/video/VideoDetailPage', params: params });
       return;
@@ -102,8 +99,8 @@ export struct DynamicCard {
   private static readonly IMG_MAX_RATIO: number = 2.6;
 
   /** 网格单元宽：2 图 = (W-s)/2；其余 = (W-2s)/3（4 图也是该单元、2 列） */
-  private cellW(n: number): number {
-    const w: number = this.cardW > 0 ? this.cardW : 340;
+  private cellW(n: number, availableWidth: number): number {
+    const w: number = Math.max(1, availableWidth);
     if (n === 2) {
       return (w - DynamicCard.GRID_SPACE) / 2;
     }
@@ -111,8 +108,8 @@ export struct DynamicCard {
   }
 
   /** 单图宽度档位（Nara）：>1.45 全宽；≥1 或 (竖图且 h/w<1.5) 2 格；否则 1.5 格；再按原图宽截断 */
-  private singleW(p: DynPic): number {
-    const w: number = this.cardW > 0 ? this.cardW : 340;
+  private singleW(p: DynPic, availableWidth: number): number {
+    const w: number = Math.max(1, availableWidth);
     const cell: number = (w - 2 * DynamicCard.GRID_SPACE) / 3;
     const rw: number = p.width > 0 && p.height > 0 ? p.width / p.height : 1.6;
     const rh: number = p.width > 0 && p.height > 0 ? p.height / p.width : 0.625;
@@ -153,14 +150,14 @@ export struct DynamicCard {
   }
 
   @Builder
-  PicsGrid(pics: DynPic[], inset: boolean) {
+  PicsGrid(pics: DynPic[], availableWidth: number) {
     Column({ space: DynamicCard.GRID_SPACE }) {
       if (pics.length === 1) {
         Column() {
           GalleryThumbnail({ urls: this.pictureUrls(pics), thumbs: this.pictureUrls(pics), index: 0,
             groupId: this.galleryId + pics[0].src, w: 720, h: 720 })
         }
-        .width(this.singleW(pics[0]))
+        .width(this.singleW(pics[0], availableWidth))
         .aspectRatio(this.singleRatio(pics[0]))
         .borderRadius(6)
         .clip(true)
@@ -190,8 +187,7 @@ export struct DynamicCard {
       }
     }
     // 4 图：2 列 × Nara 单元宽 = (2W-5)/3；其余占满
-    .width(pics.length === 4 ? (2 * this.cellW(4) + DynamicCard.GRID_SPACE) : '100%')
-    .padding({ left: inset ? 12 : 0, right: inset ? 12 : 0 })
+    .width(pics.length === 4 ? (2 * this.cellW(4, availableWidth) + DynamicCard.GRID_SPACE) : '100%')
     .alignItems(HorizontalAlign.Start)
   }
 
@@ -209,27 +205,24 @@ export struct DynamicCard {
   @Builder
   ForwardBlock(orig: DynItem) {
     Column({ space: 5 }) {
-      Text(orig.author.name)
+      Text('@' + orig.author.name)
         .fontSize(14)
         .fontWeight(FontWeight.Medium)
-        .fontColor($r('app.color.text_primary'))
+        .fontColor($r('app.color.brand_pink'))
         .onClick(() => { openMember(orig.author.mid); })
       if (orig.text.length > 0) {
-        Text(orig.text)
-          .fontSize(14)
-          .lineHeight(22)
-          .fontColor($r('app.color.text_primary'))
-          .width('100%')
+        DynamicFoldText({ contentId: orig.id, text: orig.text, segments: orig.segments || [],
+          textSize: 14, textLineHeight: 22, availableWidth: this.cardW - 6 })
       }
       if (orig.kind === 'av' && orig.archive !== undefined) {
         DynamicVideoCard({ archive: orig.archive })
       } else if (orig.kind === 'draw' && orig.pics !== undefined && orig.pics.length > 0) {
-        this.PicsGrid(orig.pics, false)
+        this.PicsGrid(orig.pics, this.cardW - 6)
       }
     }
     .width('100%')
     .padding({ left: 15, right: 15, top: 8, bottom: 8 })
-    .backgroundColor('#0D000000')
+    .backgroundColor($r('app.color.dynamic_forward_bg'))
     .alignItems(HorizontalAlign.Start)
     .onClick(() => { this.openItem(orig); })
   }
@@ -240,11 +233,11 @@ export struct DynamicCard {
     Text(t)
       .fontSize(13)
       .lineHeight(17)
-      .fontColor('#5C5F66')
+      .fontColor($r('app.color.text_secondary'))
       .width('100%')
       .border({
         width: { left: 1.5 },
-        color: { left: '#4D9499A0' }
+        color: { left: $r('app.color.interact_line') }
       })
       .padding({ left: 8 })
       .margin({ left: 12, right: 12, top: 6 })
@@ -294,9 +287,7 @@ export struct DynamicCard {
         if (this.model.kind === 'av' && this.model.archive !== undefined) {
           DynamicVideoCard({ archive: this.model.archive })
         } else if (this.model.kind === 'draw' && this.model.pics !== undefined && this.model.pics.length > 0) {
-          this.PicsGrid(this.model.pics, true)
-        } else if (this.model.kind === 'forward' && this.model.orig !== undefined) {
-          this.ForwardBlock(this.model.orig)
+          this.PicsGrid(this.model.pics, this.cardW)
         } else if (this.model.kind === 'unsupported') {
           Column() {
             Text('暂不支持的类型（直播 / 番剧 / 投票等）')
@@ -305,9 +296,9 @@ export struct DynamicCard {
           }
           .width('100%')
           .padding(14)
-          .backgroundColor('#0D000000')
+          .backgroundColor($r('app.color.soft_overlay'))
           .alignItems(HorizontalAlign.Center)
-        } else if (this.model.text.length === 0) {
+        } else if (this.model.text.length === 0 && !(this.model.kind === 'forward' && this.model.orig !== undefined)) {
           // 兜底：无任何可展示内容（如充电专属动态，接口不下发正文/图片），避免空白卡片
           Column() {
             Text(this.model.onlyFans ? '充电专属动态，暂无法查看' : '该动态暂无内容')
@@ -316,7 +307,7 @@ export struct DynamicCard {
           }
           .width('100%')
           .padding(14)
-          .backgroundColor('#0D000000')
+          .backgroundColor($r('app.color.soft_overlay'))
           .alignItems(HorizontalAlign.Center)
         }
       }
@@ -324,6 +315,11 @@ export struct DynamicCard {
       .padding({ left: 12, right: 12, bottom: 6 })
       .alignItems(HorizontalAlign.Start)
       .onClick(() => { this.openItem(this.model); })
+
+      // 引用背景铺满条目；内部15vp是唯一缩进，网格宽为整卡W-30。
+      if (this.model.kind === 'forward' && this.model.orig !== undefined) {
+        this.ForwardBlock(this.model.orig)
+      }
 
       if (this.model.interactText.length > 0) {
         this.InteractRow(this.model.interactText)
@@ -333,5 +329,12 @@ export struct DynamicCard {
     }
     .width('100%')
     .alignItems(HorizontalAlign.Start)
+    // Nara DynamicPanel 外层底边8vp、dividerColor 5%；边框占位，无额外细线/阴影。
+    .border({ width: { bottom: 8 }, color: { bottom: $r('app.color.dynamic_separator') } })
+    // 分屏/折叠屏/小窗下屏宽 ≠ 容器宽，九宫格必须按实测宽算，否则溢出
+    .onAreaChange((_old: Area, area: Area): void => {
+      const w: number = Number(area.width) - 24;
+      if (w > 0 && Math.abs(w - this.cardW) > 0.5) { this.cardW = w; }
+    })
   }
 }

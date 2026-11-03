@@ -1,3 +1,4 @@
+import { markStartup } from '../infra/startup_trace';
 import { AbilityConstant, Configuration, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
@@ -38,6 +39,7 @@ export default class EntryAbility extends UIAbility {
   }
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    markStartup('abilityCreate');
     // 外观跟随系统：不做主题设置（已确认）
     try {
       this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
@@ -47,6 +49,7 @@ export default class EntryAbility extends UIAbility {
     // 全局初始化：存储 / 图片缓存
     initImageLoader(this.context.cacheDir);
     initPrefs(this.context).then(async () => {
+      markStartup('prefsReady');
       hilog.info(DOMAIN, TAG, '%{public}s', 'prefs ready');
       // 图片缓存上限（设置页可改，默认 1GB）在启动时生效
       const lim: string = await prefsGet('setting_img_cache_mb', '1024');
@@ -86,12 +89,15 @@ export default class EntryAbility extends UIAbility {
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {
+    markStartup('windowStageCreate');
     hilog.info(DOMAIN, TAG, '%{public}s', 'Ability onWindowStageCreate');
     // 沉浸式布局（Nara 同款）：全屏布局 + 透明系统栏 + 安全区高度入 AppStorage
     try {
       const win = windowStage.getMainWindowSync();
       this.mainWindow = win;
-      win.setWindowLayoutFullScreen(true);
+      win.setWindowLayoutFullScreen(true).catch((err: Error): void => {
+        hilog.warn(DOMAIN, TAG, 'setWindowLayoutFullScreen failed: %{public}s', err.message);
+      });
       // 进入/退出小窗、分屏时重新决定能不能横屏
       try {
         win.on('windowStatusChange', (_status: window.WindowStatusType): void => {
@@ -115,9 +121,11 @@ export default class EntryAbility extends UIAbility {
     }
     windowStage.loadContent('pages/Index', (err) => {
       if (err.code) {
+        markStartup('loadContentFailed');
         hilog.error(DOMAIN, TAG, 'Failed to load the content. Cause: %{public}s', JSON.stringify(err));
         return;
       }
+      markStartup('loadContentReady');
       hilog.info(DOMAIN, TAG, 'Succeeded in loading the content.');
     });
   }

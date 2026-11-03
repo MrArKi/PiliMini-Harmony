@@ -10,7 +10,7 @@ import { AuthService, UserInfo } from '../../service/auth_service';
 import { APP_VERSION } from '../../config/constants';
 import { prefsGet, prefsPut } from '../../infra/storage/prefs';
 import { imageCacheSize, clearImageCache, setDiskLimitMB } from '../../infra/image/image_loader';
-import { MATERIAL_LEVEL_KEY } from '../main/MainShell';
+import { MATERIAL_LEVEL_KEY } from '../../config/ui_preferences';
 import { FeedFilterDialog } from '../../components/FeedFilterDialog';
 
 /** 图片缓存上限（MB）存储键 */

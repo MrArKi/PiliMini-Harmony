@@ -29,7 +29,10 @@ struct DynFeedList {
   private refreshRunning: boolean = false;
   private firstPageBaseline: string = '';
   private firstPageCookieRevision: number = -1;
-  private ds: BasicDataSource<DynItem> = new BasicDataSource<DynItem>();
+  private ds: BasicDataSource<DynItem> = new BasicDataSource<DynItem>(true);
+  private feedVisible: boolean = false;
+  private visibleFirst: number = 0;
+  private visibleLast: number = -1;
   @State pager: Pager<DynItem> = new Pager<DynItem>();
   @State needLogin: boolean = false;
   @State refreshing: boolean = false;
@@ -47,7 +50,7 @@ struct DynFeedList {
     // Nara setIndex：跨底栏只切页；保活列表不因未读、前台恢复或详情返回刷新/归顶。
     if (this.selected && !this.destroyed && !this.pager.firstLoaded && !this.reloading) {
       this.reload();
-    }
+    } else if (this.selected) { this.checkAfterLayout(); }
   }
 
   private onNavRequest(): void {
@@ -69,7 +72,7 @@ struct DynFeedList {
       }
       const out: PageData<DynItem> = {
         items: items,
-        hasMore: r.hasMore,
+        hasMore: r.hasMore && r.offset !== cursor,
         nextCursor: r.offset
       };
       return out;
@@ -107,18 +110,36 @@ struct DynFeedList {
       }
       // 客户端过滤后首页可能为空：仅成功的空页续拉，失败立即停止。
       let guard: number = 0;
-      while (!this.destroyed && this.ds.size() === 0 && this.pager.hasMore && guard < 10) {
+      while (!this.destroyed && this.selected && this.ds.size() === 0 && this.pager.hasMore && guard < 10) {
         guard++;
         const more: boolean = await this.pager.loadMore(this.ds,
           (cursor: string): Promise<PageData<DynItem>> => this.fetchFeed(cursor));
         if (!more) { break; }
       }
-    } finally { this.reloading = false; }
+    } finally { this.reloading = false; this.checkAfterLayout(); }
   }
 
-  private async loadMore(): Promise<void> {
-    if (this.destroyed) { return; }
-    await this.pager.loadMore(this.ds, (cursor: string): Promise<PageData<DynItem>> => this.fetchFeed(cursor));
+  private async loadMore(automatic: boolean = false): Promise<void> {
+    if (this.destroyed || !this.selected || this.reloading || this.refreshRunning ||
+      (automatic && (!this.feedVisible || this.pager.lastError.length > 0))) { return; }
+    const loaded: boolean = await this.pager.loadMore(this.ds,
+      (cursor: string): Promise<PageData<DynItem>> => this.fetchFeed(cursor));
+    if (loaded) { this.checkAfterLayout(); }
+  }
+
+  private prefetchVisible(): void {
+    if (this.ds.size() === 0) { return; }
+    let atEnd: boolean = false;
+    try { atEnd = this.navigation.scroller.isAtEnd(); } catch (_) {}
+    if (atEnd) { this.loadMore(true); return; }
+    if (this.visibleLast < 0) { return; }
+    const ahead: number = Math.max(2, this.visibleLast - this.visibleFirst + 1);
+    if (this.ds.size() - 1 - this.visibleLast <= ahead) { this.loadMore(true); }
+  }
+
+  private checkAfterLayout(): void {
+    if (this.destroyed || !this.selected) { return; }
+    this.navigation.afterLayout(this.getUIContext(), (): void => { this.prefetchVisible(); });
   }
 
   private async refresh(): Promise<void> {
@@ -129,7 +150,7 @@ struct DynFeedList {
     try { await this.reload(); }
     finally {
       this.refreshRunning = false;
-      if (!this.destroyed) { this.refreshing = false; }
+      if (!this.destroyed) { this.refreshing = false; this.checkAfterLayout(); }
     }
   }
 
@@ -232,21 +253,33 @@ struct DynFeedList {
                     .width('100%')
                     .textAlign(TextAlign.Center)
                     .padding({ top: 20, bottom: 110 })
+                    .onClick(() => { if (this.pager.lastError.length > 0) { this.loadMore(); } })
                 } else if (this.pager.loadingMore) {
                   LoadingFooter({ text: '加载中…' })
                 }
               }
             }
-            .cachedCount(3)
+            .cachedCount(1)
+            .scrollBar(BarState.Off)
             .width('100%')
             .height('100%')
+            .backToTop(this.selected)
             .id('dynamic_feed_' + this.dynType + '_' + this.filterKind)
-            .onAreaChange((_old: Area, area: Area): void => { this.navigation.viewportHeight = Number(area.height); })
+            .onAreaChange((_old: Area, area: Area): void => {
+              this.navigation.viewportHeight = Number(area.height); this.checkAfterLayout();
+            })
             .onScrollStop((): void => { this.navigation.onScrollStop(); })
-            // 卡片间 0.5px 分隔线（左右缩进 12，10% alpha）
-            .divider({ strokeWidth: 0.5, color: '#1A000000', startMargin: 12, endMargin: 12 })
+            .onVisibleAreaChange([0], (visible: boolean): void => {
+              this.feedVisible = visible;
+              if (visible) { this.checkAfterLayout(); }
+            })
+            .onScrollIndex((first: number, last: number): void => {
+              this.visibleFirst = first; this.visibleLast = last;
+              this.prefetchVisible();
+            })
+            // 分隔由DynamicCard的8vp主题底边统一承载，列表不再叠加细线。
             .onReachEnd(() => {
-              this.loadMore();
+              this.loadMore(true);
             })
           }
           .refreshOffset(64)
@@ -266,6 +299,8 @@ struct DynFeedList {
     }
     .width('100%')
     .height('100%')
+    // Nara 动态流底色为surface，透明卡片以8vp分隔带区分。
+    .backgroundColor($r('app.color.card_bg'))
   }
 }
 

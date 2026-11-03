@@ -19,6 +19,8 @@ import { VideoItem } from '../../model/video_item';
 struct FavListPage {
   @State loading: boolean = true;
   @State loggedIn: boolean = false;
+  /** 与"未登录"区分开：网络失败不能渲染成去登录 */
+  @State netErr: string = '';
   @State curFolder: FavFolder | null = null;
   @State refreshing: boolean = false;
   @StorageProp('statusBarHeight') statusBarH: number = 0;
@@ -41,8 +43,18 @@ struct FavListPage {
   }
 
   private async init(): Promise<void> {
-    const u: UserInfo | null = await AuthService.fetchNav();
+    // strict：网络失败必须能被区分出来，否则会被当成"未登录"把已登录用户赶去扫码
+    let u: UserInfo | null = null;
+    try {
+      u = await AuthService.fetchNav(true);
+    } catch (e) {
+      if (this.destroyed) { return; }
+      this.loading = false;
+      this.netErr = '网络异常，请检查网络后重试';
+      return;
+    }
     if (this.destroyed) { return; }
+    this.netErr = '';
     this.loggedIn = u !== null;
     if (!this.loggedIn) {
       this.loading = false;
@@ -164,6 +176,12 @@ struct FavListPage {
       if (this.loading) {
         Column() { LoadingProgress().width(40).height(40) }
           .layoutWeight(1).justifyContent(FlexAlign.Center)
+      } else if (this.netErr.length > 0) {
+        ErrorRetry({ text: this.netErr, onRetry: (): void => {
+          this.loading = true;
+          this.netErr = '';
+          this.init();
+        } })
       } else if (!this.loggedIn) {
         Column({ space: 12 }) {
           Text('未登录')

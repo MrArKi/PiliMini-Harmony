@@ -5,6 +5,11 @@ import { getJson, getJsonWithHeaders, parseEnvelope, ensureOk } from '../infra/h
 import { API_BASE } from '../config/constants';
 import { CookieStore } from '../infra/cookie/cookie_store';
 import { AppError } from '../infra/error/app_error';
+import { prefsGet, prefsPut, prefsDelete } from '../infra/storage/prefs';
+import { requestNav } from '../infra/http/nav_request';
+
+/** nav 用户信息本地缓存键（冷启动首帧用） */
+const NAV_CACHE_KEY: string = 'nav_user_cache';
 
 export const PASSPORT_BASE: string = 'https://passport.bilibili.com';
 
@@ -91,22 +96,50 @@ function toExp(v: number | string | undefined): number {
   return isNaN(n) ? 0 : n;
 }
 
+function validCachedNumber(value: number): boolean {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER;
+}
+
+/** JSON.parse不保证字段形状；只让明确且有界的展示数据进入组件。 */
+function cleanCachedUser(value: UserInfo): UserInfo | null {
+  if (value === undefined || value === null || typeof value !== 'object' || Array.isArray(value) ||
+    !Number.isSafeInteger(value.mid) || value.mid <= 0 ||
+    typeof value.uname !== 'string' || value.uname.length === 0 || value.uname.length > 200 ||
+    typeof value.face !== 'string' || value.face.length > 2048 ||
+    (value.face.length > 0 && !/^https?:\/\//.test(value.face)) ||
+    !validCachedNumber(value.level) || !Number.isInteger(value.level) || value.level > 100 ||
+    !validCachedNumber(value.coins) || !validCachedNumber(value.curExp) || !validCachedNumber(value.nextExp)) {
+    return null;
+  }
+  return { mid: value.mid, uname: value.uname, face: toHttps(value.face), level: value.level,
+    coins: value.coins, curExp: value.curExp, nextExp: value.nextExp };
+}
+
 export class AuthService {
+  private static userCacheWrites: Promise<void> = Promise.resolve();
   /** 读取当前登录用户（未登录/失效返回 null）；不走 apiGet（-101 属常态，不触发登出事件） */
   static async fetchNav(strict: boolean = false): Promise<UserInfo | null> {
+    const revision: number = CookieStore.sessionRevision();
     try {
-      const raw: string = await getJson(API_BASE + '/x/web-interface/nav');
+      const raw: string = await requestNav();
+      if (revision !== CookieStore.sessionRevision()) { return null; }
       // 不走 ensureOk：未登录时 -101 属常态，不触发全局登出事件
       const resp = parseEnvelope<NavData>(raw);
-      if (resp.code === -101 && await CookieStore.isLogin()) { ensureOk(resp); }
+      if (resp.code === -101) {
+        const logged: boolean = await CookieStore.isLogin();
+        if (revision !== CookieStore.sessionRevision()) { return null; }
+        if (logged) { ensureOk(resp); }
+      }
       if (resp.code !== 0) {
         if (strict && resp.code !== -101) { ensureOk(resp); }
         return null;
       }
       const d: NavData | undefined = resp.data;
-      if (d === undefined || !d.isLogin) {
+      if (d === undefined || d === null || typeof d.isLogin !== 'boolean') {
+        if (strict) { throw new AppError('parse', -1, 'nav 登录状态结构异常'); }
         return null;
       }
+      if (!d.isLogin) { return null; }
       const lv: NavLevelInfo | undefined = d.level_info;
       const info: UserInfo = {
         mid: d.mid,
@@ -117,6 +150,7 @@ export class AuthService {
         curExp: lv !== undefined ? lv.current_exp : 0,
         nextExp: lv !== undefined ? toExp(lv.next_exp) : 0
       };
+      AuthService.saveUser(info, revision).catch((): void => {});
       return info;
     } catch (e) {
       console.warn('[PiliMini-nav] exception=' + JSON.stringify(e));
@@ -152,6 +186,39 @@ export class AuthService {
   /** 退出登录：清 Cookie */
   static async logout(): Promise<void> {
     await CookieStore.clear();
+    await AuthService.userCacheWrites;
+    try { await prefsDelete(NAV_CACHE_KEY); } catch (e) { /* 缓存清理失败不影响登出 */ }
+  }
+
+  /**
+   * 本地缓存的用户信息（冷启动首帧用，不联网）。
+   * 只用于头像/昵称等展示，登录态有效性仍由 Cookie + -101 全局登出判定。
+   */
+  static async cachedUser(): Promise<UserInfo | null> {
+    const revision: number = CookieStore.sessionRevision();
+    try {
+      const raw: string = await prefsGet(NAV_CACHE_KEY, '');
+      if (revision !== CookieStore.sessionRevision() || raw.length === 0 || raw.length > 16384) { return null; }
+      const parsed: UserInfo | null = cleanCachedUser(JSON.parse(raw) as UserInfo);
+      if (parsed === null) { return null; }
+      const logged: boolean = await CookieStore.isLogin();
+      const uid: string = logged ? await CookieStore.get('DedeUserID') : '';
+      if (revision !== CookieStore.sessionRevision() || !/^[0-9]{1,20}$/.test(uid) || Number(uid) !== parsed.mid) {
+        return null;
+      }
+      return parsed;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  private static saveUser(info: UserInfo, revision: number): Promise<void> {
+    const operation: Promise<void> = AuthService.userCacheWrites.then(async (): Promise<void> => {
+      if (revision !== CookieStore.sessionRevision()) { return; }
+      try { await prefsPut(NAV_CACHE_KEY, JSON.stringify(info)); } catch (e) { /* 缓存失败不阻塞 */ }
+    });
+    AuthService.userCacheWrites = operation.catch((): void => {});
+    return operation;
   }
 
   /** 扫码登录：获取二维码 */

@@ -6,6 +6,7 @@ import { BasicDataSource } from '../common/list_data_source';
 import { formatPlayCount } from './VideoCard';
 import { CommentItem, SubReplyPage, SubReplyWindow, VideoService } from '../service/video_service';
 import { AppError } from '../infra/error/app_error';
+import { onAppBackground, onAppForeground } from '../infra/event/app_events';
 
 /** 单次布局后执行，回调自行检查页面是否已销毁。 */
 class ReplyLayoutCallback extends FrameCallback {
@@ -17,11 +18,13 @@ class ReplyLayoutCallback extends FrameCallback {
 @Component
 export struct SubReplyPanel {
   @Prop embedded: boolean = false;
+  @Prop active: boolean = true;
   onClose: () => void = () => { router.back(); };
   @State dragOffset: number = 0;
   @State panelHeight: number = 600;
   private listScroller: Scroller = new Scroller();
-  @State items: CommentItem[] = [];
+  private items: CommentItem[] = [];
+  private replyIds: Set<number> = new Set<number>();
   @State total: number = 0;
   @State loading: boolean = true;
   @State isEnd: boolean = false;
@@ -42,7 +45,12 @@ export struct SubReplyPanel {
   private listHeight: number = 0;
   private firstVisible: number = 0;
   private destroyed: boolean = false;
-  private ds: BasicDataSource<CommentItem> = new BasicDataSource<CommentItem>();
+  private listVisible: boolean = false;
+  private appForeground: boolean = true;
+  private routeIndex: number = 0;
+  private offBg: () => void = () => {};
+  private offFg: () => void = () => {};
+  private ds: BasicDataSource<CommentItem> = new BasicDataSource<CommentItem>(true);
   // 入参快照（aboutToAppear 一次性取走，避免全局 ctx 被后续操作/返回动画干扰）
   // root 必须为 @State：作为 @ObjectLink(CommentItemView.item) 的合法数据源
   @State root: CommentItem | undefined = undefined;
@@ -52,6 +60,9 @@ export struct SubReplyPanel {
   otype: number = 1;
 
   aboutToAppear(): void {
+    this.routeIndex = router.getState().index;
+    this.offBg = onAppBackground(() => { this.appForeground = false; });
+    this.offFg = onAppForeground(() => { this.appForeground = true; });
     this.total = this.root !== undefined ? this.root.rcount : 0;
     this.windowMode = this.targetRpid > 0;
     this.load();
@@ -59,6 +70,12 @@ export struct SubReplyPanel {
 
   aboutToDisappear(): void {
     this.destroyed = true;
+    this.offBg(); this.offFg();
+  }
+
+  private canPrefetch(): boolean {
+    return !this.destroyed && this.active && this.listVisible && this.appForeground &&
+      router.getState().index === this.routeIndex;
   }
 
   private positionReply(rpid: number, y: number, highlight: boolean, attempt: number = 0): void {
@@ -97,6 +114,7 @@ export struct SubReplyPanel {
       return;
     }
     if (direction === 'previous' && !this.hasPrevious) { return; }
+    if (direction === 'next' && this.isEnd) { return; }
     const anchorIndex: number = this.firstVisible - 4;
     const anchor: CommentItem | undefined = anchorIndex >= 0 ? this.items[anchorIndex] : undefined;
     let anchorY: number = 0;
@@ -115,8 +133,14 @@ export struct SubReplyPanel {
           direction === 'initial' ? '' : offset);
         if (this.destroyed) { return; }
         incoming = r.items;
-        if (direction !== 'next') { this.prevOffset = r.prevOffset; this.hasPrevious = r.hasPrevious; }
-        if (direction !== 'previous') { this.nextOffset = r.nextOffset; this.isEnd = !r.hasMore; }
+        if (direction !== 'next') {
+          this.prevOffset = r.prevOffset;
+          this.hasPrevious = r.hasPrevious && (direction === 'initial' || r.prevOffset !== offset);
+        }
+        if (direction !== 'previous') {
+          this.nextOffset = r.nextOffset;
+          this.isEnd = !r.hasMore || (direction !== 'initial' && r.nextOffset === offset);
+        }
         this.total = r.total;
       } else {
         const page: number = direction === 'initial' ? 1 : this.page + 1;
@@ -129,8 +153,14 @@ export struct SubReplyPanel {
         this.total = r.total;
         this.isEnd = !r.hasMore;
       }
+      if (direction === 'initial') { this.replyIds.clear(); }
+      const unique: CommentItem[] = incoming.filter((item: CommentItem): boolean => {
+        if (this.replyIds.has(item.rpid)) { return false; }
+        this.replyIds.add(item.rpid);
+        return true;
+      });
       if (direction === 'initial') {
-        this.items = incoming;
+        this.items = unique;
         this.ds.reload(this.items);
         if (this.windowMode) {
           if (this.items.some((item: CommentItem) => item.rpid === this.targetRpid)) {
@@ -140,14 +170,12 @@ export struct SubReplyPanel {
           }
         }
       } else {
-        const unique: CommentItem[] = incoming.filter((item: CommentItem) =>
-          !this.items.some((existing: CommentItem) => existing.rpid === item.rpid));
         if (direction === 'previous') {
           this.items = unique.concat(this.items);
-          this.ds.reload(this.items);
+          this.ds.prepend(unique);
           if (anchor !== undefined) { this.positionReply(anchor.rpid, anchorY, false); }
         } else {
-          this.items = this.items.concat(unique);
+          for (let i: number = 0; i < unique.length; i++) { this.items.push(unique[i]); }
           this.ds.append(unique);
         }
       }
@@ -331,13 +359,17 @@ export struct SubReplyPanel {
             }
           }
           .width('100%')
-          .height(125 + this.navBarH)
+          .height(48)
+          .margin({ bottom: this.navBarH })
           .justifyContent(FlexAlign.Center)
         }
         .width('100%')
       }
       .width('100%')
       .layoutWeight(1)
+      .cachedCount(2)
+      .scrollBar(BarState.Off)
+      .onVisibleAreaChange([0], (visible: boolean) => { this.listVisible = visible; })
       .id('sub_reply_list')
       // Nara楼中楼复用ExtendedNestedScrollController；嵌入视频页时接回同一头部滚动链。
       .edgeEffect(EdgeEffect.None, { alwaysEnabled: true })
@@ -347,10 +379,15 @@ export struct SubReplyPanel {
         scrollBackward: this.embedded ? NestedScrollMode.SELF_FIRST : NestedScrollMode.SELF_ONLY
       })
       .onAreaChange((_old: Area, area: Area) => { this.listHeight = Number(area.height); })
-      .onScrollIndex((start: number) => { this.firstVisible = start; })
+      .onScrollIndex((start: number, end: number) => {
+        this.firstVisible = start;
+        const screenCount: number = Math.max(1, end - start + 1);
+        if (this.canPrefetch() && !this.loading && !this.isEnd && this.err.length === 0 && this.items.length > 0 &&
+          end >= 4 + this.items.length - 1 - screenCount) { this.load('next'); }
+      })
       .divider({ strokeWidth: 0.3, color: '#14000000', startMargin: 55, endMargin: 15 })
       .onReachEnd(() => {
-        if (!this.loading && !this.isEnd && this.err.length === 0) {
+        if (this.canPrefetch() && !this.loading && !this.isEnd && this.err.length === 0) {
           this.load('next');
         }
       })

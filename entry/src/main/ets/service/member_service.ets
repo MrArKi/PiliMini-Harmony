@@ -171,25 +171,13 @@ export class MemberService {
     await MemberService.modifyRelationForSession(mid, act, session);
   }
 
-  static async videos(mid: number, page: number, order: string, keyword: string = '',
-    ascending: boolean = false): Promise<MemberResult> {
+  static async videos(mid: number, page: number, order: string, keyword: string = ''): Promise<MemberResult> {
     const params: Record<string, string> = { 'mid': mid.toString(), 'pn': page.toString(), 'ps': '30',
       'tid': '0', 'order': order, 'keyword': keyword, 'platform': 'web', 'web_location': '333.1387',
       'order_avoided': 'true' };
     const data: ArchiveData = await read<ArchiveData>('/x/space/wbi/arc/search', params, true, mid);
     const list: ArchiveRaw[] = data.list?.vlist || [];
     const total: number = data.page?.count || 0;
-    if (ascending) {
-      // Web端无sort参数；按总页数反向取页，页内倒序，不能只反转当前页冒充全局倒序。
-      const last: number = Math.max(1, Math.ceil(total / 30));
-      const target: number = Math.max(1, last - page + 1);
-      if (target !== page) {
-        params['pn'] = target.toString();
-        const reverse: ArchiveData = await read<ArchiveData>('/x/space/wbi/arc/search', params, true, mid);
-        return MemberService.archiveResult((reverse.list?.vlist || []).slice().reverse(), page, total);
-      }
-      return MemberService.archiveResult(list.slice().reverse(), page, total);
-    }
     return MemberService.archiveResult(list, page, total);
   }
   private static archiveResult(list: ArchiveRaw[], page: number, total: number): MemberResult {

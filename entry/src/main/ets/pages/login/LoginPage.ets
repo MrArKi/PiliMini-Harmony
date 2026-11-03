@@ -78,7 +78,14 @@ struct LoginPage {
         return;
       }
       this.qrcodeKey = qr.qrcodeKey;
-      const pm: image.PixelMap | undefined = generateQrPixelMap(qr.url, 240);
+      const pm: image.PixelMap | undefined = await generateQrPixelMap(qr.url, 240);
+      if (myGen !== this.gen || this.destroyed) {
+        return;
+      }
+      if (pm === undefined) {
+        this.statusText = '二维码生成失败，点击重试';
+        return;
+      }
       this.qrPm = pm;
       this.startTs = Date.now();
       this.remainSec = QR_TTL_SEC;

@@ -78,12 +78,13 @@ export class Pager<T> {
     }
   }
 
-  /** 触底加载下一页；成功返回 true，失败/被跳过返回 false */
+  /** 加载下一页（由宿主提前触发或触底兜底）；成功返回 true，失败/被跳过返回 false */
   async loadMore(ds: BasicDataSource<T>, fetch: (cursor: string) => Promise<PageData<T>>): Promise<boolean> {
     if (this.loadingMore || this.loading || !this.hasMore || !this.firstLoaded) {
       return false;
     }
     this.loadingMore = true;
+    this.lastError = '';
     const generation: number = this.generation;
     try {
       const r: PageData<T> = await fetch(this.cursor);
